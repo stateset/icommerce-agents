@@ -1,3 +1,6 @@
+import sqlite3
+
+import pytest
 from merchant_agent.types import MerchantSessionContext
 
 from engine_backend.merchant import EngineMerchant
@@ -45,7 +48,19 @@ async def test_analysis_query_is_select_only_and_capped(store, kernel):
     table = await backend.execute_analysis_query(session(), "SELECT COUNT(*) AS n FROM orders")
     assert table is not None and table.rows
     assert await backend.get_analysis_schema(session())
-    import pytest
 
-    with pytest.raises(Exception):  # noqa: B017
+    with pytest.raises(ValueError, match="only SELECT statements are allowed"):
         await backend.execute_analysis_query(session(), "DELETE FROM orders")
+
+    with pytest.raises(ValueError, match="single statement"):
+        await backend.execute_analysis_query(session(), "SELECT 1; DELETE FROM orders")
+
+
+def test_the_readonly_connection_itself_refuses_a_write(store):
+    """The heuristic in execute_analysis_query is the first line of defense, but the
+    brief calls the mode=ro connection the check that actually holds. Prove that
+    directly: bypass the heuristic entirely (call the connection, not the method) and
+    confirm the engine's own read-only connection raises rather than writing."""
+    connection = store.readonly_sql()
+    with pytest.raises(sqlite3.OperationalError, match="readonly database"):
+        connection.execute("DELETE FROM orders")
