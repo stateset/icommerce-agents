@@ -35,6 +35,11 @@ class Receipt(BaseModel):
     result: dict | None = None
     error_code: str | None = None
     error_message: str | None = None
+    sealed: bool = True
+    """True for a receipt parsed from the engine's JSON; False for one this module
+    synthesizes (e.g. a malformed envelope the binding rejected before sealing a receipt).
+    A downstream consumer recording receipt ids as evidence must check this rather than
+    inferring it from empty id fields."""
 
     @property
     def ok(self) -> bool:
@@ -42,6 +47,14 @@ class Receipt(BaseModel):
 
 
 def approval_evidence(approval_id: str, approved_by: str, scope: str, store_id: str) -> dict:
+    """Build a partial approval-evidence template.
+
+    `tenant_id` and `idempotency_key` are left `None` here — they are bound to the
+    concrete call by `KernelClient.execute`, which fills `tenant_id` from the host
+    principal and sets `idempotency_key` to the call's own idempotency key. The dict
+    this function returns is therefore incomplete evidence: do not log or store it as an
+    audit record before `execute` has bound it.
+    """
     return {
         "approval_id": approval_id,
         "approved_by": approved_by,
@@ -112,12 +125,18 @@ class KernelClient:
 
         try:
             raw = await self.store.write("kernel", body)
-        except Exception as error:  # a refusal the binding raises rather than seals
+        except ValueError as error:
+            # The binding raises ValueError (PyValueError) for a malformed envelope or
+            # policy JSON, or an unsupported command_type — rejected before any receipt
+            # is sealed. Any other exception (a programming defect, a lock/runtime error,
+            # cancellation) is not a refusal and must propagate rather than masquerade as
+            # a receipt.
             return Receipt(
                 command_type=command_type,
                 idempotency_key=idempotency_key,
                 status="failed",
                 error_code="kernel.rejected",
                 error_message=str(error),
+                sealed=False,
             )
         return Receipt.model_validate(json.loads(raw))
