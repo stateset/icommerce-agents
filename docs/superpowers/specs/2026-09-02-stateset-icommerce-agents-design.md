@@ -87,7 +87,7 @@ is what upstream's cart-write serialization requires anyway.
 
 | Backend method | Engine surface |
 |---|---|
-| `search_products`, `get_product_details` | `products.list()`, `products.get()`, `search_config` facets |
+| `search_products`, `get_product_details` | `products.list()`, `products.get()`, variants and merchandising attributes via `catalog.py` (below) |
 | `get_cart`, `add_to_cart`, `update_cart_item`, `remove_from_cart` | `carts.get`, `add_item`, `update_item`, `remove_item` |
 | `checkout_handoff` | returns a host URL; the storefront route calls `carts.complete()` |
 | `get_orders`, `get_order` | `orders.*`, `shipments` for tracking |
@@ -98,7 +98,7 @@ is what upstream's cart-write serialization requires anyway.
 | `search_listings`, `get_listing` | `products`, `inventory`, `price_schedules` |
 | `get_inventory_alerts` | `analytics.low_stock_items()`, `analytics.inventory_health()` |
 | `get_order_issues` | `analytics.order_status_breakdown()`, `orders` |
-| `get_pricing_context` | `price_schedules`, `price_levels`, product cost fields |
+| `get_pricing_context` | `price_schedules`, `price_levels`, unit cost from the product's merchandising object |
 | `execute_analysis_query`, `get_analysis_schema` | a read-only SQLite connection on the same file |
 | `stage_*`, `apply_change`, `discard_change`, `get_pending_changes` | see §5 |
 
@@ -111,7 +111,7 @@ upstream's models and exact decimal in the engine: conversion happens once, at t
 boundary, and every figure the model sees is derived from an engine value rather than
 computed in the adapter.
 
-### Three gaps, named rather than papered over
+### Four gaps, named rather than papered over
 
 **Search.** The engine's semantic search (`commerce.vector(openai_api_key)`) requires an
 OpenAI key, which is not acceptable in a Claude reference. `search.py` implements
@@ -127,37 +127,68 @@ disclosure text is server-authored and the model only names a product it has see
 object and applies to nothing live. The README says so rather than implying a marketing
 stack.
 
+**The catalog model is thinner than the agent's.** Two distinct shortfalls, handled two
+distinct ways in `engine_backend/catalog.py`:
+
+*Fields the engine does not store.* `Product` carries id, name, slug, description, and
+status; `ProductVariant` adds sku, price, and compare-at price. Upstream's `Product` also
+needs brand, category, image_url, rating, review_count, labels, attributes, and
+option_values, and `get_pricing_context` needs unit cost. These live in one custom object
+per product, type handle `merchandising`, `owner_type="product"`, written by `seed.py` and
+read on every catalog call. They are store-owned data, not model-supplied.
+
+*A read the binding does not expose.* `Commerce::get_variants(product_id)` exists in the
+Rust crate but is not bound in Python 1.28.5, so a family's variants cannot be listed
+through the binding at all. `catalog.py` reads them through the same read-only SQLite
+connection `execute_analysis_query` uses, with a single parameterized SELECT.
+`docs/mapping.md` lists every read taken this way — currently exactly one — so the
+workaround stays visible and disappears when the binding grows the method.
+
 ## 5. Enforcement: two layers, and where the second one stops
 
 `kernel/mutation-boundary.json` in the engine repo reports 938 tools, 474 mutations, and
 **26 governed commands**. That asymmetry is the most useful fact in either repository, and
-this reference is built around stating it.
+this reference is built around stating it precisely rather than flatteringly.
 
-**Governed — the engine returns a sealed receipt:**
+The governed 26 are the **transaction spine**, not the merchandising surface:
+`checkout.commit`, `payments.create`, `payments.create_refund`, `returns.transition`,
+`orders.transition`, `orders.ship`, `inventory.item.create`, `inventory.reserve`,
+`inventory.reservation.confirm` / `.release`, `products.create`, `ledger.post`, and the
+A2A escrow and x402 settlement commands.
 
-- `stage_inventory_action` → `inventory.item.create`, `inventory.reserve`,
-  `inventory.reservation.confirm` / `.release`
-- refunds and returns reached through `apply_change` → `payments.create_refund`,
-  `returns.transition`
-- checkout on the host route → `checkout.commit`
+**Governed — a sealed receipt comes back:**
 
-**Adapter-guarded only — no governed command exists:**
+- Checkout on the host route → `checkout.commit`.
+- A refund or a return transition on the host route → `payments.create_refund`,
+  `returns.transition`.
+- A restock of a SKU with no inventory item yet → `inventory.item.create`.
 
-- `stage_listing_update`, `stage_price_update`, `stage_promotion`, `stage_campaign`
+**Adapter-guarded only — no governed command exists for these:**
+
+- Every merchant `stage_*` write: `stage_listing_update`, `stage_price_update`,
+  `stage_promotion`, `stage_campaign`, and the ordinary `stage_inventory_action`
+  cases — a restock of an existing SKU is `inventory.adjust`, and a pause or activate is
+  a product-status write. None of the three is a governed command.
 
 These apply through direct binding writes under upstream's guardrails
-(`check_guardrails`, `check_apply_change`) plus an `activity_logs` entry. They do not
-produce a kernel receipt, and `docs/enforcement.md` says so in the same table that lists
-the ones that do.
+(`check_guardrails`, `check_apply_change`) plus an `activity_logs` entry. They produce no
+kernel receipt, and `docs/enforcement.md` says so in the same table that lists the ones
+that do.
+
+This is the finding, and it should be stated as one: **the engine governs the money and
+the stock ledger; it does not govern merchandising.** A merchant agent editing listings
+and prices is protected by its agent layer alone, which is exactly the case where
+upstream's staged-change-plus-approval design is load-bearing rather than decorative.
 
 ### The doubled rule
 
-`config/kernel-policy.json` sets `requires_approval: true` on `payments.create_refund`.
-Upstream's `require_host_approval` sets the same requirement at the agent layer. They are
-the same rule enforced twice, and the kernel's copy holds even when the agent layer is
-bypassed entirely — a caller reaching the engine directly still cannot refund without an
-approval. `docs/enforcement.md` leads with this, because it is what a two-layer reference
-is for.
+`config/kernel-policy.json` sets `requires_approval: true` on `payments.create_refund`,
+and the command envelope carries `ApprovalEvidence` (`approval_id`, `approved_by`,
+`scope`, `approved_at`). Upstream's `require_host_approval` sets the same requirement at
+the agent layer. They are the same rule enforced twice, and the kernel's copy holds even
+when the agent layer is bypassed entirely — a caller reaching the engine directly still
+cannot refund without evidence. `docs/enforcement.md` leads with this, because it is what
+a two-layer reference is for.
 
 ### Demonstrated denials
 
@@ -166,10 +197,12 @@ is for.
 1. A cart write naming a product id the model never saw → agent gate, a `blocked` tool
    outcome naming the gate.
 2. An `apply_change` without the host approval mark → agent gate, `blocked`.
-3. A refund exceeding the captured amount → engine, inside the database transaction,
-   `commerce.refund.exceeds_captured` as a sealed receipt.
+3. A refund exceeding the captured amount, issued as a governed command → engine, inside
+   the database transaction, a receipt whose `status` is failed and whose `error_code` is
+   the engine's stable code, never parsed from prose.
 
-The first two are prompt-independent but agent-layer. The third holds against any caller.
+The first two are agent-layer and prompt-independent. The third holds against any caller,
+including one that never goes through this repo.
 
 ## 6. Staging
 
