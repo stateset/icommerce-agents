@@ -8,15 +8,19 @@ resolvable, and it keeps provenance ids stable across turns for upstream's cart 
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 
 from shopping_agent.backend import StorefrontBackend
 from shopping_agent.types import (
     Cart,
     CartItem,
+    CheckoutHandoff,
     Disclosure,
     FulfillmentOption,
     Order,
+    OrderItem,
+    OrderStatus,
     Policy,
     Product,
     ProductDetails,
@@ -25,8 +29,10 @@ from shopping_agent.types import (
     UserPreferences,
 )
 from stateset_embedded import AddCartItemInput, Commerce, ProductVariant
+from stateset_embedded import Order as EngineOrder
 from stateset_embedded import Product as EngineProduct
 
+from engine_backend import content
 from engine_backend.catalog import (
     CatalogRow,
     Merchandising,
@@ -36,6 +42,45 @@ from engine_backend.catalog import (
 )
 from engine_backend.search import search as engine_search
 from engine_backend.store import EngineStore
+
+_STATUS_MAP: dict[str, OrderStatus] = {
+    "pending": OrderStatus.PROCESSING,
+    "processing": OrderStatus.PROCESSING,
+    "paid": OrderStatus.PROCESSING,
+    "shipped": OrderStatus.SHIPPED,
+    "out_for_delivery": OrderStatus.OUT_FOR_DELIVERY,
+    "delivered": OrderStatus.DELIVERED,
+    "delayed": OrderStatus.DELAYED,
+    "cancelled": OrderStatus.CANCELLED,
+    "canceled": OrderStatus.CANCELLED,
+    "return_initiated": OrderStatus.RETURN_INITIATED,
+    "refunded": OrderStatus.REFUNDED,
+}
+
+
+def _to_order(order: EngineOrder) -> Order:
+    tracking_url = (
+        f"https://track.acme-supply.example/{order.tracking_number}"
+        if order.tracking_number
+        else None
+    )
+    return Order(
+        order_id=order.id,
+        status=_STATUS_MAP.get(order.status.lower(), OrderStatus.PROCESSING),
+        placed_at=datetime.fromisoformat(order.created_at.replace("Z", "+00:00")),
+        items=[
+            OrderItem(
+                product_id=item.sku,
+                title=item.name,
+                quantity=item.quantity,
+                price=float(Decimal(item.unit_price_exact)),
+            )
+            for item in order.items
+        ],
+        total=float(Decimal(order.total_amount_exact)),
+        currency=order.currency,
+        tracking_url=tracking_url,
+    )
 
 
 def _title(product: EngineProduct, variant: ProductVariant, variant_count: int) -> str:
@@ -281,20 +326,57 @@ class EngineStorefront(StorefrontBackend):
     # -- Orders and policies --------------------------------------------------------
 
     async def get_orders(self, session: ShoppingSessionContext, limit: int = 5) -> list[Order]:
-        raise NotImplementedError
+        binding = self.store.binding(session.session_id)
+        orders = await self.store.call(lambda c: c.orders.list())
+        mine = [o for o in orders if o.customer_id == binding.subject_id]
+        mine.sort(key=lambda o: o.created_at, reverse=True)
+        return [_to_order(o) for o in mine[:limit]]
 
     async def get_order(self, session: ShoppingSessionContext, order_id: str) -> Order | None:
-        raise NotImplementedError
+        binding = self.store.binding(session.session_id)
+        order = await self.store.call(lambda c: c.orders.get(order_id))
+        if order is None or order.customer_id != binding.subject_id:
+            return None
+        return _to_order(order)
 
     async def search_policies(self, session: ShoppingSessionContext, query: str) -> list[Policy]:
-        raise NotImplementedError
+        return await content.find_policies(self.store, query)
 
     async def get_disclosure(
         self, session: ShoppingSessionContext, product_id: str
     ) -> Disclosure | None:
-        return None
+        return await content.find_disclosure(self.store, product_id)
 
     async def get_fulfillment_options(
         self, session: ShoppingSessionContext, product_ids: list[str]
     ) -> list[FulfillmentOption]:
-        raise NotImplementedError
+        # Rates come from the session cart's actual contents rather than ``product_ids``
+        # (the engine has no per-item shipping quote); only the first twenty are honored,
+        # matching the interface's cap.
+        _ = product_ids[:20]
+        cart_id = self._cart_ids.get(session.session_id)
+        if cart_id is None:
+            return []
+
+        rates = await self.store.call(lambda c: c.carts.get_shipping_rates(cart_id))
+        return [
+            FulfillmentOption(
+                method="shipping",
+                eta=(
+                    f"{rate.estimated_days} business day{'s' if rate.estimated_days != 1 else ''}"
+                    if rate.estimated_days is not None
+                    else (rate.description or rate.service)
+                ),
+                fee=float(Decimal(str(rate.price))),
+                location=f"{rate.carrier} {rate.service}",
+            )
+            for rate in rates
+        ]
+
+    async def checkout_handoff(
+        self, session: ShoppingSessionContext, cart: Cart
+    ) -> list[CheckoutHandoff]:
+        if self.checkout_base_url is None:
+            return []
+        cart_id = await self._cart_id(session)
+        return [CheckoutHandoff(url=f"{self.checkout_base_url}?cart={cart_id}")]
