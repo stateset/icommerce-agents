@@ -1,0 +1,9 @@
+line-length = 100
+target-version = "py312"
+extend-exclude = ["vendor", "docs"]
+
+[lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[lint.per-file-ignores]
+"tests/*" = ["B011"]

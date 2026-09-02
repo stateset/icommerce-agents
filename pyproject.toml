@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stateset-icommerce-agents"
+version = "0.1.0"
+description = "The commerce-agents architecture on the StateSet iCommerce engine."
+requires-python = ">=3.12,<3.13"
+license = { text = "MIT" }
+dependencies = [
+  "stateset-embedded==1.28.5",
+  "fastapi>=0.141",
+  "uvicorn>=0.52",
+  "pydantic>=2.7",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["engine_backend"]
