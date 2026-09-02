@@ -43,3 +43,49 @@ async def test_the_cart_persists_in_the_engine(store):
     engine_carts = store.commerce.carts.list()
     assert len(engine_carts) == 1
     assert store.commerce.carts.get_items(engine_carts[0].id)[0].sku == "TENT-RIDGE-GRN"
+
+
+async def test_get_cart_reads_are_bounded_not_per_line(store):
+    """_to_cart must not issue a store.call per cart line: the number of round trips
+    through the thread pool should stay flat as lines are added, not grow with them."""
+    backend = EngineStorefront(store)
+    ctx = session(store)
+
+    skus = [
+        "TENT-RIDGE-GRN",
+        "TENT-RIDGE-TAN",
+        "BAG-SUMMIT-REG",
+        "BAG-SUMMIT-LNG",
+        "PACK-SWITCH-SLT",
+    ]
+    for sku in skus:
+        await backend.add_to_cart(ctx, sku, 1)
+
+    original_call = store.call
+    calls = {"count": 0}
+
+    async def counting_call(fn):
+        calls["count"] += 1
+        return await original_call(fn)
+
+    store.call = counting_call
+    try:
+        cart = await backend.get_cart(ctx)
+    finally:
+        store.call = original_call
+
+    # One call for get_items, one for the batched variant lookup, plus one
+    # read_merchandising per distinct *product family* (3 here: tent, bag, pack) —
+    # flat regardless of line count. The old N+1 code made 2 calls per line (10
+    # for 5 lines); this pins it well below that.
+    assert calls["count"] == 5
+    assert calls["count"] < 2 * len(skus)
+
+    assert sorted((i.product_id, i.quantity) for i in cart.items) == sorted(
+        (sku, 1) for sku in skus
+    )
+    grn = next(i for i in cart.items if i.product_id == "TENT-RIDGE-GRN")
+    assert grn.option_values == {"colour": "green"}
+    assert grn.variant_of is not None
+    reg = next(i for i in cart.items if i.product_id == "BAG-SUMMIT-REG")
+    assert reg.option_values == {"length": "regular"}

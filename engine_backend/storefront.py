@@ -232,14 +232,25 @@ class EngineStorefront(StorefrontBackend):
 
     async def _to_cart(self, cart_id: str) -> Cart:
         items = await self.store.call(lambda c: c.carts.get_items(cart_id))
+
+        skus = {item.sku for item in items}
+
+        def resolve_variants(c: Commerce) -> dict[str, ProductVariant | None]:
+            return {sku: c.products.get_variant_by_sku(sku) for sku in skus}
+
+        variants_by_sku = await self.store.call(resolve_variants) if skus else {}
+
+        product_ids = {v.product_id for v in variants_by_sku.values() if v is not None}
+        merch_by_product = {
+            product_id: await read_merchandising(self.store, product_id)
+            for product_id in product_ids
+        }
+
         cart_items: list[CartItem] = []
         for item in items:
-            variant = await self.store.call(lambda c, s=item.sku: c.products.get_variant_by_sku(s))
-            merch = (
-                await read_merchandising(self.store, variant.product_id)
-                if variant is not None
-                else Merchandising()
-            )
+            variant = variants_by_sku.get(item.sku)
+            merch = merch_by_product.get(variant.product_id) if variant is not None else None
+            merch = merch if merch is not None else Merchandising()
             option_values = merch.variant_options.get(item.sku, {}) if variant is not None else {}
             cart_items.append(
                 CartItem(
