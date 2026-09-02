@@ -48,8 +48,12 @@ def _passes(row: CatalogRow, filters: SearchFilters) -> bool:
         return False
     if filters.max_price is not None and row.variant.price > filters.max_price:
         return False
-    if filters.min_rating is not None and (row.merch.rating or 0.0) < filters.min_rating:
-        return False
+    if filters.min_rating is not None:
+        # An unrated product (rating=None) does not satisfy a rating floor: inventing a
+        # rating for it would violate the rule that figures derive from engine values.
+        unrated = row.merch.rating is None
+        if unrated or row.merch.rating < filters.min_rating:
+            return False
     return all(row.merch.attributes.get(k) == v for k, v in filters.attributes.items())
 
 
@@ -75,5 +79,8 @@ async def search(
     elif filters.sort == "rating":
         chosen.sort(key=lambda r: -(r.merch.rating or 0.0))
     else:
+        # An empty query scores every row 1.0, so relevance order collapses to price,
+        # ascending. This is deliberate, not incidental: the default call shape (no
+        # query, no explicit sort) still returns a stable, useful ordering.
         chosen.sort(key=lambda r: (-score(r, terms), r.variant.price))
     return chosen[:limit]
