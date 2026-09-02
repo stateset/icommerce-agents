@@ -104,6 +104,12 @@ is what upstream's cart-write serialization requires anyway.
 
 ### Type mapping
 
+**Id convention.** A purchasable record's `product_id` is the engine **variant SKU**; a
+family's `product_id` is the engine **product id**. The engine's `CartItem` exposes `sku`
+but neither `product_id` nor `variant_id`, so keying purchasables by SKU is what makes
+`update_cart_item` and `remove_from_cart` resolvable at all, and it keeps provenance ids
+stable across turns. `get_product_details` accepts either shape.
+
 Upstream's `Product` carries `options` and `option_values`; the engine's `ProductVariant`
 supplies both, so a product with variants presents as a parent plus variant rows and
 upstream's "held, pointed at its variants" gate works unmodified. Money is `float` on
