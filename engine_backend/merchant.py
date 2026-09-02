@@ -793,14 +793,33 @@ class EngineMerchant(MerchantBackend):
         (``product_variants.price``, ``products.status``, ``products.description``) —
         the engine's own binding has no ``products.update`` or a variant price setter.
         This mirrors ``catalog.py``'s ``list_variants``, which reads what the binding
-        does not expose; here it is a write, issued against the same on-disk store and
-        serialized the same way ``EngineStore.write`` serializes a binding call, so it
-        never races a concurrent write to the same key."""
+        does not expose; here it is a write.
+
+        Schema and triggers on ``products`` / ``product_variants`` were inspected
+        directly (``PRAGMA table_info`` and ``sqlite_master`` triggers), not assumed:
+        neither table has a trigger that maintains ``updated_at`` or ``version``
+        (unlike, say, ``warehouses``), so setting both by hand here matches what a
+        native write does and there is nothing else on either table for this path to
+        miss. ``products`` does carry ``product_fts_{ai,ad,au}`` triggers that keep its
+        full-text index in sync from ``name``/``description``/``slug``; those are
+        schema-level and fire for any UPDATE on the table regardless of which
+        connection issues it, so a status/description write through this path still
+        keeps the search index correct. ``product_variants`` has no trigger at all.
+
+        This opens its own connection and serializes only against other direct-SQL
+        writes from this class (the ``"direct_sql"`` lock key) — it does not serialize
+        against a concurrent binding write from ``self.store.write``/``self.store.call``
+        on the same row (e.g. ``_apply_restock``'s ``inventory.adjust`` under
+        ``f"stock:{sku}"``), since those go through a different connection entirely.
+        ``busy_timeout`` makes that contention wait and retry rather than raise
+        ``sqlite3.OperationalError: database is locked``.
+        """
         import sqlite3
 
         def body() -> None:
-            connection = sqlite3.connect(self.store.db_path)
+            connection = sqlite3.connect(self.store.db_path, timeout=30)
             try:
+                connection.execute("PRAGMA busy_timeout = 30000")
                 connection.execute(sql, params)
                 connection.commit()
             finally:
@@ -870,7 +889,10 @@ class EngineMerchant(MerchantBackend):
                 },
                 idempotency_key=f"{change.change_id}:{sku}",
             )
-            if not receipt.ok:
+            if not receipt.ok or not receipt.sealed:
+                # `sealed` is False for a receipt this process synthesized locally
+                # (kernel.py) rather than one the engine actually sealed — that is
+                # never evidence of a governed write, whatever `ok` says.
                 raise RuntimeError(
                     f"inventory.item.create for {sku!r} failed: "
                     f"{receipt.error_code} {receipt.error_message}"
