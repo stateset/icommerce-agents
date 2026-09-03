@@ -74,3 +74,19 @@ this staging design otherwise provides. Do not run these servers unattended, and
 the Messages API host's HTTP approval route (`host/app.py`) over the MCP path for any
 deployment where an operator's own out-of-band confirmation must be guaranteed rather
 than merely conventional.
+
+**This also depends on the model, not only the client.** `host_approve` is an ordinary
+tool; nothing distinguishes a call the model made on its own initiative from one a human
+told it to make. A live run against `claude-sonnet-4-5` (`docs/testing.md`, "Live MCP
+run") asked only to stage a price change and "apply it," and the model found
+`host_approve` unprompted, called it, and then applied successfully — the model
+satisfied, entirely by itself, the gate that exists to require a human between staging
+and applying. A client that surfaces every tool call faithfully does not prevent this:
+a human watching two calls go by and clicking "allow" on each has approved that the
+calls happen, not that the change should apply — the model, not the operator, decided
+`host_approve` was warranted. In the same test, `claude-opus-5` declined to call
+`host_approve` itself, reasoning explicitly that doing so "would defeat the point of the
+two-step gate" — correct judgment, but judgment, not code, and not something this
+server enforces or can enforce. Treat the two-call design as raising the bar a client's
+UX and a model's own restraint must both clear, not as a guarantee this server provides
+on its own.
