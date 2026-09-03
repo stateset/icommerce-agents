@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  # Single top-level knob: a later task upgrades the web workspace to Node 22 / Next 16.
+  # Changing web builds to that version is then a one-line edit here.
+  NODE_VERSION: "18"
+
+jobs:
+  python:
+    # requires-python caps at "<3.13" (pyproject.toml), so a 3.13 job cannot install
+    # the package. Run 3.12 only until that cap is deliberately widened.
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+    runs-on: ubuntu-latest
+    # stateset-embedded==1.28.5 publishes manylinux_2_34 wheels and ubuntu-latest's glibc
+    # satisfies that, so this job normally installs from a prebuilt wheel in well under
+    # a minute. On a runner with an older glibc, pip falls back to building the engine
+    # from its cargo/maturin sdist, which compiles Rust and can take 15+ minutes — hence
+    # the generous timeout below.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: ruff format --check
+        run: ruff format --check .
+
+      - name: pytest
+        run: pytest
+
+      - name: drift check
+        run: python scripts/check.py
+
+      - name: denial walkthrough
+        run: python scripts/denials.py
+
+  web:
+    runs-on: ubuntu-latest
+    # This job never blocks the python job: it runs independently, in parallel, and
+    # nothing in `python` depends on it (no `needs:`).
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: npm ci
+        run: npm ci
+
+      - name: build storefront
+        run: npm run build --workspace web/storefront
+
+      - name: build portal
+        run: npm run build --workspace web/portal
