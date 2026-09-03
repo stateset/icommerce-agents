@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -83,3 +84,37 @@ async def test_an_over_refund_is_refused_even_with_approval(kernel, store):
     assert not receipt.ok
     assert receipt.error_code
     assert receipt.error_message
+
+
+def test_every_enabled_policy_command_is_disclosed_in_the_enforcement_doc():
+    """`docs/enforcement.md` states, per command, whether anything in this repo can
+    reach it. Two of the five grants have no code path at all; that is disclosed rather
+    than hidden, and this test is what stops a grant added later from going undisclosed.
+    """
+    policy = json.loads((CONFIG / "kernel-policy.json").read_text())
+    doc = (CONFIG.parent / "docs" / "enforcement.md").read_text()
+    undisclosed = [name for name in policy["commands"] if f"`{name}`" not in doc]
+    assert not undisclosed, (
+        f"kernel-policy.json enables {undisclosed} but docs/enforcement.md never names "
+        "them; every grant must say where it is issued from, or that nothing issues it"
+    )
+
+
+def test_the_commands_with_no_code_path_are_named_as_such():
+    """The specific claim the doc makes: `payments.create` is issued only by a test and
+    `products.create` by nothing at all. If either becomes reachable, this fails and the
+    table needs rewriting rather than quietly going stale."""
+    repo = CONFIG.parent
+    # Everything a running deployment executes: the backends, the host, the MCP servers
+    # and the scripts. Not `tests/`, which is where the doc says these two are issued.
+    issuers = set()
+    for package in ("engine_backend", "host", "mcp_servers", "scripts", "evals"):
+        for path in sorted((repo / package).glob("*.py")):
+            source = path.read_text()
+            for command in ('"payments.create"', '"products.create"'):
+                if command in source and "kernel.execute" in source.replace("self.", ""):
+                    issuers.add((f"{package}/{path.name}", command))
+    assert not issuers, (
+        "docs/enforcement.md says nothing outside tests/ issues these as kernel "
+        f"commands; found {sorted(issuers)}"
+    )

@@ -46,16 +46,42 @@ Of the five commands this deployment does enable, only one of the seven
 bringing a brand-new SKU into the stock ledger (`inventory.item.create`, when a restock
 names a SKU with no existing inventory item). Every other merchant write — repricing,
 merchandising content, promotions, campaigns, and even restocking a SKU the store
-already tracks — is a direct binding write (or, for two fields, direct SQL) plus an
+already tracks — is a direct binding write (or, for three fields, direct SQL) plus an
 activity-log entry, with no kernel receipt at all. It does not govern merchandising.
 
-`payments.create_refund` is enabled and is exercised — by `scripts/denials.py` and by
-`tests/test_kernel.py` — but only as a direct `KernelClient.execute` call in a script or
-a test. There is no host route or agent tool in this repo that issues a refund; the
-FastAPI host (`host/app.py`) has no refund endpoint, and no `MerchantBackend`/
-`StorefrontBackend` method calls `payments.create_refund`. Do not infer a refund flow
-from its presence in the policy or in the denial demo — this repo shows the command is
-governed, not that it is reachable from a chat turn.
+### Which of the five are reachable, and from where
+
+`KernelClient.execute` is called from exactly three places in this repo:
+`engine_backend/apply.py`, `host/app.py`, and `scripts/denials.py`. Taking the five
+enabled commands one at a time:
+
+| Command | Issued from | Reachable in a running deployment? |
+|---|---|---|
+| `inventory.item.create` | `engine_backend/apply.py` (restock of a SKU with no inventory item) | **Yes** — an applied, approved staged change reaches it |
+| `checkout.commit` | `host/app.py`'s `POST /shopping/checkout` | **Yes** — a human click on the host route |
+| `payments.create_refund` | `scripts/denials.py`, `tests/test_kernel.py` | No — script and test only |
+| `payments.create` | `tests/test_kernel.py` | No — test only |
+| `products.create` | nowhere | No — no code path issues it as a kernel command at all |
+
+The bottom three are the honest part of this section. There is no host route and no
+agent tool in this repo that issues a refund: `host/app.py` has no refund endpoint, and
+no `MerchantBackend`/`StorefrontBackend` method calls `payments.create_refund`. Nothing
+issues `payments.create` outside `tests/test_kernel.py`, which uses it as the simplest
+governed command to assert a sealed receipt against. And nothing issues `products.create`
+as a kernel command at all — `engine_backend/seed.py` creates the seeded catalog through
+`commerce.products.create` on the binding, which is an ungoverned write like every other
+binding call in this repo, and does not pass through the policy.
+
+So two of the five grants are policy with no code path behind them, and a third is
+exercised only by a script and a test. They are kept in `config/kernel-policy.json`
+because the policy file is this deployment's declared subset of the engine's governed
+set, and the point this document exists to make is precisely the gap between what the
+engine governs and what a chat turn can reach — a policy trimmed to only the reachable
+commands would state the smaller claim by hiding the larger one. Do not infer a refund
+flow, a payment flow, or a product-creation flow from their presence in the policy or in
+the denial demo: this repo shows those commands are governed, not that they are reachable.
+`tests/test_kernel.py` fails if a command in the policy is not accounted for in this
+table, so a grant added later cannot go undisclosed.
 
 This means: **a merchant agent editing listings and prices is protected by its agent
 layer alone.** There is no second, engine-side check on a price move, a status change,
