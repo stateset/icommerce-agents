@@ -10,15 +10,34 @@ from stateset_embedded import (
     CreateProductVariantInput,
 )
 
+from engine_backend import money
 from engine_backend.catalog import MERCHANDISING_TYPE, Merchandising, ensure_types
+
+
+def _price(value: float) -> float:
+    """A seeded amount, canonicalized through the money seam before it reaches the
+    binding.
+
+    ``CreateProductVariantInput.price``, ``CreateOrderItemInput.unit_price``, and
+    ``Payments.create``'s ``amount`` all take a bare ``float`` with no currency-scale
+    check -- unlike ``Payments.create_exact``, the binding will happily persist more
+    than two decimal places (``price=2.675`` lands as the three-decimal string
+    ``"2.675"``, not a rejected input). Routing every literal through
+    :func:`money.exact` first means a value is quantized in ``Decimal`` -- half-up, to
+    two places -- before it ever reaches the binding, the same discipline
+    ``engine_backend.merchant`` and ``engine_backend.storefront`` use for every other
+    read of an engine money field.
+    """
+    return money.to_float(money.exact(value))
+
 
 _CATALOG = [
     {
         "name": "Ridgeline 2-Person Tent",
         "description": "A three-season backpacking tent for two.",
         "variants": [
-            {"sku": "TENT-RIDGE-GRN", "name": "Green", "price": 219.00, "stock": 24},
-            {"sku": "TENT-RIDGE-TAN", "name": "Tan", "price": 219.00, "stock": 4},
+            {"sku": "TENT-RIDGE-GRN", "name": "Green", "price": _price(219.00), "stock": 24},
+            {"sku": "TENT-RIDGE-TAN", "name": "Tan", "price": _price(219.00), "stock": 4},
         ],
         "merch": {
             "brand": "ACME Outdoors",
@@ -40,8 +59,8 @@ _CATALOG = [
         "name": "Summit -7C Sleeping Bag",
         "description": "A mummy-cut sleeping bag rated to -7C.",
         "variants": [
-            {"sku": "BAG-SUMMIT-REG", "name": "Regular", "price": 159.00, "stock": 18},
-            {"sku": "BAG-SUMMIT-LNG", "name": "Long", "price": 169.00, "stock": 11},
+            {"sku": "BAG-SUMMIT-REG", "name": "Regular", "price": _price(159.00), "stock": 18},
+            {"sku": "BAG-SUMMIT-LNG", "name": "Long", "price": _price(169.00), "stock": 11},
         ],
         "merch": {
             "brand": "ACME Outdoors",
@@ -63,7 +82,7 @@ _CATALOG = [
         "name": "Trailhead Camp Stove",
         "description": "A single-burner canister stove for backcountry cooking.",
         "variants": [
-            {"sku": "STOVE-TRAIL-1", "name": "Standard", "price": 49.00, "stock": 0},
+            {"sku": "STOVE-TRAIL-1", "name": "Standard", "price": _price(49.00), "stock": 0},
         ],
         "merch": {
             "brand": "ACME Outdoors",
@@ -80,8 +99,8 @@ _CATALOG = [
         "name": "Switchback 22L Daypack",
         "description": "A 22-liter daypack for day hikes and commuting.",
         "variants": [
-            {"sku": "PACK-SWITCH-SLT", "name": "Slate", "price": 89.00, "stock": 30},
-            {"sku": "PACK-SWITCH-MOS", "name": "Moss", "price": 89.00, "stock": 22},
+            {"sku": "PACK-SWITCH-SLT", "name": "Slate", "price": _price(89.00), "stock": 30},
+            {"sku": "PACK-SWITCH-MOS", "name": "Moss", "price": _price(89.00), "stock": 22},
         ],
         "merch": {
             "brand": "ACME Gear",
@@ -103,7 +122,7 @@ _CATALOG = [
         "name": "Clearwater Pump Filter",
         "description": "A hand-pump water filter for backcountry sources.",
         "variants": [
-            {"sku": "FILTER-CLEAR-1", "name": "Standard", "price": 79.00, "stock": 15},
+            {"sku": "FILTER-CLEAR-1", "name": "Standard", "price": _price(79.00), "stock": 15},
         ],
         "merch": {
             "brand": "ACME Gear",
@@ -120,8 +139,8 @@ _CATALOG = [
         "name": "Beacon 300 Headlamp",
         "description": "A rechargeable 300-lumen headlamp with a red night mode.",
         "variants": [
-            {"sku": "LAMP-BEACON-BLK", "name": "Black", "price": 45.00, "stock": 27},
-            {"sku": "LAMP-BEACON-ORG", "name": "Orange", "price": 45.00, "stock": 9},
+            {"sku": "LAMP-BEACON-BLK", "name": "Black", "price": _price(45.00), "stock": 27},
+            {"sku": "LAMP-BEACON-ORG", "name": "Orange", "price": _price(45.00), "stock": 9},
         ],
         "merch": {
             "brand": "ACME Gear",
@@ -137,6 +156,32 @@ _CATALOG = [
             "attributes": {"lumens": "300", "rechargeable": "true"},
             "specs": {"battery": "USB-C, 1200 mAh"},
             "long_description": "A red night mode preserves night vision at camp.",
+        },
+    },
+    {
+        "name": "Camp Table (Folding)",
+        "description": "A packable aluminium table for a camp kitchen.",
+        "variants": [
+            {
+                "sku": "TABLE-CAMP-FOLD",
+                "name": "Standard",
+                # Split from a $250.70 case of four, landing on 62.675 -- not
+                # binary-exact, and not cent-exact either. Passed straight to the
+                # binding this becomes the three-decimal string "62.675"; `_price`
+                # quantizes it to "62.68" first. See tests/test_seed_money.py.
+                "price": _price(250.70 / 4),
+                "stock": 14,
+            },
+        ],
+        "merch": {
+            "brand": "ACME Outdoors",
+            "category": "camping",
+            "rating": 4.3,
+            "review_count": 19,
+            "unit_cost": 24.00,
+            "attributes": {"material": "aluminium"},
+            "specs": {"packed_size": "45 x 8 x 8 cm"},
+            "long_description": "Folds flat and locks open with a single latch.",
         },
     },
 ]
@@ -185,12 +230,12 @@ def seed_store(commerce: Commerce) -> None:
                 sku="TENT-RIDGE-GRN",
                 name="Ridgeline 2-Person Tent (Green)",
                 quantity=1,
-                unit_price=219.00,
+                unit_price=_price(219.00),
             )
         ],
     )
-    payment = commerce.payments.create(
-        amount=219.00,
+    payment = commerce.payments.create_exact(
+        amount=money.exact(219.00),
         currency="USD",
         order_id=order1.id,
         customer_id=customer1.id,
@@ -205,7 +250,7 @@ def seed_store(commerce: Commerce) -> None:
                 sku="BAG-SUMMIT-REG",
                 name="Summit -7C Sleeping Bag (Regular)",
                 quantity=1,
-                unit_price=159.00,
+                unit_price=_price(159.00),
             )
         ],
     )
@@ -217,13 +262,13 @@ def seed_store(commerce: Commerce) -> None:
                 sku="PACK-SWITCH-SLT",
                 name="Switchback 22L Daypack (Slate)",
                 quantity=1,
-                unit_price=89.00,
+                unit_price=_price(89.00),
             ),
             CreateOrderItemInput(
                 sku="LAMP-BEACON-BLK",
                 name="Beacon 300 Headlamp (Black)",
                 quantity=1,
-                unit_price=45.00,
+                unit_price=_price(45.00),
             ),
         ],
     )
