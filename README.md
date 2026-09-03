@@ -1,7 +1,7 @@
 # stateset-icommerce-agents
 
 Anthropic's `commerce-agents` architecture — a shopping agent and a merchant agent,
-each on three paths (Messages API host, Agent SDK console, MCP server) — running on the
+each on two paths (the Messages API host and a role MCP server) — running on the
 StateSet iCommerce embedded engine (`stateset-embedded`) instead of an in-memory demo
 backend. One fictional store, ACME Supply, one SQLite-backed engine instance, two agent
 roles.
@@ -54,9 +54,10 @@ full test suite, does not.
 
 ## Enforcement
 
-Two layers check every write in this repo, independently: the agent layer's gates
-(`shopping_agent.gates`, `merchant_agent.gates`) and, for the five commands this
-policy governs, the engine's own kernel check. `docs/enforcement.md` is the full
+Every write in this repo goes through the agent layer's gates (`shopping_agent.gates`,
+`merchant_agent.gates`). Only the five commands this deployment's kernel policy governs
+are *also* checked by a second, independent layer — the engine's own kernel — and no
+merchandising write is one of them. `docs/enforcement.md` is the full
 account, including the finding it exists to state: the engine governs the transaction
 spine — checkout, payments, refunds, order and reservation transitions, the stock
 ledger — and does not govern merchandising, where the agent layer's guardrails and

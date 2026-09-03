@@ -1,5 +1,5 @@
 """The merchant agent's MCP server, over the same ``EngineMerchant`` the Messages API
-host and the Agent SDK console use — the merchant role's own tool surface (metrics,
+host uses — the merchant role's own tool surface (metrics,
 listings, the staged-change queue, ``apply_change``), not the engine's own
 900+-tool server::
 
@@ -276,6 +276,10 @@ def build_merchant_server(
         ),
     )
     async def host_approve(change_id: str, ctx: Context) -> str:
+        # `ctx` is unused: this handler calls the backend directly rather than going
+        # through the executor. It stays in the signature because FastMCP injects it by
+        # parameter type and rejects a leading-underscore parameter name outright, so
+        # `del` is the only way to mark it unused here.
         del ctx
         backend.approve(change_id, op)
         return f"change {change_id} marked approved by {op}"

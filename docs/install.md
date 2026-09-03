@@ -51,5 +51,5 @@ and the kernel directly, not a model call:
 python scripts/denials.py
 ```
 
-Running the host or the Agent SDK console for a live chat turn does need
+Running the host for a live chat turn does need
 `ANTHROPIC_API_KEY` set in the environment.

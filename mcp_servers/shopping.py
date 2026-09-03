@@ -1,5 +1,5 @@
 """The shopping agent's MCP server, over the same ``EngineStorefront`` the Messages API
-host and the Agent SDK console use — the shopping role's own tool surface (catalog
+host uses — the shopping role's own tool surface (catalog
 search, cart, orders, policies, fulfillment, memory), not the engine's own 900+-tool
 server::
 
