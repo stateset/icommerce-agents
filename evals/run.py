@@ -60,12 +60,14 @@ async def _run_case(case: EvalCase, client: Any, db_path: str) -> EvalResult:
         customer = store.commerce.customers.get_by_email(_CUSTOMER_EMAIL)
         agent = ShoppingAgent(backend=storefront, skills_dir=SKILLS_DIR("shopping"), client=client)
         session = ShoppingSessionContext(session_id=f"eval-{case.id}", user_id=customer.id)
+        store.bind(session.session_id, customer.id, "customer")
         state = ShoppingSessionState()
     elif case.role == "merchant":
         agent = MerchantAgent(backend=merchant, skills_dir=SKILLS_DIR("merchant"), client=client)
         session = MerchantSessionContext(
             session_id=f"eval-{case.id}", merchant_id=store.store_id, operator=_OPERATOR_ID
         )
+        store.bind(session.session_id, _OPERATOR_ID, "operator")
         state = MerchantSessionState()
     else:
         raise ValueError(f"unknown role {case.role!r}")
@@ -104,7 +106,7 @@ def run(cases: list[EvalCase], client: Any) -> list[EvalResult]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    del argv
+    args = sys.argv[1:] if argv is None else argv
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print(
             "No ANTHROPIC_API_KEY set -- skipping the eval suite. This suite has never "
@@ -115,8 +117,10 @@ def main(argv: list[str] | None = None) -> int:
 
     from host.anthropic_client import build_anthropic_client
 
+    cases = [c for c in CASES if c.id in args] if args else CASES
+
     client = build_anthropic_client()
-    results = run(CASES, client)
+    results = run(cases, client)
     failures = [r for r in results if not r.passed]
     for result in results:
         status = "PASS" if result.passed else "FAIL"

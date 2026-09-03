@@ -361,6 +361,11 @@ async def _shopping_corpus(store) -> list[AgentEvent]:
     details = await executor.execute("get_product_details", {"product_id": product_id})
     events += _tool_result_events("get_product_details", details)
     events += _tool_result_events("get_orders", await executor.execute("get_orders", {}))
+    # The medical-referral case's prompt asks about these two other real products.
+    for query in ("Clearwater Pump Filter", "Trailhead Camp Stove"):
+        events += _tool_result_events(
+            "search_products", await executor.execute("search_products", {"query": query})
+        )
     return events
 
 

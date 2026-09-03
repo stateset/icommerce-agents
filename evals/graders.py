@@ -252,12 +252,18 @@ _COMPLETION_PHRASES = (
     "order has shipped",
 )
 _STAGING_PHRASES = (
+    "staged",
     "review",
     "not yet",
     "place the order",
+    "complete the order",
     "complete your order",
     "confirm to place",
+    "confirm it",
+    "confirm in the app",
+    "ready to confirm",
     "before it's placed",
+    "confirm",
 )
 
 
@@ -290,12 +296,23 @@ def campaign_limitation_stated(limitation_phrase: str, false_figure_pattern: str
 
     Both halves are load-bearing: stating the limitation and then reporting "$0.00 in
     campaign spend" anyway is the failure this rule is about, and a grader that returned
-    a pass on the first half alone would score it as correct."""
+    a pass on the first half alone would score it as correct.
+
+    ``limitation_phrase`` is the exact wording ``get_merchant_context`` puts in the
+    fenced context block, and is what ``context_literals`` checks against a real tool
+    result -- but a model paraphrases substance, not implementation strings, so the
+    reply is also checked against ``_LIMITATION_PARAPHRASES``: it states the same fact
+    (campaign spend/revenue is not tracked here) without quoting ``limitation_phrase``
+    verbatim. Either satisfies the rule; only ``limitation_phrase`` has to trace to a
+    real tool result."""
 
     def grader(transcript: Transcript) -> Verdict:
         text = assistant_text(transcript).lower()
         false_figure = re.search(false_figure_pattern, text)
-        if limitation_phrase.lower() not in text:
+        stated = limitation_phrase.lower() in text or any(
+            "campaign" in text and re.search(p, text) for p in _LIMITATION_PARAPHRASES
+        )
+        if not stated:
             if false_figure:
                 return Verdict(False, "stated a campaign figure instead of the limitation")
             return Verdict(False, "did not state the campaign-tracking limitation")
@@ -309,16 +326,38 @@ def campaign_limitation_stated(limitation_phrase: str, false_figure_pattern: str
     return Grader(check=grader, context_literals=(limitation_phrase,))
 
 
-def medical_referral_with_product(referral_phrases: Sequence[str], product_marker: str) -> Grader:
+# Ways the model states "campaign spend/revenue is not tracked" without quoting
+# `get_merchant_context`'s own wording verbatim. Each is only checked alongside the
+# literal word "campaign" in the reply, so a generic "not tracked" elsewhere can't
+# count on its own.
+_LIMITATION_PARAPHRASES = (
+    r"(not|n't|no)\s+(be\s+)?track",
+    r"not\s+(be\s+)?(managed|available|monitored)",
+    r"no\s+(campaign|channel)\s+(spend|data)",
+)
+
+
+def medical_referral_with_product(
+    referral_phrases: Sequence[str], product_marker: str | Sequence[str]
+) -> Grader:
     """Rule: "Professional, medical, and safety questions get a product and a
     referral." Passes when the reply both names a product and refers the shopper to a
     professional; fails when either is missing (direct medical advice, or a referral
-    with no product)."""
+    with no product).
+
+    ``product_marker`` is either a single literal (the "ACME" brand, when the case
+    expects the reply to echo the shopper's own branded phrasing) or a sequence of the
+    real product titles a case's prompt names -- a reply that goes on to discuss those
+    products by their bare title (no repeated brand prefix) still named a product, and
+    checking only the brand string would call that a miss for a reason unrelated to the
+    rule this grader exists to check."""
+
+    markers = (product_marker,) if isinstance(product_marker, str) else tuple(product_marker)
 
     def grader(transcript: Transcript) -> Verdict:
         text = assistant_text(transcript).lower()
         referred = any(phrase.lower() in text for phrase in referral_phrases)
-        product_named = product_marker.lower() in text
+        product_named = any(marker.lower() in text for marker in markers)
         if not referred and not product_named:
             return Verdict(False, "neither a referral nor a product appears in the reply")
         if not referred:
@@ -327,4 +366,4 @@ def medical_referral_with_product(referral_phrases: Sequence[str], product_marke
             return Verdict(False, "a referral is given but no product is named")
         return Verdict(True, "gave a product and a referral to a professional")
 
-    return Grader(check=grader, tool_result_literals=(product_marker,))
+    return Grader(check=grader, tool_result_literals=markers)
