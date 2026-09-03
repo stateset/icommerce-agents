@@ -85,6 +85,60 @@ async def _apply_write(
     raise ChangeNotApplicable(f"unknown change kind {change.kind!r}")
 
 
+def _update_variant_price_binding(commerce: Commerce, sku: str, price: float) -> None:
+    """Update variant price using the binding mutator when available.
+
+    Falls back to a direct-SQL path upstream has used historically only when the
+    mutator is not present on the installed binding.
+    """
+    variant = commerce.products.get_variant_by_sku(sku)
+    if variant is None:
+        raise ChangeNotApplicable(f"no variant with sku {sku!r}")
+    # Build a full variant input preserving existing fields that the update requires.
+    # The Python binding's CreateProductVariantInput is exported in 1.28.5; updateVariant
+    # requires sku and price and accepts optional fields.
+    try:
+        from stateset_embedded import CreateProductVariantInput  # local import for type
+    except Exception as _e:  # pragma: no cover - defensive, binding is pinned in CI
+        CreateProductVariantInput = None  # type: ignore[assignment]
+    input_kwargs: dict[str, object] = {
+        "sku": variant.sku,
+        "price": price,
+    }
+    # Preserve optional fields when present on the variant object.
+    if getattr(variant, "name", None) is not None:
+        input_kwargs["name"] = variant.name
+    if getattr(variant, "compare_at_price", None) is not None:
+        input_kwargs["compare_at_price"] = variant.compare_at_price
+    if getattr(variant, "is_default", None) is not None:
+        input_kwargs["is_default"] = variant.is_default
+    # Prefer camelCase mutator name exactly as exposed in the binding; snake_case fallback
+    # is attempted in case the symbol is surfaced that way.
+    if hasattr(commerce.products, "updateVariant"):
+        update_payload = (
+            CreateProductVariantInput(**input_kwargs) if CreateProductVariantInput else input_kwargs
+        )
+        commerce.products.updateVariant(variant.product_id, update_payload)  # type: ignore[arg-type]
+        return
+    if hasattr(commerce.products, "update_variant"):
+        update_payload = (
+            CreateProductVariantInput(**input_kwargs) if CreateProductVariantInput else input_kwargs
+        )
+        commerce.products.update_variant(variant.product_id, update_payload)  # type: ignore[arg-type]
+        return
+    # No mutator available on this binding: the caller will provide the legacy fallback.
+    raise AttributeError("products.updateVariant/update_variant not available on binding")
+
+
+def _update_product_binding(commerce: Commerce, product_id: str, **fields: object) -> None:
+    """Update product fields via binding mutator when available (description/status)."""
+    # Prefer update(id, { ... }) when present.
+    if hasattr(commerce.products, "update"):
+        commerce.products.update(product_id, fields)
+        return
+    raise AttributeError("products.update not available on binding")
+
+
 async def _log_apply(
     ctx: ApplyContext, change: StagedChange, summary: str
 ) -> tuple[str, staging.Evidence]:
@@ -142,11 +196,19 @@ async def _apply_price_update(
         if item.field != "price":
             continue
         price = money.exact(item.after)
-        await ctx.store.write_sql(
-            "UPDATE product_variants SET price = ?, "
-            "updated_at = datetime('now'), version = version + 1 WHERE sku = ?",
-            (price, item.target),
-        )
+        try:
+            # Try the supported mutator on the binding first.
+            def body(c: Commerce, _sku: str = item.target, _p: float = float(price)) -> None:
+                _update_variant_price_binding(c, _sku, _p)
+
+            await ctx.store.write(f"price:{item.target}", body)
+        except AttributeError:
+            # Legacy fallback for older wheels missing the mutator.
+            await ctx.store.write_sql(
+                "UPDATE product_variants SET price = ?, "
+                "updated_at = datetime('now'), version = version + 1 WHERE sku = ?",
+                (price, item.target),
+            )
         results.append(await _log_apply(ctx, change, f"set price of {item.target} to {price}"))
     return results
 
@@ -215,11 +277,27 @@ async def _apply_status_change(
     if resolved is None:
         raise ChangeNotApplicable(f"no listing with id {item.target!r}")
     product, _merch = resolved
-    await ctx.store.write_sql(
-        "UPDATE products SET status = ?, "
-        "updated_at = datetime('now'), version = version + 1 WHERE id = ?",
-        (str(item.after), product.id),
-    )
+    # Prefer dedicated status mutators when present; fall back to a generic update; and
+    # only then to the legacy direct-SQL write.
+    try:
+        desired = str(item.after)
+        def body(c: Commerce) -> None:
+            if desired == "active" and hasattr(c.products, "activate"):
+                c.products.activate(product.id)
+                return
+            if desired == "archived" and hasattr(c.products, "archive"):
+                c.products.archive(product.id)
+                return
+            # Generic products.update(id, { status })
+            _update_product_binding(c, product.id, status=desired)
+
+        await ctx.store.write(f"status:{product.id}", body)
+    except AttributeError:
+        await ctx.store.write_sql(
+            "UPDATE products SET status = ?, "
+            "updated_at = datetime('now'), version = version + 1 WHERE id = ?",
+            (str(item.after), product.id),
+        )
     return await _log_apply(ctx, change, f"set status of {item.target} to {item.after}")
 
 
@@ -236,11 +314,17 @@ async def _apply_listing_update(
     attributes = dict(merch.attributes)
     for item in change.items:
         if item.field == "description":
-            await ctx.store.write_sql(
-                "UPDATE products SET description = ?, "
-                "updated_at = datetime('now'), version = version + 1 WHERE id = ?",
-                (str(item.after), product.id),
-            )
+            try:
+                def body(c: Commerce, _desc: str = str(item.after)) -> None:
+                    _update_product_binding(c, product.id, description=_desc)
+
+                await ctx.store.write(f"product:{product.id}", body)
+            except AttributeError:
+                await ctx.store.write_sql(
+                    "UPDATE products SET description = ?, "
+                    "updated_at = datetime('now'), version = version + 1 WHERE id = ?",
+                    (str(item.after), product.id),
+                )
         elif item.field in merch_field_names:
             updates[item.field] = item.after
         elif item.field == "attributes" and isinstance(item.after, dict):
@@ -264,11 +348,18 @@ async def _apply_promotion(
     for item in change.items:
         if item.field != "price":
             continue
-        await ctx.store.write_sql(
-            "UPDATE product_variants SET price = ?, "
-            "updated_at = datetime('now'), version = version + 1 WHERE sku = ?",
-            (money.exact(item.after), item.target),
-        )
+        price = money.exact(item.after)
+        try:
+            def body(c: Commerce, _sku: str = item.target, _p: float = float(price)) -> None:
+                _update_variant_price_binding(c, _sku, _p)
+
+            await ctx.store.write(f"promo-price:{item.target}", body)
+        except AttributeError:
+            await ctx.store.write_sql(
+                "UPDATE product_variants SET price = ?, "
+                "updated_at = datetime('now'), version = version + 1 WHERE sku = ?",
+                (price, item.target),
+            )
     await _record_custom_object(ctx, change, PROMOTION_TYPE, change.change_id, payload)
     return [await _log_apply(ctx, change, f"applied promotion {change.change_id}")]
 

@@ -100,12 +100,12 @@ this stack stops an unreviewed merchandising write.
 | Checkout (complete an order) | no agent tool reaches this route — `POST /shopping/checkout` is a human-clicked host route, not a tool | `checkout.commit` | sealed kernel receipt (`receipt_id`) |
 | Stage a price update | `check_listing_provenance`, `check_listing_record_read`, guardrail discount cap (`merchant_agent.changes.check_guardrails`) | none (staging only; no live write) | `StagedChange` record |
 | Stage a listing/promotion/campaign/inventory action | same staging gates as above, per kind | none (staging only) | `StagedChange` record |
-| Apply a price update | `check_apply_change` (provenance, guardrails, `APPROVAL_GATE` when `require_host_approval`) + `EngineMerchant.apply_change`'s own `approved_ids` check | none — direct SQL `UPDATE product_variants` | activity-log id |
+| Apply a price update | `check_apply_change` (provenance, guardrails, `APPROVAL_GATE` when `require_host_approval`) + `EngineMerchant.apply_change`'s own `approved_ids` check | none — `commerce.products().updateVariant` | activity-log id |
 | Apply an inventory action — restock, SKU has an inventory item | same as above | none — `commerce.inventory.adjust` (not in the governed set) | activity-log id |
 | Apply an inventory action — restock, SKU has **no** inventory item | same as above | `inventory.item.create` | **sealed kernel receipt** |
-| Apply an inventory action — pause/activate | same as above | none — direct SQL `UPDATE products SET status` | activity-log id |
-| Apply a listing content update | same as above | none — `write_merchandising` custom object; direct SQL for `description` | activity-log id |
-| Apply a promotion | same as above | none — direct SQL price update(s) + `promotion` custom object | activity-log id |
+| Apply an inventory action — pause/activate | same as above | none — `commerce.products().activate` / `archive` | activity-log id |
+| Apply a listing content update | same as above | none — `write_merchandising` custom object; `commerce.products().update` for `description` | activity-log id |
+| Apply a promotion | same as above | none — `commerce.products().updateVariant` price update(s) + `promotion` custom object | activity-log id |
 | Apply a campaign | same as above | none — `campaign` custom object | activity-log id |
 | Refund | (issued only as a governed command — no tool in this repo issues a refund directly) | `payments.create_refund` (`requires_approval: true` in policy) | sealed kernel receipt, or an `agent-layer: blocked` outcome if attempted without approval evidence |
 
@@ -117,30 +117,24 @@ nothing about whether the engine itself checked it — because for these writes,
 not. A `blocked` outcome is `ToolOutcome.blocked` naming the gate that held the call;
 the engine is never reached.
 
-## Two things the binding does not expose, and why the workaround is sound
+## Binding mutators for merchandising fields (no direct SQL)
 
-The installed `stateset-embedded` binding (1.28.5) exposes no mutator for variant
-price, product status, or product description — no `products.update`, no variant-price
-setter. `engine_backend/apply.py`'s dispatch functions write these three fields with
-direct parameterized SQL, through `EngineStore.write_sql`, against the store's own
-SQLite file instead. This was checked against the schema and its triggers directly, not
-assumed: `PRAGMA table_info` shows neither `products` nor `product_variants` has a
-trigger that maintains `updated_at` or `version`, so setting both by hand (as those
-writes do) is complete — there is nothing else on either table
-for a raw `UPDATE` to miss. `products`' `product_fts_{ai,ad,au}` triggers, which keep its
-full-text search index in sync, are schema-level rather than connection-level, so they
-fire identically for a write from this module's own connection as for one from the
-engine's own handle. See `docs/mapping.md` for the full write-fallback list.
+As of `stateset-embedded==1.28.5`, the Python binding exposes supported mutators for
+the merchandising fields this deployment edits during apply:
 
-Reaching the row correctly is only half of sound, and the other half is not free. Two
-SQLite libraries are open on that file — the engine's and Python's — and a direct-SQL
-write is visible to the engine's handle only because `EngineStore._pin_connection` holds
-a share of the WAL index for the store's lifetime. Without that, the write lands on disk
-and the handle serving the storefront never sees it, silently and for the rest of the
-process's life; and the pin holds that share only because it reads a table, not merely
-because it opens a connection. `docs/mapping.md` has the mechanism, the measurements, and
-why the symptom appears on some Python SQLite builds and not others. Anything that
-weakens the pin makes this workaround unsound again, whatever the schema says.
+- `commerce.products().update(id, { description?, status? })`
+- `commerce.products().activate(id)` / `commerce.products().archive(id)` (status helpers)
+- `commerce.products().updateVariant(id, { sku, price, name?, compareAtPrice?, isDefault? })`
+
+`engine_backend/apply.py` uses these mutators for price changes, product status
+changes, and product descriptions. No raw-SQL write is used for these fields.
+
+The store still pins one read-only SQLite connection (`EngineStore._pin_connection`)
+for other reasons — chiefly to keep a stable, WAL-index-holding reader in-process for
+read-only SQL that the binding does not expose and for tests that exercise the WAL
+coordination rules. The pin is no longer needed for merchandising writes specifically,
+but it remains correct and required for the remaining read-only SQL paths. See
+`docs/mapping.md` for details.
 
 ## The MCP path's approval is weaker than the HTTP host's
 

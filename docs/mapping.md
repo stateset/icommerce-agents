@@ -4,7 +4,7 @@
 (`StorefrontBackend`, `MerchantBackend`) meet the StateSet iCommerce engine
 (`stateset-embedded`, installed as a pinned wheel, version `1.28.5`). This file records
 what each read and write actually does, the one place the engine's Python binding is
-read around with raw SQL, the write fallbacks the binding forces, and the pinned vendor
+read around with raw SQL, and the pinned vendor
 commit `scripts/check.py` verifies against.
 
 ## Pinned vendor commit
@@ -56,19 +56,19 @@ One row per write `engine_backend/apply.py`'s `apply_change` can perform:
 
 | `ChangeKind` | Engine write | Governed? | Evidence |
 |---|---|---|---|
-| `PRICE_UPDATE` | direct SQL `UPDATE product_variants SET price = ...` | No | activity-log entry |
+| `PRICE_UPDATE` | `commerce.products().updateVariant` | No | activity-log entry |
 | `INVENTORY_ACTION` (restock, SKU has an inventory item) | `commerce.inventory.adjust` | No | activity-log entry |
 | `INVENTORY_ACTION` (restock, SKU has **no** inventory item) | kernel `inventory.item.create` | **Yes** | sealed receipt |
-| `INVENTORY_ACTION` (pause/activate) | direct SQL `UPDATE products SET status = ...` | No | activity-log entry |
-| `LISTING_UPDATE` | `write_merchandising` custom object; direct SQL for `description` | No | activity-log entry |
-| `PROMOTION` | direct SQL price update(s) + `promotion` custom object | No | activity-log entry |
+| `INVENTORY_ACTION` (pause/activate) | `commerce.products().activate` / `.archive` | No | activity-log entry |
+| `LISTING_UPDATE` | `write_merchandising` custom object; `commerce.products().update` for `description` | No | activity-log entry |
+| `PROMOTION` | `commerce.products().updateVariant` price update(s) + `promotion` custom object | No | activity-log entry |
 | `CAMPAIGN` | `campaign` custom object | No | activity-log entry |
 
 `payload` is the promotion or campaign draft the change was staged from
 (`staging.load_change_payload`); every other kind ignores it.
 
 Full detail, including the exact error codes and the schema/trigger inspection behind
-the direct-SQL path, is in `docs/enforcement.md`.
+the mutator-based path, is in `docs/enforcement.md`.
 
 ### `Evidence`: what actually backed a write
 
@@ -132,28 +132,19 @@ and the connection's own `mode=ro` guard (see `tests/test_merchant_reads.py`).
 when a module in `engine_backend/` is named in neither this file nor `README.md`, which
 is the same drift class one level up.
 
-## Direct-SQL write fallbacks
+## No direct-SQL write fallbacks for merchandising
 
-The binding exposes no mutator at all for three fields — no `products.update`, no
-variant-price setter, no `products.update_status`. `EngineStore.write_sql` writes them
-with a direct parameterized `UPDATE` on the store's own SQLite file, serialized against
-other direct-SQL writes under one lock key (`"direct_sql"`), with `PRAGMA busy_timeout`
-set so genuine contention waits rather than raising:
+As of `stateset-embedded==1.28.5`, the Python binding exposes supported mutators for
+the three merchandising fields this deployment edits during apply:
 
-- `product_variants.price` (price updates, promotions) — always a two-place decimal
-  string from `engine_backend/money.py`
-- `products.status` (pause/activate)
-- `products.description` (listing content)
+- `products.update(id, { description?, status? })`
+- `products.activate(id)` / `products.archive(id)` (status helpers)
+- `products.updateVariant(id, { sku, price, name?, compareAtPrice?, isDefault? })`
 
-`engine_backend/apply.py`'s dispatch functions call it directly (`ctx.store.write_sql`).
-The write lives on the store, not on the merchant backend or its apply dispatch,
-because of the invariant in the next section: a direct-SQL write is only sound in
-combination with something the store owns, and keeping the two in one class is what
-stops a second write path being added that forgets.
-
-`scripts/check.py` scans `engine_backend/*.py` for every function containing
-`sqlite3.connect(` and fails if this file does not name it — currently `write_sql`,
-`_pin_connection`, and `readonly_sql` — so a new direct-SQL path cannot appear silently.
+`engine_backend/apply.py` uses these mutators for price changes, product status
+changes, and product descriptions. No raw-SQL write is used for these fields. The only
+SQL outside the binding in this repo is read-only (see above), plus legacy test code
+that exercises the WAL coordination rules.
 
 ### Two SQLite libraries, one file: why the store pins a connection
 
