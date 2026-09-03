@@ -266,8 +266,10 @@ async def test_two_successive_applies_both_reach_the_engine_handle(store, kernel
     The transient read-only connection in `_disk_price` is not scene-setting: any other
     connection opening and closing on the file is enough to trigger the incoherence, and a
     second reader, a backup, or a worker thread's collected read-only connection all do it.
-    `EngineStore.write_sql` is what makes it impossible to skip the handle reopen that
-    fixes it; without that reopen this test fails on the second iteration.
+    This end-to-end test passes even without the pin, because `stage_price_update`'s
+    catalog read holds a connection open and accidentally masks the hazard. The isolating
+    guard is :func:`tests.test_store.test_a_direct_sql_write_is_visible_to_the_engine_handle`,
+    which fails without the pin.
 
     Each price is asserted three ways: on disk, on the engine handle, and through the
     storefront the shopper actually sees.

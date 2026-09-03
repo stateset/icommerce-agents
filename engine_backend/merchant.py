@@ -804,13 +804,12 @@ class EngineMerchant(MerchantBackend):
         This mirrors ``catalog.py``'s ``list_variants``, which reads what the binding
         does not expose; here it is a write.
 
-        The write itself, its serialization, and the engine-handle reopen that has to
-        follow it all live in :meth:`EngineStore.write_sql` -- deliberately, so that a
-        direct-SQL write cannot be performed without the reopen. Read that docstring
-        before adding another one: skipping the reopen leaves this process's engine
-        handle serving the pre-write value for the rest of its life while disk is
-        correct, which is how the second applied price change of a session used to
-        vanish from the storefront.
+        The write itself and its serialization live in :meth:`EngineStore.write_sql`.
+        That method is only sound in combination with the read-only connection pinned in
+        :meth:`EngineStore._pin_connection` -- see that method's docstring for what goes
+        wrong without it. The pin keeps the database file from reaching zero connections,
+        so the WAL index is never torn down and rebuilt while the engine handle's cache
+        is live, preventing it from serving pre-write values for the rest of its life.
 
         Schema and triggers on ``products`` / ``product_variants`` were inspected
         directly (``PRAGMA table_info`` and ``sqlite_master`` triggers), not assumed:
