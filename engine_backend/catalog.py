@@ -8,12 +8,12 @@ the Rust crate but is not bound in Python 1.28.5. docs/mapping.md lists that rea
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
 from stateset_embedded import Commerce, Product, ProductVariant
 
+from engine_backend.custom_objects import ensure_payload_type, read_payload, write_payload
 from engine_backend.store import EngineStore
 
 MERCHANDISING_TYPE = "merchandising"
@@ -34,52 +34,33 @@ class Merchandising(BaseModel):
     variant_options: dict[str, dict[str, str]] = Field(default_factory=dict)
 
 
+MERCHANDISING_DISPLAY = "Merchandising"
+
+
 def ensure_types(commerce: Commerce) -> None:
     """Create the custom object types this repo owns. Idempotent."""
-    from stateset_embedded import CustomFieldDefinitionInput
-
-    for handle, display, fields in (
-        (
-            MERCHANDISING_TYPE,
-            "Merchandising",
-            [CustomFieldDefinitionInput(key="payload", field_type="json", required=True)],
-        ),
-    ):
-        if commerce.custom_objects.get_type_by_handle(handle) is None:
-            commerce.custom_objects.create_type(handle=handle, display_name=display, fields=fields)
-
-
-def _merch_object(commerce: Commerce, product_id: str):
-    objects = commerce.custom_objects.list_objects(
-        type_handle=MERCHANDISING_TYPE, owner_type="product", owner_id=product_id, limit=1
-    )
-    return objects[0] if objects else None
+    ensure_payload_type(commerce, MERCHANDISING_TYPE, MERCHANDISING_DISPLAY)
 
 
 async def read_merchandising(store: EngineStore, product_id: str) -> Merchandising:
-    record = await store.call(lambda c: _merch_object(c, product_id))
-    if record is None:
+    payload = await read_payload(
+        store, MERCHANDISING_TYPE, owner_type="product", owner_id=product_id
+    )
+    if payload is None:
         return Merchandising()
-    return Merchandising.model_validate(json.loads(record.values_json)["payload"])
+    return Merchandising.model_validate(payload)
 
 
 async def write_merchandising(store: EngineStore, product_id: str, data: Merchandising) -> None:
-    values = json.dumps({"payload": data.model_dump()})
-
-    def body(c: Commerce) -> None:
-        ensure_types(c)
-        record = _merch_object(c, product_id)
-        if record is None:
-            c.custom_objects.create_object(
-                type_handle=MERCHANDISING_TYPE,
-                values_json=values,
-                owner_type="product",
-                owner_id=product_id,
-            )
-        else:
-            c.custom_objects.update_object(id=record.id, values_json=values)
-
-    await store.write(f"merch:{product_id}", body)
+    await write_payload(
+        store,
+        MERCHANDISING_TYPE,
+        MERCHANDISING_DISPLAY,
+        data.model_dump(),
+        lock_key=f"merch:{product_id}",
+        owner_type="product",
+        owner_id=product_id,
+    )
 
 
 async def list_variants(store: EngineStore, product_id: str) -> list[ProductVariant]:

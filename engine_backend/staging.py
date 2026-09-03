@@ -6,62 +6,50 @@ Each ``StagedChange`` is a custom object of type ``staged_change``, keyed by its
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from uuid import uuid4
 
 from merchant_agent.types import ActorKind, ChangeItem, ChangeKind, ChangeStatus, StagedChange
 from stateset_embedded import Commerce
 
+from engine_backend.custom_objects import (
+    ensure_payload_type,
+    list_payloads,
+    read_payload,
+    write_payload,
+)
 from engine_backend.store import EngineStore
 
 STAGED_TYPE = "staged_change"
+STAGED_DISPLAY = "Staged change"
 
 
 def ensure_types(commerce: Commerce) -> None:
     """Create the ``staged_change`` custom object type. Idempotent."""
-    from stateset_embedded import CustomFieldDefinitionInput
-
-    if commerce.custom_objects.get_type_by_handle(STAGED_TYPE) is None:
-        commerce.custom_objects.create_type(
-            handle=STAGED_TYPE,
-            display_name="Staged change",
-            fields=[CustomFieldDefinitionInput(key="payload", field_type="json", required=True)],
-        )
+    ensure_payload_type(commerce, STAGED_TYPE, STAGED_DISPLAY)
 
 
 async def save(store: EngineStore, change: StagedChange) -> None:
-    values = json.dumps({"payload": change.model_dump(mode="json")})
-
-    def body(c: Commerce) -> None:
-        ensure_types(c)
-        record = c.custom_objects.get_object_by_handle(STAGED_TYPE, change.change_id)
-        if record is None:
-            c.custom_objects.create_object(
-                type_handle=STAGED_TYPE, values_json=values, handle=change.change_id
-            )
-        else:
-            c.custom_objects.update_object(id=record.id, values_json=values)
-
-    await store.write(f"staged_change:{change.change_id}", body)
+    await write_payload(
+        store,
+        STAGED_TYPE,
+        STAGED_DISPLAY,
+        change.model_dump(mode="json"),
+        lock_key=f"staged_change:{change.change_id}",
+        object_handle=change.change_id,
+    )
 
 
 async def load(store: EngineStore, change_id: str) -> StagedChange | None:
-    def body(c: Commerce):
-        return c.custom_objects.get_object_by_handle(STAGED_TYPE, change_id)
-
-    record = await store.call(body)
-    if record is None:
+    payload = await read_payload(store, STAGED_TYPE, object_handle=change_id)
+    if payload is None:
         return None
-    return StagedChange.model_validate(json.loads(record.values_json)["payload"])
+    return StagedChange.model_validate(payload)
 
 
 async def pending(store: EngineStore) -> list[StagedChange]:
-    def body(c: Commerce):
-        return c.custom_objects.list_objects(type_handle=STAGED_TYPE)
-
-    records = await store.call(body)
-    changes = [StagedChange.model_validate(json.loads(r.values_json)["payload"]) for r in records]
+    payloads = await store.call(lambda c: list_payloads(c, STAGED_TYPE))
+    changes = [StagedChange.model_validate(p) for p in payloads]
     return [c for c in changes if c.status is ChangeStatus.STAGED]
 
 

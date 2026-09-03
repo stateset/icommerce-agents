@@ -48,7 +48,7 @@ from merchant_agent.types import (
 from shopping_agent.types import SearchFilters
 from stateset_embedded import Commerce
 
-from engine_backend import money, staging
+from engine_backend import custom_objects, money, staging
 from engine_backend.catalog import (
     CatalogRow,
     Merchandising,
@@ -258,13 +258,13 @@ class EngineMerchant(MerchantBackend):
     async def get_campaign_performance(
         self, session: MerchantSessionContext, campaign_id: str | None = None
     ) -> list[Campaign]:
-        def body(c: Commerce):
-            if c.custom_objects.get_type_by_handle("campaign") is None:
+        def body(c: Commerce) -> list[Any]:
+            if c.custom_objects.get_type_by_handle(CAMPAIGN_TYPE) is None:
                 return []
-            return c.custom_objects.list_objects(type_handle="campaign")
+            return custom_objects.list_payloads(c, CAMPAIGN_TYPE)
 
-        records = await self.store.call(body)
-        campaigns = [Campaign.model_validate(json.loads(r.values_json)["payload"]) for r in records]
+        payloads = await self.store.call(body)
+        campaigns = [Campaign.model_validate(p) for p in payloads]
         if campaign_id is not None:
             campaigns = [c for c in campaigns if c.campaign_id == campaign_id]
         return campaigns
@@ -989,25 +989,15 @@ class EngineMerchant(MerchantBackend):
         return [self._log_apply(change, operator, f"wrote campaign {campaign_id}")]
 
     def _record_custom_object(self, type_handle: str, handle: str, payload_json: str) -> None:
-        from stateset_embedded import CustomFieldDefinitionInput
-
-        commerce = self.store.commerce
-        if commerce.custom_objects.get_type_by_handle(type_handle) is None:
-            commerce.custom_objects.create_type(
-                handle=type_handle,
-                display_name=type_handle.replace("_", " ").title(),
-                fields=[
-                    CustomFieldDefinitionInput(key="payload", field_type="json", required=True)
-                ],
-            )
-        values = json.dumps({"payload": json.loads(payload_json)})
-        record = commerce.custom_objects.get_object_by_handle(type_handle, handle)
-        if record is None:
-            commerce.custom_objects.create_object(
-                type_handle=type_handle, values_json=values, handle=handle
-            )
-        else:
-            commerce.custom_objects.update_object(id=record.id, values_json=values)
+        """Synchronous and unlocked, unlike ``staging``'s writes: it runs inside an apply
+        that already holds the change, on the store's own ``Commerce`` handle."""
+        custom_objects.put_payload(
+            self.store.commerce,
+            type_handle,
+            type_handle.replace("_", " ").title(),
+            json.loads(payload_json),
+            object_handle=handle,
+        )
 
     async def discard_change(
         self,

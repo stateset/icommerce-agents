@@ -11,12 +11,15 @@ import json
 
 from pydantic import BaseModel, Field
 from shopping_agent.types import Disclosure, DisclosureRow, Policy
-from stateset_embedded import Commerce, CustomFieldDefinitionInput
+from stateset_embedded import Commerce
 
+from engine_backend.custom_objects import ensure_payload_type, list_payloads, read_payload
 from engine_backend.store import EngineStore
 
 POLICY_TYPE = "policy_document"
+POLICY_DISPLAY = "Policy document"
 DISCLOSURE_TYPE = "disclosure"
+DISCLOSURE_DISPLAY = "Disclosure"
 
 
 class _PolicyRecord(BaseModel):
@@ -122,20 +125,8 @@ def _disclosure_records() -> list[_DisclosureRecord]:
 
 def ensure_content_types(commerce: Commerce) -> None:
     """Create the custom object types this module owns. Idempotent."""
-    for handle, display, fields in (
-        (
-            POLICY_TYPE,
-            "Policy document",
-            [CustomFieldDefinitionInput(key="payload", field_type="json", required=True)],
-        ),
-        (
-            DISCLOSURE_TYPE,
-            "Disclosure",
-            [CustomFieldDefinitionInput(key="payload", field_type="json", required=True)],
-        ),
-    ):
-        if commerce.custom_objects.get_type_by_handle(handle) is None:
-            commerce.custom_objects.create_type(handle=handle, display_name=display, fields=fields)
+    ensure_payload_type(commerce, POLICY_TYPE, POLICY_DISPLAY)
+    ensure_payload_type(commerce, DISCLOSURE_TYPE, DISCLOSURE_DISPLAY)
 
 
 def seed_content(commerce: Commerce) -> None:
@@ -166,10 +157,10 @@ async def find_policies(store: EngineStore, query: str) -> list[Policy]:
     if not terms:
         return []
 
-    records = await store.call(lambda c: c.custom_objects.list_objects(type_handle=POLICY_TYPE))
+    payloads = await store.call(lambda c: list_payloads(c, POLICY_TYPE))
     scored: list[tuple[int, _PolicyRecord]] = []
-    for record in records:
-        policy = _PolicyRecord.model_validate(json.loads(record.values_json)["payload"])
+    for payload in payloads:
+        policy = _PolicyRecord.model_validate(payload)
         haystack = f"{policy.title} {policy.body}".lower()
         hits = sum(haystack.count(term) for term in terms)
         if hits > 0:
@@ -183,17 +174,11 @@ async def find_policies(store: EngineStore, query: str) -> list[Policy]:
 
 
 async def find_disclosure(store: EngineStore, product_id: str) -> Disclosure | None:
-    def body(c: Commerce):
-        objects = c.custom_objects.list_objects(
-            type_handle=DISCLOSURE_TYPE, owner_type="product", owner_id=product_id, limit=1
-        )
-        return objects[0] if objects else None
-
-    record = await store.call(body)
-    if record is None:
+    payload = await read_payload(store, DISCLOSURE_TYPE, owner_type="product", owner_id=product_id)
+    if payload is None:
         return None
 
-    data = _DisclosureRecord.model_validate(json.loads(record.values_json)["payload"])
+    data = _DisclosureRecord.model_validate(payload)
     return Disclosure(
         title=data.title,
         product_id=data.product_id,
