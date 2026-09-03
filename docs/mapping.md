@@ -164,33 +164,59 @@ regression test: it applies four successive direct-SQL price writes with an engi
 binding write between them, exactly as an apply does, and asserts the engine handle
 tracks every one. Disable the pin and it fails on the second write.
 
-#### The pin is per process, and two processes were measured
+#### The pin is per process, and that is exactly what a second process needs
 
 `_pin_connection` holds one connection per *process*, so a second host process on the
 same store file — `scripts/run_demo.py` alongside a separately launched MCP server — is
-not covered by that connection. Rather than assume either way,
-`tests/test_store_multiprocess.py` measures it: **the staleness does not cross the
-process boundary.** A `Commerce` handle in one process tracks `write_sql` writes made by
-another, on the round after the write and every round after it, in each ordering tried —
-reader process opened first or second, with and without an engine binding write
-interleaved in either process, and with the writer process exiting entirely between
-writes so the reader process is the only thing left holding the file. The failure needs
-the direct-SQL connection churn and the handle that goes stale to be in the same
-process; a second process's engine handle is a separate library instance and never
-inherits the WAL index the first one cached. The same result holds with the pin
-disabled, so this is not the pin reaching across processes — there is nothing for it to
-reach across. No fix is therefore required and none was added, and there is no "one
-process per store file" constraint on this ground.
+not covered by the first process's connection. `tests/test_store_multiprocess.py`
+measures what actually happens, and the answer is that **a second process is covered
+precisely because it pins too.**
 
-Two things about a second process remain true, and are recorded here because they are
-not what the pin covers:
+The staleness is not cross-process in origin. One process's direct-SQL connection churn
+does not by itself poison another process's handle, and a writer process that opens,
+writes and exits leaves a reader process's handle correct. But a second process's writes
+are fully subject to the hazard. The moment an **unpinned** reader process makes any
+transient `sqlite3` connection of its own — which is exactly what `readonly_sql()` does
+on every real request — its `Commerce` handle stops seeing the other process's
+`write_sql` writes, permanently, while the row on disk is correct.
+
+Two runtime knobs on one harness — the reader's pin closed or held, its transient disk
+read included or omitted — over four successive price writes applied by a separate
+process, deterministic over three repeats:
+
+| reader's pin | reader does a transient read | what the reader's engine handle sees |
+|---|---|---|
+| held | yes | `199` OK, `189` OK, `179` OK, `169` OK |
+| held | no | `199` OK, `189` OK, `179` OK, `169` OK |
+| dropped | **yes** | `199` OK, then **stale on `199` for `189`, `179` and `169`** |
+| dropped | no | `199` OK, `189` OK, `179` OK, `169` OK |
+
+So the pin is neither redundant across processes nor merely a single-process concern: it
+is the only thing standing between a two-process deployment and silently stale prices,
+and every process that opens a store gets one. No fix is required beyond the pin already
+being in the constructor, and there is no "one process per store file" constraint.
+
+The bottom row of that table is a trap worth naming, because it is how the wrong
+conclusion was reached here twice: **an incidental extra connection anywhere masks the
+whole effect.** A harness whose reader performs an engine binding write before its read,
+or leaves a diagnostic connection open beside the store, reads correct values with the
+pin off and proves nothing. Any reproduction must open nothing except the store's own
+connection and the transient read under test.
+
+Three things about a second process are true and are *not* what the pin covers:
 
 - The `"direct_sql"` lock is an `asyncio` lock, so it orders direct-SQL writes only
   within one process. Two processes writing at once are ordered by SQLite's own file
   lock and wait on the `busy_timeout` `write_sql` sets, not by that lock.
-- In-memory state beside the store is per process by construction and is not shared by
-  running a second one: `EngineStore._bindings` and `EngineStorefront._cart_ids`. A
-  session belongs to the process that opened it.
+- `EngineMerchant._approved` is an in-memory set, and it is the gate `apply_change`
+  checks before any write. Staged changes live in `custom_objects` and so are shared
+  across processes, but the host approval that authorises applying one is not: an
+  approval granted in one process does not authorise an apply in another, and does not
+  survive a restart. This is the per-process item with the most riding on it, and the one
+  a reader is most likely to assume is shared.
+- The rest of the in-memory state beside the store is per process by construction:
+  `EngineStore._bindings` and `EngineStorefront._cart_ids`. A session belongs to the
+  process that opened it.
 
 This was verified against the schema and triggers directly, not assumed:
 `PRAGMA table_info` on `products` and `product_variants` shows neither table has a

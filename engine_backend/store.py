@@ -28,24 +28,49 @@ class EngineStore:
 
     The connection :meth:`_pin_connection` holds is per *process*, so two host processes
     on one store file -- ``scripts/run_demo.py`` alongside a separately launched MCP
-    server -- were an open question rather than a covered case. They are now measured,
-    in ``tests/test_store_multiprocess.py``: **the staleness this class pins against does
-    not cross the process boundary.** A ``Commerce`` handle in one process tracks
-    ``write_sql`` writes made by another, on the round after the write and every round
-    after that, in each ordering tried -- reader process opened first or second, with and
-    without a binding write interleaved in either process, and with the writer process
-    exiting entirely between writes so the reader is the only holder left. The failure
-    this class exists to prevent needs the direct-SQL connection churn and the handle
-    that goes stale to be in the same process; a second process's engine handle is a
-    separate library instance that never inherits the WAL index the first one cached.
+    server -- were an open question rather than a covered case. They are now measured, in
+    ``tests/test_store_multiprocess.py``, and the answer is that **a second process is
+    covered precisely because it pins too.**
 
-    Two things about a second process are still true and are not guarantees this class
-    makes. Direct-SQL writes are serialized against each other by an ``asyncio`` lock,
-    which reaches only as far as one process: two processes writing at once are ordered
-    by SQLite's own file lock and wait on the ``busy_timeout`` :meth:`write_sql` sets,
-    not by that lock. And the in-memory state around the store is per-process by
-    construction and is not shared by running a second one: ``self._bindings`` here, and
-    ``EngineStorefront._cart_ids``, so a session belongs to the process that opened it.
+    The staleness is not cross-process in origin: one process's direct-SQL connection
+    churn does not by itself poison another process's handle, and a writer process that
+    opens, writes and exits leaves a reader's handle correct. But a second process's
+    writes are fully subject to the hazard. The moment an *unpinned* reader process makes
+    any transient ``sqlite3`` connection of its own -- which is exactly what
+    :meth:`readonly_sql` does on every real request -- its ``Commerce`` handle stops
+    seeing the other process's ``write_sql`` writes, permanently, while disk is correct.
+    Measured over four successive price writes applied by a separate process, with the
+    reader's pin dropped and its transient read left in, the handle tracks the first
+    write and then freezes on it for the rest of its life; with the pin held it tracks
+    all four. Deterministic over three repeats.
+
+    So the pin is not redundant across processes and is not merely a single-process
+    concern: it is the only thing standing between a two-process deployment and silently
+    stale prices. Each process that opens a store gets its own, which is why the
+    per-process scope is the right scope rather than a gap.
+
+    One caution for anyone reproducing this: an incidental extra connection anywhere in
+    the harness masks the whole effect, which is how it stayed hidden here twice. A
+    reader that performs an engine binding write before its read, or a diagnostic
+    connection left open beside the store, reads correct values with the pin off and
+    proves nothing.
+
+    Three things about a second process are true and are *not* guarantees this class
+    makes:
+
+    - Direct-SQL writes are serialized against each other by an ``asyncio`` lock, which
+      reaches only as far as one process. Two processes writing at once are ordered by
+      SQLite's own file lock and wait on the ``busy_timeout`` :meth:`write_sql` sets, not
+      by that lock.
+    - ``EngineMerchant._approved`` is an in-memory set and the gate ``apply_change``
+      checks. Staged changes are persisted in ``custom_objects`` and so are shared, but
+      the host approval that authorises applying one is not: an approval granted in one
+      process does not authorise an apply in another, and does not survive a restart.
+      This is the per-process item with the most riding on it, and the one most likely to
+      be assumed shared.
+    - The rest of the in-memory state beside the store is per process by construction:
+      ``self._bindings`` here and ``EngineStorefront._cart_ids``, so a session belongs to
+      the process that opened it.
     """
 
     def __init__(self, db_path: str, store_id: str = "store:acme") -> None:
