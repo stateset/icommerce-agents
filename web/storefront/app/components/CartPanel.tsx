@@ -10,6 +10,9 @@ import type { CartPayload, CheckoutResponse } from "../../lib/types";
  * the rounded `subtotal`/`line_total` a `cart_update` chat event carries). */
 function displayAmount(value: number | string | null | undefined, currency = "USD"): string | null {
   if (value === null || value === undefined) return null;
+  // The terminal display conversion: the engine's exact decimal string becomes a
+  // JS number here, at the last step before formatting, and is never read back or
+  // used in arithmetic.
   const amount = typeof value === "string" ? Number(value) : value;
   if (Number.isNaN(amount)) return null;
   return new Intl.NumberFormat("en-US", { style: "currency", currency }).format(amount);

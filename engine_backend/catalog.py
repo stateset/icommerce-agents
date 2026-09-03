@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from decimal import Decimal
 
 from pydantic import BaseModel, Field
 from stateset_embedded import Commerce, Product, ProductVariant
@@ -117,7 +116,9 @@ async def catalog_rows(store: EngineStore) -> list[CatalogRow]:
                     product=product,
                     variant=variant,
                     merch=merch,
-                    stock=float(Decimal(str(stock.total_available))) if stock else 0.0,
+                    # A quantity, not money: it never reaches an engine money column,
+                    # so it does not go through engine_backend.money.
+                    stock=float(stock.total_available) if stock else 0.0,
                 )
             )
     return rows

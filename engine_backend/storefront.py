@@ -9,7 +9,6 @@ resolvable, and it keeps provenance ids stable across turns for upstream's cart 
 from __future__ import annotations
 
 from datetime import datetime
-from decimal import Decimal
 from typing import Any
 
 from shopping_agent.backend import StorefrontBackend
@@ -33,7 +32,7 @@ from stateset_embedded import AddCartItemInput, Commerce, ProductVariant
 from stateset_embedded import Order as EngineOrder
 from stateset_embedded import Product as EngineProduct
 
-from engine_backend import content
+from engine_backend import content, money
 from engine_backend.catalog import (
     CatalogRow,
     Merchandising,
@@ -74,11 +73,11 @@ def _to_order(order: EngineOrder) -> Order:
                 product_id=item.sku,
                 title=item.name,
                 quantity=item.quantity,
-                price=float(Decimal(item.unit_price_exact)),
+                price=money.to_float(item.unit_price_exact),
             )
             for item in order.items
         ],
-        total=float(Decimal(order.total_amount_exact)),
+        total=money.to_float(order.total_amount_exact),
         currency=order.currency,
         tracking_url=tracking_url,
     )
@@ -99,7 +98,7 @@ def to_product(
         product_id=row.variant.sku,
         title=_title(row.product, row.variant, count),
         brand=row.merch.brand,
-        price=float(Decimal(row.variant.price_exact)),
+        price=money.to_float(row.variant.price_exact),
         rating=row.merch.rating,
         review_count=row.merch.review_count,
         image_url=row.merch.image_url,
@@ -129,7 +128,7 @@ def to_family(
             if value is not None and value not in options[name]:
                 options[name].append(value)
 
-    prices = [float(Decimal(v.price_exact)) for v in variants]
+    prices = [money.to_float(v.price_exact) for v in variants]
     in_stock = any(by_sku[v.sku].stock > 0 for v in variants if v.sku in by_sku)
 
     return Product(
@@ -166,12 +165,14 @@ class EngineStorefront(StorefrontBackend):
     ) -> list[Product]:
         rows = await engine_search(self.store, query, filters, limit)
         results: list[Product] = []
+        # One catalog scan for the whole result set, not one per family result.
+        every_row: list[CatalogRow] | None = None
         for row in rows:
             variants = await list_variants(self.store, row.product.id)
             if len(variants) > 1:
-                all_rows = [
-                    r for r in await catalog_rows(self.store) if r.product.id == row.product.id
-                ]
+                if every_row is None:
+                    every_row = await catalog_rows(self.store)
+                all_rows = [r for r in every_row if r.product.id == row.product.id]
                 results.append(to_family(row.product, variants, row.merch, all_rows))
             else:
                 results.append(to_product(row, variant_count=1))
@@ -257,7 +258,7 @@ class EngineStorefront(StorefrontBackend):
                 CartItem(
                     product_id=item.sku,
                     title=item.name,
-                    price=float(Decimal(item.unit_price_exact)),
+                    price=money.to_float(item.unit_price_exact),
                     quantity=item.quantity,
                     option_values=dict(option_values),
                     variant_of=variant.product_id if variant is not None else None,
@@ -268,6 +269,18 @@ class EngineStorefront(StorefrontBackend):
     async def get_cart(self, session: ShoppingSessionContext) -> Cart:
         cart_id = await self._cart_id(session)
         return await self._to_cart(cart_id)
+
+    def session_cart_id(self, session_id: str) -> str | None:
+        """Host-only, not part of :class:`StorefrontBackend`: the id of the cart *this
+        session* created, or ``None`` when it has not created one yet.
+
+        The host's checkout route needs the session's own cart, not the customer's
+        latest one — every shopping session in this demo binds to the same seeded
+        customer, so ``carts.for_customer(...)[-1]`` would let two concurrent sessions
+        check out each other's cart. This mapping is the only record of which cart
+        belongs to which session, and it is server-held, never a request or tool
+        argument."""
+        return self._cart_ids.get(session_id)
 
     async def cart_exact_totals(self, session: ShoppingSessionContext) -> dict[str, Any]:
         """Host-only, not part of :class:`StorefrontBackend`: the engine's own exact
@@ -378,10 +391,9 @@ class EngineStorefront(StorefrontBackend):
     async def get_fulfillment_options(
         self, session: ShoppingSessionContext, product_ids: list[str]
     ) -> list[FulfillmentOption]:
-        # Rates come from the session cart's actual contents rather than ``product_ids``
-        # (the engine has no per-item shipping quote); only the first twenty are honored,
-        # matching the interface's cap.
-        _ = product_ids[:20]
+        # The engine has no per-item shipping quote, so ``product_ids`` is not used:
+        # rates come from the session's own cart, and a session with no cart yet gets
+        # an empty list.
         cart_id = self._cart_ids.get(session.session_id)
         if cart_id is None:
             return []
@@ -395,7 +407,7 @@ class EngineStorefront(StorefrontBackend):
                     if rate.estimated_days is not None
                     else (rate.description or rate.service)
                 ),
-                fee=float(Decimal(str(rate.price))),
+                fee=money.to_float(str(rate.price)),
                 location=f"{rate.carrier} {rate.service}",
             )
             for rate in rates

@@ -1,20 +1,19 @@
-"""``MerchantBackend`` reads over the engine's analytics, catalog, and order data.
+"""``MerchantBackend`` over the engine: analytics, catalog and order reads, and the
+staged-write half (``stage_*`` / ``apply_change`` / ``discard_change``), whose applies
+are the only place this package mutates live state.
 
-The write half (stage_* / apply_change / discard_change) is Task 10's; those methods
-raise ``NotImplementedError`` here so the class stays instantiable for the reads this
-module implements.
-
-Money mirrors ``storefront.py``: figures already computed by ``commerce.analytics`` are
-plain floats returned as-is; a figure sourced from an exact-string field is converted
-once with ``float(Decimal(...))``. A figure the engine genuinely cannot supply (traffic,
-conversion, campaign spend/revenue when no campaign exists) is ``None`` with a ``note``,
-never a defaulted zero.
+Money mirrors ``storefront.py`` and goes through ``engine_backend.money``: figures
+already computed by ``commerce.analytics`` are plain floats returned as-is; a figure
+sourced from an exact-string field is converted once, at the display edge, with
+``money.to_float``. A price a change *writes back* stays an exact two-place decimal
+string end to end — computed in ``Decimal`` and never through a ``float``. A figure the
+engine genuinely cannot supply (traffic, conversion, campaign spend/revenue when no
+campaign exists) is ``None`` with a ``note``, never a defaulted zero.
 """
 
 from __future__ import annotations
 
 import json
-from decimal import Decimal
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -49,7 +48,7 @@ from merchant_agent.types import (
 from shopping_agent.types import SearchFilters
 from stateset_embedded import Commerce
 
-from engine_backend import staging
+from engine_backend import money, staging
 from engine_backend.catalog import (
     CatalogRow,
     Merchandising,
@@ -113,7 +112,7 @@ def to_listing(row: CatalogRow, variant_count: int = 1, variant_of: str | None =
         listing_id=row.variant.sku,
         title=_title(row.product, row.variant, variant_count),
         status=_status(row.product.status, row.stock > 0),
-        price=float(Decimal(row.variant.price_exact)),
+        price=money.to_float(row.variant.price_exact),
         stock=int(row.stock),
         category=row.merch.category,
         content_quality=_content_quality(row.merch),
@@ -137,7 +136,7 @@ def _to_family_listing(
             if value is not None and value not in options[name]:
                 options[name].append(value)
 
-    prices = [float(Decimal(v.price_exact)) for v in variants]
+    prices = [money.to_float(v.price_exact) for v in variants]
     total_stock = sum(int(by_sku[v.sku].stock) for v in variants if v.sku in by_sku)
     any_in_stock = any(by_sku[v.sku].stock > 0 for v in variants if v.sku in by_sku)
 
@@ -163,7 +162,7 @@ class EngineMerchant(MerchantBackend):
         self.config = MerchantAgentConfig()
         self._approved: set[str] = set()
 
-    # -- Host approval surface (Task 11's portal route) --------------------------
+    # -- Host approval surface ---------------------------------------------------
 
     def approve(self, change_id: str, approved_by: str) -> None:
         """Record that ``approved_by`` (the host's operator, never a tool argument) has
@@ -282,12 +281,14 @@ class EngineMerchant(MerchantBackend):
         search_filters = SearchFilters(category=filters.category) if filters else None
         rows = await engine_search(self.store, query, search_filters, max(limit * 3, limit))
         listings: list[Listing] = []
+        # One catalog scan for the whole result set, not one per family result.
+        every_row: list[CatalogRow] | None = None
         for row in rows:
             variants = await list_variants(self.store, row.product.id)
             if len(variants) > 1:
-                all_rows = [
-                    r for r in await catalog_rows(self.store) if r.product.id == row.product.id
-                ]
+                if every_row is None:
+                    every_row = await catalog_rows(self.store)
+                all_rows = [r for r in every_row if r.product.id == row.product.id]
                 listings.append(_to_family_listing(row.product, variants, row.merch, all_rows))
             else:
                 listings.append(to_listing(row, variant_count=1))
@@ -429,7 +430,7 @@ class EngineMerchant(MerchantBackend):
         return None
 
     def _variant_pricing_context(self, row: CatalogRow) -> PricingContext:
-        price = float(Decimal(row.variant.price_exact))
+        price = money.to_float(row.variant.price_exact)
         unit_cost = row.merch.unit_cost
         margin_pct = None
         if unit_cost is not None and price > 0:
@@ -503,7 +504,7 @@ class EngineMerchant(MerchantBackend):
             ],
         }
 
-    # -- Staged writes (Task 10) ------------------------------------------------------
+    # -- Staged writes ----------------------------------------------------------------
 
     async def _resolve_variant_row(self, listing_id: str) -> CatalogRow | None:
         rows = await catalog_rows(self.store)
@@ -585,10 +586,15 @@ class EngineMerchant(MerchantBackend):
             row = by_sku.get(item.listing_id)
             if row is None:
                 raise ChangeNotApplicable(f"no listing or variant with id {item.listing_id!r}")
-            before = float(Decimal(row.variant.price_exact))
+            # Both sides stay exact decimal strings: `after` is what `_apply_price_update`
+            # writes into `product_variants.price`, and upstream's guardrails read either
+            # side with `float(...)`, which parses a string just as well.
             change_items.append(
                 ChangeItem(
-                    target=item.listing_id, field="price", before=before, after=item.new_price
+                    target=item.listing_id,
+                    field="price",
+                    before=money.exact(row.variant.price_exact),
+                    after=money.exact(item.new_price),
                 )
             )
 
@@ -670,8 +676,11 @@ class EngineMerchant(MerchantBackend):
             row = by_sku.get(listing_id)
             if row is None:
                 raise ChangeNotApplicable(f"no listing or variant with id {listing_id!r}")
-            before = float(Decimal(row.variant.price_exact))
-            after = before * (1 - promotion.discount_pct / 100)
+            # The discount is applied in `Decimal`, to the engine's own exact string,
+            # and quantized back to two places. Computing it in `float` would stage (and
+            # then persist) a figure like 208.04999999999998 as this variant's price.
+            before = money.exact(row.variant.price_exact)
+            after = money.discounted(before, promotion.discount_pct)
             change_items.append(
                 ChangeItem(target=listing_id, field="price", before=before, after=after)
             )
@@ -849,13 +858,14 @@ class EngineMerchant(MerchantBackend):
         for item in change.items:
             if item.field != "price":
                 continue
+            price = money.exact(item.after)
             await self._write_sql(
                 "UPDATE product_variants SET price = ?, "
                 "updated_at = datetime('now'), version = version + 1 WHERE sku = ?",
-                (str(item.after), item.target),
+                (price, item.target),
             )
             notes.append(
-                self._log_apply(change, operator, f"set price of {item.target} to {item.after}")
+                self._log_apply(change, operator, f"set price of {item.target} to {price}")
             )
         return notes
 
@@ -969,13 +979,10 @@ class EngineMerchant(MerchantBackend):
             await self._write_sql(
                 "UPDATE product_variants SET price = ?, "
                 "updated_at = datetime('now'), version = version + 1 WHERE sku = ?",
-                (str(item.after), item.target),
+                (money.exact(item.after), item.target),
             )
-        record = self._record_custom_object(
-            PROMOTION_TYPE, change.change_id, change.guardrail_notes[0]
-        )
+        self._record_custom_object(PROMOTION_TYPE, change.change_id, change.guardrail_notes[0])
         notes.append(self._log_apply(change, operator, f"applied promotion {change.change_id}"))
-        del record
         return notes
 
     async def _apply_campaign(self, change: StagedChange, operator: str) -> list[str]:

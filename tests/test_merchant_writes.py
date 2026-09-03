@@ -80,7 +80,7 @@ async def test_a_restock_of_a_new_sku_is_governed(store, kernel):
     from merchant_agent.types import InventoryActionItem
     from stateset_embedded import CreateProductVariantInput
 
-    product = store.commerce.products.create(
+    store.commerce.products.create(
         name="Brand New Widget",
         description="A widget with no inventory item yet.",
         variants=[CreateProductVariantInput(sku="WIDGET-NEW-1", price=25.00)],
@@ -104,7 +104,6 @@ async def test_a_restock_of_a_new_sku_is_governed(store, kernel):
     assert applied.guardrail_notes
     note = applied.guardrail_notes[-1]
     assert "receipt" in note.lower()
-    del product  # only needed to create the variant
 
 
 async def test_discard_leaves_live_state_alone(store, kernel):
@@ -119,3 +118,137 @@ async def test_discard_leaves_live_state_alone(store, kernel):
 
 def test_no_abstract_methods_remain():
     assert EngineMerchant.__abstractmethods__ == frozenset()
+
+
+def _variant_price_text(store, sku):
+    """The raw `product_variants.price` TEXT the engine actually holds -- not the float
+    the binding parses it into, which is exactly what a float-arithmetic bug hides."""
+    row = (
+        store.readonly_sql()
+        .execute("SELECT price FROM product_variants WHERE sku = ?", (sku,))
+        .fetchone()
+    )
+    return row["price"]
+
+
+async def test_an_applied_price_update_persists_a_two_place_decimal_string(store, kernel):
+    backend = EngineMerchant(store, kernel)
+    change = await backend.stage_price_update(
+        session(), [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.5)]
+    )
+    backend.approve(change.change_id, "user:acme-operator")
+    await backend.apply_change(session(), change.change_id)
+
+    assert _variant_price_text(store, "TENT-RIDGE-TAN") == "199.50"
+
+
+async def test_an_applied_promotion_prices_in_decimal_not_float(store, kernel):
+    """219.00 less 5% is 208.05. Computed in binary float it is 208.04999999999998, and
+    that string would land in `product_variants.price`, which every later cart line,
+    subtotal and order total reads back."""
+    from merchant_agent.types import PromotionDraft
+
+    backend = EngineMerchant(store, kernel)
+    change = await backend.stage_promotion(
+        session(),
+        PromotionDraft(
+            name="Spring tents",
+            listing_ids=["TENT-RIDGE-GRN", "TENT-RIDGE-TAN"],
+            discount_pct=5.0,
+            starts="2026-03-01",
+            ends="2026-03-14",
+        ),
+    )
+    # The staged figure is already the exact string the write will persist.
+    assert {item.after for item in change.items} == {"208.05"}
+    assert {item.before for item in change.items} == {"219.00"}
+
+    backend.approve(change.change_id, "user:acme-operator")
+    applied = await backend.apply_change(session(), change.change_id)
+    assert applied.status is ChangeStatus.APPLIED
+
+    for sku in ("TENT-RIDGE-GRN", "TENT-RIDGE-TAN"):
+        assert _variant_price_text(store, sku) == "208.05"
+        assert store.commerce.products.get_variant_by_sku(sku).price == 208.05
+
+    # The promotion itself is recorded as a `promotion` custom object, and the evidence
+    # for this ungoverned write is an activity-log id, never a receipt.
+    record = store.commerce.custom_objects.get_object_by_handle("promotion", change.change_id)
+    assert record is not None
+    assert json.loads(record.values_json)["payload"]["name"] == "Spring tents"
+    assert "activity log" in applied.guardrail_notes[-1]
+    assert "receipt" not in applied.guardrail_notes[-1].lower()
+
+
+async def test_a_promotion_price_flows_into_a_cart_line_as_a_currency_amount(store, kernel):
+    """The reason the exact string matters: the promoted price is what every later cart
+    line and subtotal is computed from, including the figures the host hands the
+    browser as engine-vouched."""
+    from merchant_agent.types import PromotionDraft
+    from shopping_agent.types import ShoppingSessionContext
+
+    from engine_backend.storefront import EngineStorefront
+
+    backend = EngineMerchant(store, kernel)
+    change = await backend.stage_promotion(
+        session(),
+        PromotionDraft(
+            name="Spring tents",
+            listing_ids=["TENT-RIDGE-GRN"],
+            discount_pct=5.0,
+            starts="2026-03-01",
+            ends="2026-03-14",
+        ),
+    )
+    backend.approve(change.change_id, "user:acme-operator")
+    await backend.apply_change(session(), change.change_id)
+
+    customer = store.commerce.customers.get_by_email("rowan@example.invalid")
+    store.bind("shop-1", customer.id, "customer")
+    storefront = EngineStorefront(store)
+    shopper = ShoppingSessionContext(session_id="shop-1", user_id=customer.id)
+    await storefront.add_to_cart(shopper, "TENT-RIDGE-GRN", 2)
+    totals = await storefront.cart_exact_totals(shopper)
+
+    assert totals["line_totals_exact"]["TENT-RIDGE-GRN"] == "416.10"
+    assert totals["subtotal_exact"] == "416.10"
+
+
+async def test_an_applied_campaign_writes_a_campaign_custom_object(store, kernel):
+    from merchant_agent.types import CampaignDraft
+
+    backend = EngineMerchant(store, kernel)
+    change = await backend.stage_campaign(
+        session(),
+        CampaignDraft(name="Spring push", objective="awareness", budget=2500.0),
+    )
+    backend.approve(change.change_id, "user:acme-operator")
+    applied = await backend.apply_change(session(), change.change_id)
+
+    assert applied.status is ChangeStatus.APPLIED
+    campaigns = await backend.get_campaign_performance(session())
+    assert [c.name for c in campaigns] == ["Spring push"]
+    assert campaigns[0].budget == 2500.0
+    # A campaign is not a governed command: activity-log evidence, no receipt.
+    assert "activity log" in applied.guardrail_notes[-1]
+    assert "receipt" not in applied.guardrail_notes[-1].lower()
+
+
+async def test_a_promotion_over_the_guardrail_cap_is_refused(store, kernel):
+    from merchant_agent.changes import GuardrailViolation
+    from merchant_agent.types import PromotionDraft
+
+    backend = EngineMerchant(store, kernel)
+    with pytest.raises(GuardrailViolation):
+        await backend.stage_promotion(
+            session(),
+            PromotionDraft(
+                name="Everything must go",
+                listing_ids=["TENT-RIDGE-GRN"],
+                discount_pct=80.0,
+                starts="2026-03-01",
+                ends="2026-03-14",
+            ),
+        )
+    # Untouched: still exactly what the engine's own seeding write put there.
+    assert store.commerce.products.get_variant_by_sku("TENT-RIDGE-GRN").price == 219.00
