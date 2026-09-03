@@ -8,9 +8,12 @@ because it pins too**, and these tests encode both halves of that.
 The staleness is not cross-process in origin: a writer process that opens, writes and
 exits leaves a reader process's handle correct. But a second process's writes are fully
 subject to it. `test_an_unpinned_reader_process_goes_stale_...` is the negative leg: with
-the reader's pin dropped and a transient `sqlite3` read left in -- which is what
-`readonly_sql()` does on every real request -- the reader's handle tracks the first write
-by another process and then freezes on it permanently. That leg exists because without
+the reader's pin dropped and a transient `sqlite3` read left in -- a connection opened
+and closed around one statement, which is what `write_sql` does on every apply -- the
+reader's handle tracks the first write by another process and then freezes on it
+permanently. It is the open-and-close that does it, not the statement being a read;
+`readonly_sql()` is deliberately *not* that shape, because it caches one connection per
+thread for the thread's life. That leg exists because without
 it these tests could only confirm shipped behavior, never support the claim that the pin
 is what makes two processes safe.
 
@@ -66,9 +69,12 @@ def _disk_price(db_path: str) -> str:
 
     This connection is not incidental to the tests below -- it is the variable the whole
     finding turns on. Opening it is what tips an *unpinned* process's engine handle into
-    permanent staleness, and it stands in for `readonly_sql()`, which every real request
-    goes through. `_reader_process` takes it as a flag for that reason; do not "tidy" it
-    into an unconditional call, or the negative leg stops testing anything.
+    permanent staleness. What it stands in for is a transient `sqlite3` connection
+    opened and closed around one statement: `EngineStore.write_sql`, which every applied
+    price change goes through. It is deliberately *not* standing in for `readonly_sql()`,
+    which caches one connection per thread and never closes it. `_reader_process` takes
+    it as a flag for that reason; do not "tidy" it into an unconditional call, or the
+    negative leg stops testing anything.
     """
     return (
         sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -231,11 +237,12 @@ def test_an_unpinned_reader_process_goes_stale_on_another_processs_writes(tmp_pa
     """The negative leg, and the reason the pin is not redundant across processes.
 
     Same churn as above, but the reader closes the connection its store pinned. With its
-    transient disk read left in -- what `readonly_sql()` does on every real request --
-    its handle tracks the first write by the other process and then freezes on it
-    permanently, while disk stays correct. Drop the transient read and the staleness
-    disappears: that is the masking this module's docstring warns about, asserted here so
-    a harness that quietly loses the read cannot pass by accident.
+    transient disk read left in -- a connection opened and closed around one statement,
+    the shape `write_sql` takes on every apply -- its handle tracks the first write by
+    the other process and then freezes on it permanently, while disk stays correct.
+    Drop the transient read and the staleness disappears: that is the masking this
+    module's docstring warns about, asserted here so a harness that quietly loses the
+    read cannot pass by accident.
 
     If this test ever fails, the engine's behaviour has changed and the claims in
     `EngineStore`'s docstring and `docs/mapping.md` need re-measuring, not deleting.

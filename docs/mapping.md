@@ -176,10 +176,13 @@ precisely because it pins too.**
 The staleness is not cross-process in origin. One process's direct-SQL connection churn
 does not by itself poison another process's handle, and a writer process that opens,
 writes and exits leaves a reader process's handle correct. But a second process's writes
-are fully subject to the hazard. The moment an **unpinned** reader process makes any
-transient `sqlite3` connection of its own — which is exactly what `readonly_sql()` does
-on every real request — its `Commerce` handle stops seeing the other process's
-`write_sql` writes, permanently, while the row on disk is correct.
+are fully subject to the hazard. The moment an **unpinned** reader process makes a
+transient `sqlite3` connection of its own — one opened and closed around a single
+statement, which is exactly what `write_sql` does on every apply — its `Commerce` handle
+stops seeing the other process's `write_sql` writes, permanently, while the row on disk
+is correct. The open-and-close is what does it, not whether the statement reads or
+writes; `readonly_sql()` is not an instance of it, since it caches one connection per
+thread and holds it for that thread's life.
 
 Two runtime knobs on one harness — the reader's pin closed or held, its transient disk
 read included or omitted — over four successive price writes applied by a separate

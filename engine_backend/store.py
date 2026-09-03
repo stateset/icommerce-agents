@@ -36,9 +36,12 @@ class EngineStore:
     churn does not by itself poison another process's handle, and a writer process that
     opens, writes and exits leaves a reader's handle correct. But a second process's
     writes are fully subject to the hazard. The moment an *unpinned* reader process makes
-    any transient ``sqlite3`` connection of its own -- which is exactly what
-    :meth:`readonly_sql` does on every real request -- its ``Commerce`` handle stops
-    seeing the other process's ``write_sql`` writes, permanently, while disk is correct.
+    a transient ``sqlite3`` connection of its own -- one opened and closed around a
+    single statement, which is exactly what :meth:`write_sql` does on every apply -- its
+    ``Commerce`` handle stops seeing the other process's ``write_sql`` writes,
+    permanently, while disk is correct. What matters is the open-and-close, not whether
+    the statement is a read or a write: :meth:`readonly_sql` is *not* an instance of it,
+    because it caches one connection per thread and holds it for that thread's life.
     Measured over four successive price writes applied by a separate process, with the
     reader's pin dropped and its transient read left in, the handle tracks the first
     write and then freezes on it for the rest of its life; with the pin held it tracks
