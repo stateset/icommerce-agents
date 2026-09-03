@@ -30,9 +30,8 @@ Checks out the repo (submodules too, since the web workspace depends on
 `vendor/commerce-agents/examples/web-shared`), installs Node via `actions/setup-node`
 with `cache: npm`, runs `npm ci`, then builds `web/storefront` and `web/portal`.
 
-The Node version is a single top-level `env.NODE_VERSION` value (currently `18`, matching
-the Next 14.2.x the workspace builds on today) so that a future upgrade to Node 22 /
-Next 16 is a one-line change here.
+The Node version is a single top-level `env.NODE_VERSION` value, currently `22`,
+matching the Next 16 / React 19 the workspace builds on (Next 16 requires Node >= 20.9).
 
 ## What CI does not cover
 
@@ -40,4 +39,5 @@ No job exercises a live model turn or runs an eval suite — both need `ANTHROPI
 and CI has none. `pytest`, `scripts/check.py`, and `scripts/denials.py` all run against
 the deterministic engine and agent layers without ever calling out to a model, so a green
 run proves the agent-layer gates, the engine's own transactional refusals, and the
-storefront/portal builds — not that a live model chooses the right tool calls.
+storefront/portal builds — not that a live model chooses the right tool calls. See
+`docs/testing.md` for the full account of what the suite does and does not prove.

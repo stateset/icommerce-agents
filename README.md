@@ -1,5 +1,7 @@
 # stateset-icommerce-agents
 
+[![CI](https://github.com/stateset/icommerce-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/stateset/icommerce-agents/actions/workflows/ci.yml)
+
 Anthropic's `commerce-agents` architecture — a shopping agent and a merchant agent,
 each on two paths (the Messages API host and a role MCP server) — running on the
 StateSet iCommerce embedded engine (`stateset-embedded`) instead of an in-memory demo
@@ -23,11 +25,16 @@ roles.
   `/shopping/*` and `/merchant/*` routes.
 - `scripts/` — `run_demo.py` (starts the host, and with `--web` the two web apps),
   `denials.py` (three refusals, end to end), `check.py` (the drift check), `install.sh`.
+- `evals/` — six graded cases checking rules the prompts, not the code, are relied on
+  for (`docs/safety.md`'s "still asked of the model" list); has never run against a
+  live model — see `evals/README.md` and `docs/testing.md`.
 - `docs/` — `enforcement.md` (what is governed and what is not, and by which layer),
   `mapping.md` (the backend method map, the pinned submodule commit, the SQL
   fallbacks), `install.md`, `mcp.md` (connecting an MCP client, and its weaker
-  approval guarantee).
+  approval guarantee), `testing.md` (what the suite covers and what it does not).
 - `tests/` — one file per module above, run with `pytest`.
+- `.github/workflows/` — CI: a Python job (ruff, pytest, the drift check, the denial
+  walkthrough) and a Node 22 job (the two web builds); see its own `README.md`.
 
 ## Run it
 
@@ -35,12 +42,18 @@ roles.
 python scripts/run_demo.py            # FastAPI host on :8000
 python scripts/run_demo.py --web      # also starts web/storefront (:3000) and web/portal (:3100)
 python scripts/denials.py             # three refusals, printed end to end, no API key needed
+python scripts/smoke_chat.py          # one live conversation per role; needs ANTHROPIC_API_KEY, else skips
+python -m evals.run                   # the eval suite; needs ANTHROPIC_API_KEY, else skips
 ```
 
-`docs/install.md` has the Python version, submodule, and glibc-wheel details. A live
-chat turn (`/shopping/chat`, `/merchant/chat`, or either web app) needs
-`ANTHROPIC_API_KEY` in the environment; everything else, including `denials.py` and the
-full test suite, does not.
+`docs/install.md` has the Python version, submodule, and glibc-wheel details.
+`web/storefront` and `web/portal` are Next.js 16 / React 19 and need **Node >= 20.9**
+(`nvm use 22`). A live chat turn (`/shopping/chat`, `/merchant/chat`, either web app,
+`smoke_chat.py`, or `evals/`) needs `ANTHROPIC_API_KEY` in the environment; everything
+else, including `denials.py` and the full test suite, does not. `docs/testing.md` is
+the honest account of what the test suite proves and what it does not — read it before
+trusting a green CI run to mean more than "the code, not the agent's behavior, is
+correct."
 
 ## Where the interfaces are
 
