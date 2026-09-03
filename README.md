@@ -63,7 +63,8 @@ id. The first two protect you from the model. The third holds against anything.
 - `evals/` — six graded cases checking rules the prompts, not the code, are relied on
   for (`docs/safety.md`'s "still asked of the model" list), each one's grader literals
   checked against the seeded store and the real serializers by `tests/test_evals.py`;
-  has never run against a live model — see `evals/README.md` and `docs/testing.md`.
+  run live against `claude-sonnet-5` on 2026-09-03 at 4/6 — see `evals/README.md` and
+  `docs/testing.md` for the score and the two genuine model-behavior findings.
 - `docs/` — `enforcement.md` (what is governed and what is not, and by which layer),
   `mapping.md` (the backend method map, the pinned submodule commit, the SQL
   fallbacks), `install.md`, `mcp.md` (connecting an MCP client, and its weaker

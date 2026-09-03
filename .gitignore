@@ -7,3 +7,8 @@ node_modules/
 .next/
 .env
 .superpowers/
+
+# Next 16 auto-generates these under each web app during `next build`/`next dev`;
+# content is upstream Next's, not this repo's.
+web/*/AGENTS.md
+web/*/CLAUDE.md
