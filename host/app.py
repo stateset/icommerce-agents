@@ -26,7 +26,12 @@ from typing import Any
 from commerce_common.streaming import AgentEvent, to_sse
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
-from merchant_agent.types import ChangeStatus, MerchantSessionContext, MerchantSessionState
+from merchant_agent.types import (
+    ChangeStatus,
+    MerchantSessionContext,
+    MerchantSessionState,
+    StagedChange,
+)
 from merchant_agent_runtime import MerchantAgent
 from pydantic import BaseModel
 from shopping_agent.types import ShoppingSessionContext, ShoppingSessionState
@@ -34,11 +39,12 @@ from shopping_agent_runtime import ShoppingAgent
 from stateset_embedded import CartAddress
 
 from engine_backend import SKILLS_DIR
+from engine_backend.custom_objects import list_payloads
 from engine_backend.kernel import KernelClient
 from engine_backend.merchant import EngineMerchant
 from engine_backend.seed import seed_store
+from engine_backend.staging import STAGED_TYPE, load_evidence
 from engine_backend.staging import load as load_staged_change
-from engine_backend.staging import load_evidence
 from engine_backend.store import EngineStore
 from engine_backend.storefront import EngineStorefront
 
@@ -176,12 +182,7 @@ def create_app(db_path: str) -> FastAPI:
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    @app.post("/shopping/cart/add")
-    async def shopping_cart_add(
-        request: CartAddRequest, x_session_id: str | None = Header(default=None)
-    ) -> dict[str, Any]:
-        session = _bound_shopping_context(x_session_id)
-        cart = await storefront.add_to_cart(session, request.product_id, request.quantity)
+    async def _cart_payload(session: ShoppingSessionContext, cart: Any) -> dict[str, Any]:
         payload = cart.model_dump(mode="json")
         # The engine's own exact decimal totals, not a figure recomputed from the
         # ``float`` prices above: the browser displays these as given, never multiplies.
@@ -191,6 +192,43 @@ def create_app(db_path: str) -> FastAPI:
         payload["subtotal_exact"] = exact["subtotal_exact"]
         payload["grand_total_exact"] = exact["grand_total_exact"]
         return payload
+
+    @app.post("/shopping/cart/add")
+    async def shopping_cart_add(
+        request: CartAddRequest, x_session_id: str | None = Header(default=None)
+    ) -> dict[str, Any]:
+        session = _bound_shopping_context(x_session_id)
+        cart = await storefront.add_to_cart(session, request.product_id, request.quantity)
+        return await _cart_payload(session, cart)
+
+    @app.get("/shopping/cart")
+    async def shopping_cart_read(x_session_id: str | None = Header(default=None)) -> dict[str, Any]:
+        """A read: renders this session's own cart as it stands, no write involved."""
+        session = _bound_shopping_context(x_session_id)
+        cart = await storefront.get_cart(session)
+        return await _cart_payload(session, cart)
+
+    @app.get("/shopping/orders")
+    async def shopping_orders(x_session_id: str | None = Header(default=None)) -> dict[str, Any]:
+        """This session's own orders, each carrying the engine's own exact total --
+        never a figure recomputed from the ``float`` total on the order itself."""
+        session = _bound_shopping_context(x_session_id)
+        orders = await storefront.get_orders(session)
+        binding = store.binding(session.session_id)
+        engine_orders = {
+            order.id: order
+            for order in await store.call(lambda c: c.orders.list())
+            if order.customer_id == binding.subject_id
+        }
+        payload = []
+        for order in orders:
+            item = order.model_dump(mode="json")
+            engine_order = engine_orders.get(order.order_id)
+            item["total_exact"] = (
+                engine_order.total_amount_exact if engine_order is not None else None
+            )
+            payload.append(item)
+        return {"orders": payload}
 
     @app.post("/shopping/checkout")
     async def shopping_checkout(x_session_id: str | None = Header(default=None)) -> dict[str, Any]:
@@ -285,6 +323,37 @@ def create_app(db_path: str) -> FastAPI:
             )
         merchant.approve(change_id, session.operator)
         return {"change_id": change_id, "approved_by": session.operator}
+
+    @app.get("/merchant/changes")
+    async def merchant_changes_read(
+        x_session_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Pending and applied changes, each carrying its structured evidence -- a
+        sealed kernel receipt id or an activity-log id, read straight from the
+        persisted record, never inferred from ``guardrail_notes`` prose. This is a
+        read: it introduces no write and calls neither ``approve`` nor ``apply_change``."""
+        _bound_merchant_context(x_session_id)
+        records = await store.call(lambda c: list_payloads(c, STAGED_TYPE))
+        changes = []
+        for record in records:
+            change = StagedChange.model_validate(record)
+            if change.status not in (ChangeStatus.STAGED, ChangeStatus.APPLIED):
+                continue
+            item = change.model_dump(mode="json")
+            item["evidence"] = record.get("evidence") or []
+            changes.append(item)
+        changes.sort(key=lambda item: item["created_at"])
+        return {"changes": changes}
+
+    # -- Capabilities ---------------------------------------------------------------
+
+    @app.get("/capabilities")
+    async def capabilities() -> dict[str, str]:
+        """Whether a model is configured for this deployment -- present or absent,
+        never valid or invalid, since that would require a call to the provider. Not
+        session-scoped: a browser needs this before it has a session. Never echoes the
+        key or the workspace id; this route never touches either value's contents."""
+        return {"assistant": "available" if anthropic_client is not None else "unconfigured"}
 
     return app
 

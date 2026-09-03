@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import secrets
 import sys
 from pathlib import Path
 
@@ -78,11 +79,19 @@ def merchant_agent_config():
     return MerchantAgentConfig()
 
 
-async def denial_three_engine_over_refund(store: EngineStore, kernel: KernelClient) -> bool:
+async def denial_three_engine_over_refund(
+    store: EngineStore, kernel: KernelClient, run_id: str
+) -> bool:
     """An over-refund issued as a governed command with valid approval evidence. This
     reaches the engine's own transaction -- policy passes because approval is present
     and correctly scoped -- and the engine's own refund logic refuses it because the
-    amount exceeds what was captured."""
+    amount exceeds what was captured.
+
+    ``run_id`` makes the idempotency key (and the approval id alongside it) unique per
+    invocation of this script: a fixed key means a second run against the same
+    ``--db`` file replays the *first* run's idempotency conflict instead of re-issuing
+    the over-refund attempt, so this denial would stop firing on any but a fresh store.
+    """
     payment = store.commerce.payments.list()[0]
     print(
         f"Attempting: payments.create_refund for 10000.00 against payment {payment.id} "
@@ -91,9 +100,9 @@ async def denial_three_engine_over_refund(store: EngineStore, kernel: KernelClie
     receipt = await kernel.execute(
         "payments.create_refund",
         {"payment_id": payment.id, "amount": "10000.00"},
-        idempotency_key="denials-refund-toolarge",
+        idempotency_key=f"denials-refund-toolarge-{run_id}",
         approval=approval_evidence(
-            "appr-denials-1", "user:acme-operator", "payments.create_refund", store.store_id
+            f"appr-denials-{run_id}", "user:acme-operator", "payments.create_refund", store.store_id
         ),
     )
     if receipt.ok:
@@ -111,13 +120,19 @@ async def main(db_path: str) -> int:
     seed_store(store.commerce)
     kernel = KernelClient(store, CONFIG / "kernel-policy.json", CONFIG / "kernel-principal.json")
 
+    # A per-run suffix, not a fixed key: against a fresh store either would do, but
+    # against an existing `--db` file (a re-run) a fixed idempotency key on the
+    # over-refund attempt would replay the first run's conflict instead of
+    # re-attempting the refund, hiding the denial this script exists to demonstrate.
+    run_id = secrets.token_hex(4)
+
     results = []
     print("=" * 72)
     results.append(await denial_one_agent_layer_cart_write())
     print("-" * 72)
     results.append(await denial_two_agent_layer_apply_without_approval(store, kernel))
     print("-" * 72)
-    results.append(await denial_three_engine_over_refund(store, kernel))
+    results.append(await denial_three_engine_over_refund(store, kernel, run_id))
     print("=" * 72)
 
     if all(results):
