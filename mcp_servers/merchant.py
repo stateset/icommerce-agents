@@ -1,37 +1,27 @@
-"""The merchant agent's MCP server, over the same ``EngineMerchant`` the Messages API
-host uses — the merchant role's own tool surface (metrics,
-listings, the staged-change queue, ``apply_change``), not the engine's own
-900+-tool server::
+"""Merchant MCP server over the same ``EngineMerchant`` the Messages API host uses —
+the merchant role's own tool surface (metrics, listings, the staged-change queue,
+``apply_change``), not the engine's 900+-tool server.
+
+Run locally:
 
     ACME_OPERATOR=user:acme-operator .venv/bin/python -m mcp_servers.merchant
 
-The operator stamped on every staged and applied change comes from the
-``ACME_OPERATOR`` environment variable — never from a tool argument.
+Identity and approval
+---------------------
+- The operator stamped on every staged and applied change comes from the
+  ``ACME_OPERATOR`` environment variable — never from a tool argument.
+- Approval is out-of-band and happens only via the FastAPI host's
+  ``POST /merchant/changes/{id}/approve`` route (operator identity is read from the
+  session binding), or by calling the same ``EngineMerchant.approve`` that route uses.
+- There is no MCP approval tool on this server. ``apply_change`` marks nothing itself
+  and refuses any ``change_id`` the host has not approved first; enforcement is in the
+  backend's own ``approved_ids`` and is re-checked by ``EngineMerchant.apply_change``.
 
-Host approval on this path: ``apply_change`` marks nothing itself and refuses any
-``change_id`` that a separate ``host_approve`` tool call has not marked first
-(``EngineMerchant.approve``, from the environment-bound operator, never a tool
-argument). Staging, approving, and applying are three distinct tool calls, so a client
-that surfaces each call to its user — the default behavior in Claude Code, Claude
-Desktop, and Cursor — gives the operator an independent, visible decision point before
-``host_approve`` runs, separate from the one before ``apply_change`` runs. This mirrors
-upstream's own Agent SDK path, where ``MerchantToolset.host_approve`` /
-``host_clear`` are exactly this: a mark the host sets before ``apply_change`` is allowed
-to see it, distinct from staging and from applying.
-
-This is weaker than the FastAPI host's approval surface (``POST
-/merchant/changes/{id}/approve``), which is a route only the operator's own browser
-session can reach — out-of-band by construction, entirely outside the MCP client's or
-the model's discretion. Here, both ``host_approve`` and ``apply_change`` are ordinary
-tools sitting behind whatever the connecting MCP client does with a tool call: a client
-configured to auto-approve tool invocations (skipping its own confirmation prompts)
-removes the human step this design otherwise relies on, and nothing in this process can
-detect or refuse that. Treat this MCP path as weaker than the HTTP host's for exactly
-this reason, and see ``docs/mcp.md`` for the same warning in the operator-facing form.
-The executor's own ``require_host_approval`` gate is left off (``False``): nothing on
-this transport populates the in-process ``state.approved_change_ids`` it would
-otherwise require, so ``EngineMerchant.approved_ids`` — set only by ``host_approve`` —
-is the one real, independent guard.
+Executor gates
+--------------
+- The executor's in-process ``require_host_approval`` is left ``False`` on this path:
+  MCP does not populate ``state.approved_change_ids``; approval is tracked only in the
+  backend and enforced at apply time.
 """
 
 from __future__ import annotations
