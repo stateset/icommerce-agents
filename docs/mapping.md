@@ -240,22 +240,3 @@ is this repo's own, in plain CSS, and does not use `web-shared`'s Tailwind-v4-to
 components (`ui.tsx`, `generative.tsx`, `storefront/bag.tsx`, `portal/*`) — pulling
 those in would mean adopting Tailwind v4's custom-property utility syntax wholesale for
 more surface than a from-scratch reference implementation needs.
-
-## npm audit findings on the pinned Next 14.2.x / React 18.3.1 stack
-
-`docs/install.md` records why `web/storefront` and `web/portal` are pinned to Next
-14.2.35 / React 18.3.1 rather than the vendor `web-shared` examples' Next 16 / React 19
-(Node 18, the ambient toolchain here, cannot build Next 16). `npm audit` against that
-pin reports exactly two high-severity advisories, unresolved without the Node upgrade
-this repo deliberately avoided:
-
-- **Next.js** — a family of Server-Components/DoS/SSRF/cache-poisoning advisories
-  (e.g. `GHSA-h25m-26qc-wcjf`, `GHSA-q4gf-8mx6-v5v3`) fixed only from Next 15 onward.
-- **PostCSS** (`<=8.5.22`, a transitive dependency of Next 14) — XSS via unescaped
-  `</style>` output and several `sourceMappingURL` path-traversal/arbitrary-file-read
-  advisories (e.g. `GHSA-qx2v-qp2m-jg93`, `GHSA-6g55-p6wh-862q`).
-
-`npm audit fix --force` resolves both by installing `next@15.5.25`, which is the
-Node-20+ upgrade this repo's pin exists to avoid. This is a local reference
-implementation, not an internet-facing deployment; the pin is left as-is with these two
-findings recorded rather than silently accepted.

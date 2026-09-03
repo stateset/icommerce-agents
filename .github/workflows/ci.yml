@@ -6,9 +6,8 @@ on:
   pull_request:
 
 env:
-  # Single top-level knob: a later task upgrades the web workspace to Node 22 / Next 16.
-  # Changing web builds to that version is then a one-line edit here.
-  NODE_VERSION: "18"
+  # Single top-level knob: the web workspace builds Next 16, which requires Node >= 20.9.
+  NODE_VERSION: "22"
 
 jobs:
   python:

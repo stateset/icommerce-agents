@@ -1,9 +1,5 @@
 {
   "name": "stateset-icommerce-agents-web",
   "private": true,
-  "workspaces": ["web/*", "vendor/commerce-agents/examples/web-shared"],
-  "overrides": {
-    "react": "18.3.1",
-    "react-dom": "18.3.1"
-  }
+  "workspaces": ["web/*", "vendor/commerce-agents/examples/web-shared"]
 }

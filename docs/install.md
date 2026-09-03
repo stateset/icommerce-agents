@@ -26,13 +26,12 @@ install. This is expected, not a failure; let it run.
 
 ## Node
 
-`web/storefront` and `web/portal` are Next.js 14.2.x / React 18.3.1, deliberately one
-major behind the vendor `web-shared` examples' Next 16 / React 19: Next 16 requires
-Node ≥ 20.9 and refuses to build under Node 18, which is what this repo's install was
-verified against (`node -v` → `v18.20.8`). Next 14.2.35 builds cleanly on Node 18.17+.
-If your Node is 20.9 or newer, Next 14 still works; there is no requirement to upgrade.
+`web/storefront` and `web/portal` are Next.js 16 / React 19, matching the vendor
+`web-shared` examples. Next 16 requires **Node ≥ 20.9**; this repo's install is
+verified against Node 22.18.0. Select it (e.g. `nvm use 22`) before installing.
 
 ```bash
+nvm use 22   # or any Node >= 20.9
 npm install
 npm run build --workspace web/storefront
 npm run build --workspace web/portal
