@@ -261,7 +261,11 @@ def _drive_tour(
         # Use the family product id, not the SKU.
         pid = store.commerce.products.get_variant_by_sku(PRICE_UPDATE_SKU).product_id
         listing_change = asyncio.run(
-            merchant.stage_listing_update(backend_session, pid, {"description": "Updated copy via tour."})
+            merchant.stage_listing_update(
+                backend_session,
+                pid,
+                {"description": "Updated copy via tour."},
+            )
         )
         result.narrate(f"Approving {listing_change.change_id} (host route)...")
         approve_listing = http.post(
