@@ -7,6 +7,7 @@ to a warning rather than crashing.
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -41,8 +42,6 @@ def main() -> int:
                 processes.append(process)
 
     uvicorn_env = {"DEMO_DB_PATH": args.db}
-    import os
-
     env = os.environ | uvicorn_env
     host_process = subprocess.Popen(
         [
@@ -72,8 +71,6 @@ def main() -> int:
 
 def build_app():
     """The uvicorn factory target: ``host.app.create_app`` over ``DEMO_DB_PATH``."""
-    import os
-
     from host.app import create_app
 
     db_path = os.environ.get("DEMO_DB_PATH", str(REPO_ROOT / "data" / "demo.db"))

@@ -31,6 +31,7 @@ from merchant_agent_runtime import MerchantAgent
 from pydantic import BaseModel
 from shopping_agent.types import ShoppingSessionContext, ShoppingSessionState
 from shopping_agent_runtime import ShoppingAgent
+from stateset_embedded import CartAddress
 
 from engine_backend import SKILLS_DIR
 from engine_backend.kernel import KernelClient
@@ -157,7 +158,12 @@ def create_app(db_path: str) -> FastAPI:
     @app.post("/shopping/checkout")
     async def shopping_checkout(x_session_id: str | None = Header(default=None)) -> dict[str, Any]:
         """The only route that completes an order. Reached by a human click, never by
-        the model: no agent tool calls this. Governed by ``checkout.commit``."""
+        the model: no agent tool calls this. Governed by ``checkout.commit``.
+
+        Writes a fixed, fictional placeholder shipping address onto the cart first --
+        a demo stand-in for the address-collection step a real deployment would run
+        before checkout, present only because the engine's checkout-readiness check
+        requires one."""
         session = _bound_shopping_context(x_session_id)
         binding = store.binding(session.session_id)
         carts = store.commerce.carts.for_customer(binding.subject_id)
@@ -166,20 +172,24 @@ def create_app(db_path: str) -> FastAPI:
         cart_id = carts[-1].id
         customer = store.commerce.customers.get(binding.subject_id)
 
+        # DEMO PLACEHOLDER: the engine's checkout-readiness check requires a shipping
+        # address on the cart, and this host has no address-collection step yet (a real
+        # deployment collects one from the shopper before checkout). This is a fixed,
+        # unmistakably fictional ACME Supply placeholder standing in for that step --
+        # not a real address, and not one the customer gave -- and exists only to
+        # satisfy the engine's readiness check ahead of ``checkout.commit``.
         def set_address(c: Any) -> None:
-            from stateset_embedded import CartAddress
-
             c.carts.set_shipping_address(
                 cart_id,
                 CartAddress(
                     first_name=customer.first_name or "",
                     last_name=customer.last_name or "",
                     company=None,
-                    line1="1 Acme Way",
+                    line1="1 Demo Placeholder Way (ACME Supply fictional address)",
                     line2=None,
-                    city="Portland",
-                    state="OR",
-                    postal_code="97201",
+                    city="Fictional",
+                    state="ZZ",
+                    postal_code="00000",
                     country="US",
                     phone=None,
                     email=customer.email,

@@ -76,3 +76,28 @@ def test_routes_reject_a_missing_or_unknown_session_id(tmp_path):
         ).status_code
         == 401
     )
+
+
+def test_chat_routes_reject_a_missing_or_unknown_session_id_before_any_model_call(tmp_path):
+    # No ANTHROPIC_API_KEY is set in this test process; if the identity gate did not
+    # sit in front of the model call, this would error out reaching the runtime
+    # instead of cleanly 401ing, and that would be the finding.
+    c = client(tmp_path)
+    assert c.post("/shopping/chat", json={"message": "hi"}).status_code == 401
+    assert c.post("/merchant/chat", json={"message": "hi"}).status_code == 401
+    assert (
+        c.post(
+            "/shopping/chat",
+            json={"message": "hi"},
+            headers={"X-Session-Id": "not-a-real-session"},
+        ).status_code
+        == 401
+    )
+    assert (
+        c.post(
+            "/merchant/chat",
+            json={"message": "hi"},
+            headers={"X-Session-Id": "not-a-real-session"},
+        ).status_code
+        == 401
+    )
