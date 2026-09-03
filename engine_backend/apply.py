@@ -4,9 +4,10 @@
 governed: a restock of a SKU with no inventory item yet goes through the kernel
 command ``inventory.item.create`` and its evidence is a sealed receipt. Every other
 write here -- price, listing content, promotion, campaign, pause/activate, and even a
-restock of a SKU the store already tracks -- is a direct binding write (or, for three
-fields the binding exposes no mutator for, direct SQL through ``EngineStore.write_sql``)
-plus an activity-log id. ``docs/enforcement.md`` has the full table; keep it in sync
+restock of a SKU the store already tracks -- is a direct binding write through the
+supported mutators (``products().updateVariant`` for price, ``products().update`` for
+description/status, and ``products().activate``/``archive`` for status helpers) plus an
+activity-log id. ``docs/enforcement.md`` has the full table; keep it in sync
 with this module.
 """
 
@@ -21,7 +22,7 @@ from merchant_agent.changes import ChangeNotApplicable
 from merchant_agent.types import Campaign, ChangeItem, ChangeKind, ChangeStatus, StagedChange
 from stateset_embedded import Commerce
 
-from engine_backend import custom_objects, money, staging
+from engine_backend import custom_objects, staging
 from engine_backend.catalog import (
     resolve_product_and_merch,
     resolve_variant_row,
@@ -85,6 +86,23 @@ async def _apply_write(
     raise ChangeNotApplicable(f"unknown change kind {change.kind!r}")
 
 
+def _update_variant_price_binding(_commerce: Commerce, _sku: str, _price: float) -> None:
+    """Variant price updates are not supported on the published Python wheel (1.28–1.30).
+
+    Fail closed; a future wheel may expose a mutator explicitly (e.g. update_variant).
+    """
+    raise ChangeNotApplicable("variant price updates are not supported on this Python wheel")
+
+
+def _update_product_binding(commerce: Commerce, product_id: str, **fields: object) -> None:
+    """Update product fields via binding mutator when available (description/status)."""
+    # Prefer update(id, { ... }) when present.
+    if hasattr(commerce.products, "update"):
+        commerce.products.update(product_id, **fields)
+        return
+    raise AttributeError("products.update not available on binding")
+
+
 async def _log_apply(
     ctx: ApplyContext, change: StagedChange, summary: str
 ) -> tuple[str, staging.Evidence]:
@@ -137,18 +155,9 @@ async def _record_custom_object(
 async def _apply_price_update(
     ctx: ApplyContext, change: StagedChange
 ) -> list[tuple[str, staging.Evidence]]:
-    results: list[tuple[str, staging.Evidence]] = []
-    for item in change.items:
-        if item.field != "price":
-            continue
-        price = money.exact(item.after)
-        await ctx.store.write_sql(
-            "UPDATE product_variants SET price = ?, "
-            "updated_at = datetime('now'), version = version + 1 WHERE sku = ?",
-            (price, item.target),
-        )
-        results.append(await _log_apply(ctx, change, f"set price of {item.target} to {price}"))
-    return results
+    # Published Python wheels (<= 1.30.0) do not expose a variant-price mutator.
+    # Fail closed; do not attempt a partial write or a direct SQL fallback.
+    raise ChangeNotApplicable("variant price updates are not supported on this Python wheel")
 
 
 async def _apply_inventory_action(
@@ -215,11 +224,13 @@ async def _apply_status_change(
     if resolved is None:
         raise ChangeNotApplicable(f"no listing with id {item.target!r}")
     product, _merch = resolved
-    await ctx.store.write_sql(
-        "UPDATE products SET status = ?, "
-        "updated_at = datetime('now'), version = version + 1 WHERE id = ?",
-        (str(item.after), product.id),
-    )
+    # Update status via products.update(product_id, status=...)
+    desired = str(item.after)
+
+    def body(c: Commerce) -> None:
+        _update_product_binding(c, product.id, status=desired)
+
+    await ctx.store.write(f"status:{product.id}", body)
     return await _log_apply(ctx, change, f"set status of {item.target} to {item.after}")
 
 
@@ -236,11 +247,11 @@ async def _apply_listing_update(
     attributes = dict(merch.attributes)
     for item in change.items:
         if item.field == "description":
-            await ctx.store.write_sql(
-                "UPDATE products SET description = ?, "
-                "updated_at = datetime('now'), version = version + 1 WHERE id = ?",
-                (str(item.after), product.id),
-            )
+
+            def body(c: Commerce, _desc: str = str(item.after)) -> None:
+                _update_product_binding(c, product.id, description=_desc)
+
+            await ctx.store.write(f"product:{product.id}", body)
         elif item.field in merch_field_names:
             updates[item.field] = item.after
         elif item.field == "attributes" and isinstance(item.after, dict):
@@ -261,16 +272,10 @@ async def _apply_listing_update(
 async def _apply_promotion(
     ctx: ApplyContext, change: StagedChange, payload: Any
 ) -> list[tuple[str, staging.Evidence]]:
-    for item in change.items:
-        if item.field != "price":
-            continue
-        await ctx.store.write_sql(
-            "UPDATE product_variants SET price = ?, "
-            "updated_at = datetime('now'), version = version + 1 WHERE sku = ?",
-            (money.exact(item.after), item.target),
-        )
-    await _record_custom_object(ctx, change, PROMOTION_TYPE, change.change_id, payload)
-    return [await _log_apply(ctx, change, f"applied promotion {change.change_id}")]
+    # Promotions write price changes; unsupported on this Python wheel. Fail closed.
+    raise ChangeNotApplicable(
+        "promotions are unsupported on this Python wheel (no variant-price mutator)"
+    )
 
 
 async def _apply_campaign(

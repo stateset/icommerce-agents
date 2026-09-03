@@ -20,7 +20,7 @@ Matrix: Python 3.12 only. `pyproject.toml` pins `requires-python = ">=3.12,<3.13
 so a 3.13 job cannot install the package; the matrix stays single-version until that
 cap is deliberately widened.
 
-`stateset-embedded==1.28.5` publishes `manylinux_2_34` wheels, and `ubuntu-latest`'s
+`stateset-embedded==1.30.0` publishes `manylinux_2_34` wheels, and `ubuntu-latest`'s
 glibc satisfies that, so installing normally takes well under a minute. A runner with
 an older glibc falls back to building the engine from its cargo/maturin sdist —
 compiling Rust from source, which can take 15+ minutes. The job's `timeout-minutes: 30`

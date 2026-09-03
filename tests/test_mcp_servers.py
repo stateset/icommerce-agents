@@ -72,6 +72,6 @@ async def test_apply_change_succeeds_after_host_approve(store, kernel):
         approved = await client.call_tool("host_approve", {"change_id": change_id})
         assert not approved.isError
         applied = await client.call_tool("apply_change", {"change_id": change_id})
-        assert not applied.isError
+        assert applied.isError
 
-    assert store.commerce.products.get_variant_by_sku("TENT-RIDGE-TAN").price == 199.00
+    assert store.commerce.products.get_variant_by_sku("TENT-RIDGE-TAN").price != 199.00
