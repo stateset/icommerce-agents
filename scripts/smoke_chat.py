@@ -1,6 +1,3 @@
-# Copyright 2026 Anthropic PBC
-# SPDX-License-Identifier: Apache-2.0
-
 """A scripted live conversation against this repo's host (``host.app.create_app``),
 in-process, over the ACME Supply seeded store. One arc per role, run against a live
 model: a shopping conversation (search, comparison, cart add, order history) and a
@@ -96,7 +93,13 @@ ROLE_TURNS: dict[str, list[dict[str, Any]]] = {
 
 
 def build_turns(role: str) -> list[str]:
-    """The scripted user turns for one role. A later eval task imports this."""
+    """The scripted user turns for one role, without their per-turn expectations.
+
+    `tests/test_smoke_chat.py` is the only caller. The eval suite was once meant to
+    reuse this for its scripted lead-ins and does not: a lead-in is one deliberate turn
+    per case (`EvalCase.lead_in`), not a whole role arc, and driving four vague turns
+    through a live model to set up one graded turn would add cost and flake without
+    making the case sharper."""
     try:
         return [turn["message"] for turn in ROLE_TURNS[role]]
     except KeyError:

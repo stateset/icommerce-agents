@@ -1,3 +1,4 @@
+import re
 import subprocess
 from pathlib import Path
 
@@ -12,13 +13,22 @@ MIN_NODE_VERSION = (20, 9)
 
 
 def _node_version() -> tuple[int, int] | None:
+    """Node's reported version, or `None` when it cannot be determined.
+
+    Everything unparseable returns `None` so the caller skips: a `node` that is absent
+    or exits non-zero, and output this does not recognise. `"v22"` with no minor, or a
+    nightly's `"v23.0.0-nightly..."`, used to raise `ValueError` out of the unpacking or
+    the `int()`, past the `except` above, and fail the test rather than skip it.
+    """
     try:
         result = subprocess.run(["node", "--version"], capture_output=True, text=True, check=True)
     except (OSError, subprocess.CalledProcessError):
         return None
     # e.g. "v18.20.8\n"
-    major, minor, *_ = result.stdout.strip().lstrip("v").split(".")
-    return int(major), int(minor)
+    match = re.match(r"v?(\d+)(?:\.(\d+))?", result.stdout.strip())
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2) or 0)
 
 
 @pytest.mark.parametrize("app", ["storefront", "portal"])
@@ -40,3 +50,24 @@ def test_the_web_app_builds(app):
         text=True,
     )
     assert result.returncode == 0, result.stderr[-3000:]
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("v18.20.8\n", (18, 20)),
+        ("v22\n", (22, 0)),
+        ("v23.0.0-nightly20260101\n", (23, 0)),
+        ("not a version\n", None),
+        ("", None),
+    ],
+)
+def test_node_version_parses_or_returns_none(output, expected, monkeypatch):
+    """`None` means "skip", so anything unparseable must reach it rather than raise:
+    `"v22"` used to raise `ValueError` past the `except` and fail the test outright."""
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert _node_version() == expected

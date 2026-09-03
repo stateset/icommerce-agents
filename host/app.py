@@ -68,7 +68,15 @@ async def _with_change_evidence(store: EngineStore, event: AgentEvent) -> AgentE
     if event.type != "change_update":
         return event
     change = dict(event.data.get("change") or {})
-    evidence = await load_evidence(store, change["change_id"])
+    # Two reasons to hand the event straight back. A change dict with no `change_id` is
+    # nothing this can look up, and raising here would break the SSE stream mid-turn
+    # rather than drop one field. And evidence only exists for an *applied* change --
+    # `apply.apply_change` is what produces it -- so a staged or discarded change would
+    # cost a database read per event to learn it has none.
+    change_id = change.get("change_id")
+    if change_id is None or change.get("status") != ChangeStatus.APPLIED.value:
+        return event
+    evidence = await load_evidence(store, change_id)
     change["evidence"] = [item.model_dump() for item in evidence]
     return AgentEvent(type=event.type, data={**event.data, "change": change})
 

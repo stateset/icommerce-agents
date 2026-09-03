@@ -28,7 +28,12 @@ Pip is cached via `actions/setup-python`'s `cache: pip`.
 
 Checks out the repo (submodules too, since the web workspace depends on
 `vendor/commerce-agents/examples/web-shared`), installs Node via `actions/setup-node`
-with `cache: npm`, runs `npm ci`, then builds `web/storefront` and `web/portal`.
+with `cache: npm`, runs `npm ci`, then `npm audit --audit-level=high`, then builds
+`web/storefront` and `web/portal`.
+
+The audit step is there because the Next 16 / React 19 upgrade was done to clear the
+workspace's high-severity advisories. Without a gate, they come back on a transitive
+bump with nothing failing.
 
 The Node version is a single top-level `env.NODE_VERSION` value, currently `22`,
 matching the Next 16 / React 19 the workspace builds on (Next 16 requires Node >= 20.9).

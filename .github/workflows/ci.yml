@@ -68,6 +68,12 @@ jobs:
       - name: npm ci
         run: npm ci
 
+      # Task 7 cleared the workspace's high-severity advisories by moving to Next 16 /
+      # React 19. Without this step they could come back on a transitive bump with
+      # nothing failing, which is the whole reason that upgrade was done.
+      - name: npm audit
+        run: npm audit --audit-level=high
+
       - name: build storefront
         run: npm run build --workspace web/storefront
 

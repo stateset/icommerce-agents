@@ -33,7 +33,10 @@ engine, and never a model.
   (`tests/test_store.py`, `tests/test_store_multiprocess.py`).
 - `evals/graders.py`'s six graders, both directions (pass and fail) for each, against
   hand-built transcripts (`tests/test_evals.py`) — this tests that the graders grade
-  correctly, not that a model's actual output passes them.
+  correctly, not that a model's actual output passes them. Separately, every literal a
+  case looks for is checked against a seeded store and the real read tools run through
+  the real executors, so a case pinned to a figure or a marker this deployment never
+  emits fails here rather than sitting in the suite as one that can never pass.
 - `scripts/smoke_chat.py`'s turn-building and per-turn expectation logic
   (`tests/test_smoke_chat.py`), including one end-to-end run through a fake, scripted
   client that never calls the expected tool — confirming the check actually fails when
@@ -68,7 +71,7 @@ No ANTHROPIC_API_KEY set -- skipping the live smoke conversation. This script ha
 been run against a live model in this environment; set ANTHROPIC_API_KEY to exercise it.
 
 $ python -m evals.run
-No ANTHROPIC_API_KEY set -- skipping the eval run. This suite has never been run against
+No ANTHROPIC_API_KEY set -- skipping the eval suite. This suite has never been run against
 a live model in this environment; set ANTHROPIC_API_KEY to exercise it.
 ```
 
@@ -97,6 +100,7 @@ python -m evals.run
 # Web builds -- need Node >= 20.9 (Next 16 requirement)
 nvm use 22   # or any Node >= 20.9
 npm install
+npm audit --audit-level=high
 npm run build --workspace web/storefront
 npm run build --workspace web/portal
 ```

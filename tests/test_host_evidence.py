@@ -91,3 +91,31 @@ def test_no_regex_remains_anywhere_in_the_evidence_path():
     assert "import re" not in source
     assert "re.compile" not in source
     assert "re.search" not in source
+
+
+async def test_a_change_update_without_a_change_id_passes_through_unchanged(store, kernel):
+    """`_with_change_evidence` runs inside an SSE generator, so a `KeyError` on a change
+    dict missing `change_id` breaks the stream rather than dropping one field."""
+    from commerce_common.streaming import AgentEvent
+
+    event = AgentEvent(type="change_update", data={"change": {"status": "applied"}})
+    assert await host_app._with_change_evidence(store, event) is event
+    assert await host_app._with_change_evidence(store, AgentEvent(type="change_update", data={}))
+
+
+async def test_a_staged_change_update_costs_no_evidence_read(store, kernel, monkeypatch):
+    """Evidence exists only for an applied change, so the read is skipped for a staged
+    or discarded one instead of spending a database round trip per event to learn it."""
+    from commerce_common.streaming import AgentEvent
+
+    backend = EngineMerchant(store, kernel)
+    staged = await backend.stage_price_update(
+        session(), [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.00)]
+    )
+
+    async def fail(*args, **kwargs):
+        raise AssertionError("load_evidence was called for a change that cannot have any")
+
+    monkeypatch.setattr(host_app, "load_evidence", fail)
+    event = AgentEvent(type="change_update", data={"change": staged.model_dump(mode="json")})
+    assert await host_app._with_change_evidence(store, event) is event
