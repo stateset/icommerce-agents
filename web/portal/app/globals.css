@@ -189,6 +189,33 @@ button {
   color: var(--danger);
 }
 
+.assistant-unavailable {
+  margin: auto;
+  max-width: 440px;
+  text-align: center;
+  padding: 28px 24px;
+}
+
+.assistant-unavailable h2 {
+  font-size: 17px;
+  margin: 0 0 10px;
+}
+
+.assistant-unavailable p {
+  color: var(--ink-soft);
+  font-size: 13.5px;
+  line-height: 1.6;
+  margin: 0 0 10px;
+}
+
+.assistant-unavailable code {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-size: 12.5px;
+}
+
 .changes-col {
   display: flex;
   flex-direction: column;

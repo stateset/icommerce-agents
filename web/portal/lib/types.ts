@@ -36,3 +36,9 @@ export interface StagedChange {
   evidence?: ChangeEvidence[];
   currency?: string | null;
 }
+
+/** `GET /capabilities` -- whether a model is configured for this deployment. Present
+ * or absent only, never valid or invalid. */
+export interface Capabilities {
+  assistant: "available" | "unconfigured";
+}

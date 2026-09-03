@@ -52,3 +52,36 @@ export interface CheckoutResponse {
     error_message?: string | null;
   };
 }
+
+export interface OrderItem {
+  product_id: string;
+  title: string;
+  quantity: number;
+  price: number;
+  option_values?: Record<string, string>;
+  variant_of?: string | null;
+}
+
+export interface Order {
+  order_id: string;
+  status: string;
+  placed_at: string;
+  items: OrderItem[];
+  total: number;
+  currency?: string;
+  estimated_delivery?: string | null;
+  tracking_url?: string | null;
+  /** The engine's own exact total for this order (`GET /shopping/orders`), read from
+   * the matching engine order -- never recomputed from the `float` `total` above. */
+  total_exact?: string | null;
+}
+
+export interface OrdersPayload {
+  orders: Order[];
+}
+
+/** `GET /capabilities` -- whether a model is configured for this deployment. Present
+ * or absent only, never valid or invalid. */
+export interface Capabilities {
+  assistant: "available" | "unconfigured";
+}

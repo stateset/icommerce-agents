@@ -18,7 +18,15 @@ function displayAmount(value: number | string | null | undefined, currency = "US
   return new Intl.NumberFormat("en-US", { style: "currency", currency }).format(amount);
 }
 
-export function CartPanel({ cart, busy }: { cart: CartPayload | null; busy: boolean }) {
+export function CartPanel({
+  cart,
+  busy,
+  onPlaced,
+}: {
+  cart: CartPayload | null;
+  busy: boolean;
+  onPlaced?: () => void;
+}) {
   const [placing, setPlacing] = useState(false);
   const [result, setResult] = useState<
     { ok: true; orderNumber: string; sealed: boolean; receiptId: string | null } | { ok: false; message: string } | null
@@ -41,6 +49,7 @@ export function CartPanel({ cart, busy }: { cart: CartPayload | null; busy: bool
         sealed: body.receipt?.sealed ?? false,
         receiptId: body.receipt?.receipt_id ?? null,
       });
+      onPlaced?.();
       return;
     }
     const message =
@@ -50,7 +59,7 @@ export function CartPanel({ cart, busy }: { cart: CartPayload | null; busy: bool
   }
 
   return (
-    <aside className="cart-col">
+    <div className="cart-block">
       <div className="cart-header">
         <h2>Your bag</h2>
         <span className="cart-count">{count} item{count === 1 ? "" : "s"}</span>
@@ -111,6 +120,6 @@ export function CartPanel({ cart, busy }: { cart: CartPayload | null; busy: bool
           )
         ) : null}
       </div>
-    </aside>
+    </div>
   );
 }

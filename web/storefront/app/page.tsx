@@ -3,21 +3,31 @@
 import { useEffect, useRef, useState } from "react";
 import { useAgentTurn, useSession } from "web-shared";
 import type { AgentEvent } from "web-shared";
-import { api, healthy, UNREACHABLE } from "../lib/api";
-import type { CartPayload, ProductsPayload } from "../lib/types";
+import { api, capabilities, fetchCart, fetchOrders, healthy, UNREACHABLE } from "../lib/api";
+import type { CartPayload, Order, ProductsPayload } from "../lib/types";
 import { ProductCards } from "./components/ProductCards";
 import { CartPanel } from "./components/CartPanel";
+import { OrdersPanel } from "./components/OrdersPanel";
 
 export default function StorefrontPage() {
   const [reachable, setReachable] = useState<boolean | null>(null);
+  const [assistant, setAssistant] = useState<"checking" | "available" | "unconfigured">(
+    "checking",
+  );
   const [cart, setCart] = useState<CartPayload | null>(null);
+  const [orders, setOrders] = useState<Order[] | null>(null);
   const [input, setInput] = useState("");
   const transcriptRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let cancelled = false;
     healthy().then((ok) => {
-      if (!cancelled) setReachable(ok);
+      if (cancelled) return;
+      setReachable(ok);
+      if (!ok) return;
+      capabilities().then((caps) => {
+        if (!cancelled) setAssistant(caps?.assistant ?? "unconfigured");
+      });
     });
     return () => {
       cancelled = true;
@@ -25,6 +35,27 @@ export default function StorefrontPage() {
   }, []);
 
   const session = useSession(api);
+
+  // Live store state: fetched as soon as a session exists, independent of whether an
+  // assistant is configured -- this is what makes a keyless tour's order visible on
+  // first load, with no typing.
+  const refreshCart = () => {
+    fetchCart().then((next) => {
+      if (next) setCart(next);
+    });
+  };
+  const refreshOrders = () => {
+    fetchOrders().then((next) => {
+      if (next) setOrders(next.orders);
+    });
+  };
+  useEffect(() => {
+    if (!session.sessionId) return;
+    refreshCart();
+    refreshOrders();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.sessionId]);
+
   const turn = useAgentTurn(api, {
     sessionId: reachable ? session.sessionId : null,
     unreachable: UNREACHABLE,
@@ -55,7 +86,40 @@ export default function StorefrontPage() {
     );
   }
 
-  const ready = reachable === true && turn.ready;
+  const ready = reachable === true && assistant === "available" && turn.ready;
+  const sideCol = (
+    <div className="cart-col">
+      <CartPanel cart={cart} busy={turn.busy} onPlaced={refreshOrders} />
+      <OrdersPanel orders={orders} />
+    </div>
+  );
+
+  if (reachable === true && assistant === "unconfigured") {
+    return (
+      <main className="app">
+        <section className="chat-col">
+          <header className="header">
+            <h1>ACME Supply</h1>
+            <span className="sub">shopping assistant</span>
+            <span className="status-pill down">assistant unconfigured</span>
+          </header>
+          <div className="assistant-unavailable">
+            <h2>The assistant is unavailable</h2>
+            <p>
+              No model is configured for this deployment, so there is no chat here. Set{" "}
+              <code>ANTHROPIC_API_KEY</code> and reload this page to bring the assistant back.
+            </p>
+            <p>
+              The store itself is real: the bag and order history to the right came from actual
+              writes through the engine, including anything a keyless tour run placed. Nothing
+              here is a mock.
+            </p>
+          </div>
+        </section>
+        {sideCol}
+      </main>
+    );
+  }
 
   return (
     <main className="app">
@@ -130,7 +194,7 @@ export default function StorefrontPage() {
           </button>
         </form>
       </section>
-      <CartPanel cart={cart} busy={turn.busy} />
+      {sideCol}
     </main>
   );
 }

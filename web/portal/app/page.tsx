@@ -3,12 +3,15 @@
 import { useEffect, useRef, useState } from "react";
 import { useAgentTurn, useSession } from "web-shared";
 import type { AgentEvent } from "web-shared";
-import { api, healthy, UNREACHABLE } from "../lib/api";
+import { api, capabilities, fetchChanges, healthy, UNREACHABLE } from "../lib/api";
 import type { StagedChange } from "../lib/types";
 import { ChangesPanel } from "./components/ChangesPanel";
 
 export default function PortalPage() {
   const [reachable, setReachable] = useState<boolean | null>(null);
+  const [assistant, setAssistant] = useState<"checking" | "available" | "unconfigured">(
+    "checking",
+  );
   const [changes, setChanges] = useState<Record<string, StagedChange>>({});
   const [input, setInput] = useState("");
   const transcriptRef = useRef<HTMLDivElement>(null);
@@ -16,7 +19,12 @@ export default function PortalPage() {
   useEffect(() => {
     let cancelled = false;
     healthy().then((ok) => {
-      if (!cancelled) setReachable(ok);
+      if (cancelled) return;
+      setReachable(ok);
+      if (!ok) return;
+      capabilities().then((caps) => {
+        if (!cancelled) setAssistant(caps?.assistant ?? "unconfigured");
+      });
     });
     return () => {
       cancelled = true;
@@ -24,6 +32,22 @@ export default function PortalPage() {
   }, []);
 
   const session = useSession(api);
+
+  // Live store state: fetched as soon as a session exists, independent of whether an
+  // assistant is configured. This is the artifact the whole repo exists to show, and it
+  // must be visible on first load after a keyless tour run, with no typing.
+  useEffect(() => {
+    if (!session.sessionId) return;
+    fetchChanges().then((list) => {
+      if (!list) return;
+      setChanges((prev) => {
+        const next = { ...prev };
+        for (const change of list) next[change.change_id] = change;
+        return next;
+      });
+    });
+  }, [session.sessionId]);
+
   const turn = useAgentTurn(api, {
     sessionId: reachable ? session.sessionId : null,
     unreachable: UNREACHABLE,
@@ -55,7 +79,34 @@ export default function PortalPage() {
     );
   }
 
-  const ready = reachable === true && turn.ready;
+  const ready = reachable === true && assistant === "available" && turn.ready;
+
+  if (reachable === true && assistant === "unconfigured") {
+    return (
+      <main className="app">
+        <section className="chat-col">
+          <header className="header">
+            <h1>ACME Supply</h1>
+            <span className="sub">merchant portal</span>
+            <span className="status-pill down">assistant unconfigured</span>
+          </header>
+          <div className="assistant-unavailable">
+            <h2>The assistant is unavailable</h2>
+            <p>
+              No model is configured for this deployment, so there is no chat here. Set{" "}
+              <code>ANTHROPIC_API_KEY</code> and reload this page to bring the assistant back.
+            </p>
+            <p>
+              The staged and applied changes to the right are real writes against the engine,
+              including anything a keyless tour run staged and applied -- each carrying its own
+              sealed kernel receipt or activity-log entry as evidence. Nothing here is a mock.
+            </p>
+          </div>
+        </section>
+        <ChangesPanel changes={changes} />
+      </main>
+    );
+  }
 
   return (
     <main className="app">
