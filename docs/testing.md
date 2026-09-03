@@ -22,7 +22,7 @@ engine, and never a model.
   (`config/kernel-policy.json`), including the over-refund rejection inside the
   transaction.
 - The `stage_*` / `apply_change` pipeline end to end: staging, guardrail re-check at
-  apply time, approval gating, the direct-SQL write fallbacks, and the structured
+  apply time, approval gating, the binding mutators used for merchandising writes, and the structured
   `Evidence` (`kind`/`id`) a change persists (`tests/test_host_evidence.py`,
   `tests/test_staging.py`, `tests/test_merchant_writes.py`).
 - Money: the seeded catalog's prices and the seeded order/payment amounts pass through
