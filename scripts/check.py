@@ -79,32 +79,49 @@ def check_submodule_commit() -> list[str]:
     return []
 
 
+def _top_level_defs(node: ast.AST) -> list[ast.AsyncFunctionDef | ast.FunctionDef]:
+    """Module-level functions and class methods only -- not a nested closure defined
+    inside one of them (e.g. `list_variants`'s inner `body`), whose generic name would
+    otherwise collide with unrelated prose in the documentation."""
+    defs: list[ast.AsyncFunctionDef | ast.FunctionDef] = []
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.AsyncFunctionDef | ast.FunctionDef):
+            defs.append(child)
+        elif isinstance(child, ast.ClassDef):
+            defs.extend(_top_level_defs(child))
+    return defs
+
+
 def _readonly_sql_functions() -> set[str]:
-    """Every function/method name in engine_backend/ whose body calls
-    `store.readonly_sql()` or `self.store.readonly_sql()` (directly, or via a
-    connection variable assigned from it in the same function)."""
+    """Every top-level function/method name in engine_backend/ whose body calls
+    `store.readonly_sql()` or `self.store.readonly_sql()`, directly or via a nested
+    closure defined inside it."""
     names: set[str] = set()
     for path in sorted(ENGINE_BACKEND.glob("*.py")):
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
-                continue
-            source = ast.get_source_segment(path.read_text(), node) or ""
+        source_text = path.read_text()
+        tree = ast.parse(source_text, filename=str(path))
+        for node in _top_level_defs(tree):
+            source = ast.get_source_segment(source_text, node) or ""
             if "readonly_sql(" in source:
                 names.add(node.name)
     return names
 
 
 def check_readonly_sql_fallbacks_documented() -> list[str]:
+    """Each name must appear as a backticked reference (`` `name` `` or `` `name(...)` ``,
+    optionally inside a fenced code span), not merely as a substring anywhere in the
+    file -- a bare substring match would silently pass if a function's name happened to
+    appear inside unrelated prose or another identifier."""
     if not MAPPING.is_file():
         return [f"{MAPPING} does not exist"]
     mapping_text = MAPPING.read_text()
     problems = []
     for name in sorted(_readonly_sql_functions()):
-        if name not in mapping_text:
+        reference = re.compile(r"`" + re.escape(name) + r"(\(\)|\(\.\.\.\))?`")
+        if reference.search(mapping_text) is None:
             problems.append(
-                f"{name!r} reads through store.readonly_sql() but is not named in "
-                f"{MAPPING.relative_to(ROOT)}"
+                f"{name!r} reads through store.readonly_sql() but is not named as a "
+                f"backticked reference (e.g. `{name}`) in {MAPPING.relative_to(ROOT)}"
             )
     return problems
 

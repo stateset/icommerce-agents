@@ -15,16 +15,37 @@ has already passed.
 
 ## The finding: the engine governs the transaction spine, not merchandising
 
-Of the engine's 474 mutations, this repo's kernel policy (`config/kernel-policy.json`)
-names five as governed commands, and only one of the seven `MerchantBackend` write
-paths (`apply_change`'s `ChangeKind` dispatch) ever reaches one: bringing a brand-new
-SKU into the stock ledger (`inventory.item.create`, when a restock names a SKU with no
-existing inventory item). Every other merchant write — repricing, merchandising content,
-promotions, campaigns, and even restocking a SKU the store already tracks — is a direct
-binding write (or, for two fields, direct SQL) plus an activity-log entry, with no
-kernel receipt at all. The engine governs 26 of its mutations across this store's
-lifetime: checkout, payments, refunds, returns, order and reservation transitions, and
-the inventory ledger — the transaction spine. It does not govern merchandising.
+The engine governs 26 of its 474 mutations across its full command surface, and
+those 26 are the transaction spine — checkout, payments, refunds, returns, order and
+reservation transitions, and the inventory ledger. That is a fact about the engine,
+independent of any one deployment of it.
+
+This deployment enables five of those 26 in its own kernel policy
+(`config/kernel-policy.json`): `inventory.item.create`, `checkout.commit`,
+`payments.create`, `payments.create_refund`, `products.create`. That is a fact about
+this repo, and it is a materially smaller claim than the engine's own figure — the
+other 21 governed commands, including every return and reservation command, are not
+wired into this policy at all. This repo also implements neither a return flow nor a
+reservation flow anywhere in `engine_backend/`, so "the engine governs returns and
+reservation transitions" is a true statement about the engine and a false one about
+this deployment: those particular governed commands exist in the engine, are not in
+this policy, and have no code path here that would reach them regardless.
+
+Of the five commands this deployment does enable, only one of the seven
+`MerchantBackend` write paths (`apply_change`'s `ChangeKind` dispatch) ever reaches one:
+bringing a brand-new SKU into the stock ledger (`inventory.item.create`, when a restock
+names a SKU with no existing inventory item). Every other merchant write — repricing,
+merchandising content, promotions, campaigns, and even restocking a SKU the store
+already tracks — is a direct binding write (or, for two fields, direct SQL) plus an
+activity-log entry, with no kernel receipt at all. It does not govern merchandising.
+
+`payments.create_refund` is enabled and is exercised — by `scripts/denials.py` and by
+`tests/test_kernel.py` — but only as a direct `KernelClient.execute` call in a script or
+a test. There is no host route or agent tool in this repo that issues a refund; the
+FastAPI host (`host/app.py`) has no refund endpoint, and no `MerchantBackend`/
+`StorefrontBackend` method calls `payments.create_refund`. Do not infer a refund flow
+from its presence in the policy or in the denial demo — this repo shows the command is
+governed, not that it is reachable from a chat turn.
 
 This means: **a merchant agent editing listings and prices is protected by its agent
 layer alone.** There is no second, engine-side check on a price move, a status change,

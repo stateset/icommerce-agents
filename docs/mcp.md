@@ -1,6 +1,6 @@
 # Connecting an MCP client
 
-`mcp_servers/shopping.py` and `mcp_servers/merchant.py` expose the same ~15-20-tool
+`mcp_servers/shopping.py` and `mcp_servers/merchant.py` expose the same 13- and 19-tool
 role surface the Messages API host and the Agent SDK console use — `search_products`,
 cart and order tools, `search_policies`, and `get_fulfillment_options` on the shopping
 side; business metrics, listings, the staged-change queue, and `apply_change` on the
