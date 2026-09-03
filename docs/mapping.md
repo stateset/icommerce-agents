@@ -33,7 +33,7 @@ and keeps provenance ids stable across turns.
 | `get_preferences` | derived from `commerce.customers.get` (no preferences object in the engine) |
 | `search_policies` / `get_disclosure` | `engine_backend/content.py`'s static ACME Supply policy text (the engine has no policy/disclosure domain) |
 | `get_fulfillment_options` | `commerce.carts.get_shipping_rates` for the session's own cart; `product_ids` is unused (the engine has no per-item quote) and a session with no cart yet gets `[]` |
-| `checkout_handoff` | renders the cart; charges nothing. Completing an order is `POST /shopping/checkout` on the host, which calls the governed `checkout.commit` kernel command directly — no agent tool reaches it. See `docs/enforcement.md`. |
+| `checkout_handoff` | renders the cart; charges nothing. Completing an order is `POST /shopping/checkout` on the host, which calls the governed `checkout.commit` kernel command directly — no agent tool reaches it. See `docs/enforcement.md`. `GET /shopping/cart` and `GET /shopping/orders` are session-scoped host reads over the same `get_cart`/`get_orders` methods, for the storefront web app to render live state with no model turn. |
 
 ## `EngineMerchant` (`engine_backend/merchant.py`)
 
@@ -84,7 +84,9 @@ change, and `EngineMerchant.apply_change` persists it with the change record:
 It is set once, at apply time, from what actually happened — never inferred from
 `guardrail_notes` prose, so a wording change cannot make evidence disappear.
 `staging.load_evidence` reads it back, and `host/app.py` attaches it to the
-`change_update` event the portal renders (`tests/test_host_evidence.py`).
+`change_update` event the portal renders (`tests/test_host_evidence.py`). `GET
+/merchant/changes` attaches the same stored evidence to a session-scoped list of staged
+and applied changes, for the portal to render on load with no chat turn.
 
 ## The modules `engine_backend/` shares between the two roles
 

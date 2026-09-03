@@ -38,6 +38,10 @@ approval (agent layer), and a refund of 10,000.00 against a 219.00 payment — r
 the engine inside the transaction, `commerce.refund.exceeds_captured`, with a receipt
 id. The first two protect you from the model. The third holds against anything.
 
+`python scripts/run_demo.py --web --tour` produces this contrast live, with no API key:
+it drives the checkout and both merchant applies over the real routes, and both web
+apps render the result on load from `GET /shopping/orders` and `GET /merchant/changes`.
+
 ## Layout
 
 - `vendor/commerce-agents/` — the upstream repo, a git submodule, never edited.
@@ -79,6 +83,7 @@ id. The first two protect you from the model. The third holds against anything.
 ```bash
 python scripts/run_demo.py            # FastAPI host on :8000
 python scripts/run_demo.py --web      # also starts web/storefront (:3000) and web/portal (:3100)
+python scripts/run_demo.py --web --tour  # ...and runs scripts/tour.py against it, no API key needed
 python scripts/denials.py             # three refusals, printed end to end, no API key needed
 python scripts/smoke_chat.py          # one live conversation per role; needs ANTHROPIC_API_KEY, else skips
 python -m evals.run                   # the eval suite; needs ANTHROPIC_API_KEY, else skips
@@ -98,8 +103,11 @@ correct."
 ## Where the interfaces are
 
 - `POST /shopping/session`, `POST /shopping/chat`, `POST /shopping/cart/add`,
-  `POST /shopping/checkout`, `POST /merchant/session`, `POST /merchant/chat`,
-  `POST /merchant/changes/{id}/approve`, `GET /healthz` — `host/app.py`.
+  `POST /shopping/checkout`, `GET /shopping/cart`, `GET /shopping/orders`,
+  `POST /merchant/session`, `POST /merchant/chat`, `POST /merchant/changes/{id}/approve`,
+  `GET /merchant/changes`, `GET /capabilities`, `GET /healthz` — `host/app.py`. The `GET`
+  routes are session-scoped reads (`GET /capabilities` excepted) behind the same 401
+  gate as every other route, and both web apps use them to render live store state.
 - The MCP tool surface — 13 shopping tools, 19 merchant tools — `mcp_servers/`, wired
   up in `docs/mcp.md`.
 - The governed kernel seam — `engine_backend/kernel.py`'s `KernelClient.execute`,

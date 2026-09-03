@@ -2,6 +2,13 @@
 """Run the reference demo: the FastAPI host on :8000, and with ``--web`` the two Next.js
 web apps (``web/storefront``, ``web/portal``) alongside it. ``--web`` degrades to a
 warning rather than crashing if a web app's ``package.json`` is missing.
+
+``--tour`` runs ``scripts/tour.py`` against this same running host over HTTP
+(``run_tour(..., base_url=...)``), once the host answers on :8000, so the store has a
+placed order and both evidence kinds in it before you open a browser -- no API key
+needed. It targets the host's own live handle rather than opening a second
+``EngineStore`` on ``--db``'s file; see ``scripts/tour.py``'s docstring for why that
+distinction matters.
 """
 
 from __future__ import annotations
@@ -10,7 +17,10 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+import httpx
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STOREFRONT_WEB = REPO_ROOT / "web" / "storefront"
@@ -24,10 +34,31 @@ def _run_web_app(path: Path, port: int) -> subprocess.Popen | None:
     return subprocess.Popen(["npm", "run", "dev", "--", "--port", str(port)], cwd=path)
 
 
+def _wait_for_host(base_url: str, timeout: float = 30.0) -> bool:
+    """Poll ``GET /capabilities`` until the host answers or ``timeout`` elapses."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if httpx.get(f"{base_url}/capabilities", timeout=1.0).is_success:
+                return True
+        except httpx.HTTPError:
+            pass
+        time.sleep(0.5)
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--web", action="store_true", help="also start the storefront and merchant web apps"
+    )
+    parser.add_argument(
+        "--tour",
+        action="store_true",
+        help=(
+            "once the host is up, run scripts/tour.py against it over HTTP so the "
+            "store has a placed order and both evidence kinds to look at"
+        ),
     )
     parser.add_argument("--db", default=str(REPO_ROOT / "data" / "demo.db"))
     args = parser.parse_args()
@@ -58,7 +89,15 @@ def main() -> int:
         cwd=REPO_ROOT,
         env=env,
     )
+    base_url = "http://127.0.0.1:8000"
     try:
+        if args.tour:
+            if _wait_for_host(base_url):
+                from scripts.tour import main as tour_main
+
+                tour_main(["--db", args.db, "--base-url", base_url])
+            else:
+                print("warning: host never came up on :8000; skipping --tour")
         host_process.wait()
     except KeyboardInterrupt:
         pass

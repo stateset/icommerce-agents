@@ -43,6 +43,23 @@ engine, and never a model.
   it should, rather than passing vacuously.
 - The Next.js builds for `web/storefront` and `web/portal` (`tests/test_web_build.py`).
 
+## `scripts/tour.py`: a keyless end-to-end check, not a substitute for a live eval
+
+`scripts/tour.py` (`tests/test_tour.py`) drives the real routes against the real
+engine — a checkout, an unapproved apply refused, a price update applied with
+`activity_log` evidence, a restock applied with `kernel_receipt` evidence — with no
+API key and no model in the loop. It proves the routes, the engine, and the
+staging/apply/evidence pipeline work end to end from outside the process, the way a
+browser would call them. **It exercises none of what "Live run, 2026-09-03" below is
+about**: no request reaches `AsyncAnthropic`, so it says nothing about whether a model
+states checkout as staging, completes a medical referral, or confirms a write with the
+right verb. It closes the demo's keyless-first-impression gap, not the eval gap; the two
+remaining live-model findings below are exactly as open after a tour run as before one.
+That the two web apps then render this state correctly is verified by code inspection
+and by the read routes themselves returning the right data (`tests/test_web_build.py`,
+plus direct route calls against a running host); no automated check in this repo has
+watched a browser paint the result.
+
 ## What the suite does not cover
 
 - **Whether a real model, given these tools and this prompt, behaves correctly.** Every
@@ -137,6 +154,10 @@ ruff check . && ruff format --check . && pytest && python scripts/check.py
 
 # The three end-to-end refusals, no API key needed
 python scripts/denials.py
+
+# The keyless tour: a placed order, a refusal, both evidence kinds, no API key needed
+python scripts/tour.py --db /tmp/tour.db
+python scripts/run_demo.py --web --tour   # runs it against the live host and both web apps
 
 # The live smoke conversations and the eval suite -- need ANTHROPIC_API_KEY, otherwise skip and exit 0
 python scripts/smoke_chat.py
