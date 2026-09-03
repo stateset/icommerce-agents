@@ -4,9 +4,10 @@
 governed: a restock of a SKU with no inventory item yet goes through the kernel
 command ``inventory.item.create`` and its evidence is a sealed receipt. Every other
 write here -- price, listing content, promotion, campaign, pause/activate, and even a
-restock of a SKU the store already tracks -- is a direct binding write (or, for three
-fields the binding exposes no mutator for, direct SQL through ``EngineStore.write_sql``)
-plus an activity-log id. ``docs/enforcement.md`` has the full table; keep it in sync
+restock of a SKU the store already tracks -- is a direct binding write through the
+supported mutators (``products().updateVariant`` for price, ``products().update`` for
+description/status, and ``products().activate``/``archive`` for status helpers) plus an
+activity-log id. ``docs/enforcement.md`` has the full table; keep it in sync
 with this module.
 """
 
@@ -86,10 +87,10 @@ async def _apply_write(
 
 
 def _update_variant_price_binding(commerce: Commerce, sku: str, price: float) -> None:
-    """Update variant price using the binding mutator when available.
+    """Update a variant's price via the binding mutator.
 
-    Falls back to a direct-SQL path upstream has used historically only when the
-    mutator is not present on the installed binding.
+    Requires a binding that exposes ``products().updateVariant`` (or ``update_variant``).
+    Raises ``AttributeError`` if the mutator is unavailable.
     """
     variant = commerce.products.get_variant_by_sku(sku)
     if variant is None:
@@ -126,7 +127,7 @@ def _update_variant_price_binding(commerce: Commerce, sku: str, price: float) ->
         )
         commerce.products.update_variant(variant.product_id, update_payload)  # type: ignore[arg-type]
         return
-    # No mutator available on this binding: the caller will provide the legacy fallback.
+    # No mutator available on this binding: fail loudly so the deployment can correct the binding.
     raise AttributeError("products.updateVariant/update_variant not available on binding")
 
 
@@ -269,8 +270,7 @@ async def _apply_status_change(
     if resolved is None:
         raise ChangeNotApplicable(f"no listing with id {item.target!r}")
     product, _merch = resolved
-    # Prefer dedicated status mutators when present; fall back to a generic update; and
-    # only then to the legacy direct-SQL write.
+    # Prefer dedicated status mutators when present; fall back to a generic update.
     desired = str(item.after)
     def body(c: Commerce) -> None:
         if desired == "active" and hasattr(c.products, "activate"):
