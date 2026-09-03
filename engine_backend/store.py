@@ -24,6 +24,30 @@ class PrincipalBinding(BaseModel):
 
 
 class EngineStore:
+    """One engine handle, one pinned connection, and the session→principal bindings.
+
+    The connection :meth:`_pin_connection` holds is per *process*, so two host processes
+    on one store file -- ``scripts/run_demo.py`` alongside a separately launched MCP
+    server -- were an open question rather than a covered case. They are now measured,
+    in ``tests/test_store_multiprocess.py``: **the staleness this class pins against does
+    not cross the process boundary.** A ``Commerce`` handle in one process tracks
+    ``write_sql`` writes made by another, on the round after the write and every round
+    after that, in each ordering tried -- reader process opened first or second, with and
+    without a binding write interleaved in either process, and with the writer process
+    exiting entirely between writes so the reader is the only holder left. The failure
+    this class exists to prevent needs the direct-SQL connection churn and the handle
+    that goes stale to be in the same process; a second process's engine handle is a
+    separate library instance that never inherits the WAL index the first one cached.
+
+    Two things about a second process are still true and are not guarantees this class
+    makes. Direct-SQL writes are serialized against each other by an ``asyncio`` lock,
+    which reaches only as far as one process: two processes writing at once are ordered
+    by SQLite's own file lock and wait on the ``busy_timeout`` :meth:`write_sql` sets,
+    not by that lock. And the in-memory state around the store is per-process by
+    construction and is not shared by running a second one: ``self._bindings`` here, and
+    ``EngineStorefront._cart_ids``, so a session belongs to the process that opened it.
+    """
+
     def __init__(self, db_path: str, store_id: str = "store:acme") -> None:
         self.db_path = db_path
         self.store_id = store_id

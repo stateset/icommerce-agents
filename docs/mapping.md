@@ -164,6 +164,34 @@ regression test: it applies four successive direct-SQL price writes with an engi
 binding write between them, exactly as an apply does, and asserts the engine handle
 tracks every one. Disable the pin and it fails on the second write.
 
+#### The pin is per process, and two processes were measured
+
+`_pin_connection` holds one connection per *process*, so a second host process on the
+same store file — `scripts/run_demo.py` alongside a separately launched MCP server — is
+not covered by that connection. Rather than assume either way,
+`tests/test_store_multiprocess.py` measures it: **the staleness does not cross the
+process boundary.** A `Commerce` handle in one process tracks `write_sql` writes made by
+another, on the round after the write and every round after it, in each ordering tried —
+reader process opened first or second, with and without an engine binding write
+interleaved in either process, and with the writer process exiting entirely between
+writes so the reader process is the only thing left holding the file. The failure needs
+the direct-SQL connection churn and the handle that goes stale to be in the same
+process; a second process's engine handle is a separate library instance and never
+inherits the WAL index the first one cached. The same result holds with the pin
+disabled, so this is not the pin reaching across processes — there is nothing for it to
+reach across. No fix is therefore required and none was added, and there is no "one
+process per store file" constraint on this ground.
+
+Two things about a second process remain true, and are recorded here because they are
+not what the pin covers:
+
+- The `"direct_sql"` lock is an `asyncio` lock, so it orders direct-SQL writes only
+  within one process. Two processes writing at once are ordered by SQLite's own file
+  lock and wait on the `busy_timeout` `write_sql` sets, not by that lock.
+- In-memory state beside the store is per process by construction and is not shared by
+  running a second one: `EngineStore._bindings` and `EngineStorefront._cart_ids`. A
+  session belongs to the process that opened it.
+
 This was verified against the schema and triggers directly, not assumed:
 `PRAGMA table_info` on `products` and `product_variants` shows neither table has a
 trigger that maintains `updated_at` or `version` — the caller sets both by hand, and
