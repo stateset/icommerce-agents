@@ -1,5 +1,5 @@
 # requirements.txt — order matters: upstream pins siblings to versions no index carries
--e ./vendor/commerce-agents/commerce-common[examples]
+-e ./vendor/commerce-agents/commerce-common[examples,mcp]
 -e ./vendor/commerce-agents/shopping-agent/core
 -e ./vendor/commerce-agents/shopping-agent/runtime-messages-api
 -e ./vendor/commerce-agents/merchant-agent/core
