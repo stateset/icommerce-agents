@@ -133,7 +133,7 @@ def create_app(db_path: str) -> FastAPI:
 
     @app.post("/shopping/session")
     async def start_shopping_session() -> dict[str, str]:
-        customer = store.commerce.customers.get_by_email(_ROWAN_EMAIL)
+        customer = await store.call(lambda c: c.customers.get_by_email(_ROWAN_EMAIL))
         session_id = secrets.token_urlsafe(24)
         store.bind(session_id, customer.id, "customer")
         shopping_sessions.start(session_id)
@@ -195,7 +195,7 @@ def create_app(db_path: str) -> FastAPI:
         cart_id = storefront.session_cart_id(session.session_id)
         if cart_id is None:
             raise HTTPException(status_code=409, detail="no cart to check out")
-        customer = store.commerce.customers.get(binding.subject_id)
+        customer = await store.call(lambda c: c.customers.get(binding.subject_id))
 
         # DEMO PLACEHOLDER: the engine's checkout-readiness check requires a shipping
         # address on the cart, and this host has no address-collection step yet (a real

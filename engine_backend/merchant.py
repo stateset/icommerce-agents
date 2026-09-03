@@ -374,31 +374,37 @@ class EngineMerchant(MerchantBackend):
         if first_word != "select":
             raise ValueError("only SELECT statements are allowed")
 
-        connection = self.store.readonly_sql()
-        cursor = connection.execute(statement.rstrip(";"))
-        columns = [d[0] for d in cursor.description] if cursor.description else []
-        fetched = cursor.fetchmany(_ANALYSIS_ROW_CAP + 1)
-        truncated = len(fetched) > _ANALYSIS_ROW_CAP
-        fetched = fetched[:_ANALYSIS_ROW_CAP]
+        # A read, off the loop via ``store.call`` -- like ``catalog.list_variants``, the
+        # other caller of ``readonly_sql``, this runs on a worker thread so the
+        # thread-local connection it opens is never touched from the event-loop thread.
+        def body(_c: Any) -> AnalysisTable:
+            connection = self.store.readonly_sql()
+            cursor = connection.execute(statement.rstrip(";"))
+            columns = [d[0] for d in cursor.description] if cursor.description else []
+            fetched = cursor.fetchmany(_ANALYSIS_ROW_CAP + 1)
+            truncated = len(fetched) > _ANALYSIS_ROW_CAP
+            fetched = fetched[:_ANALYSIS_ROW_CAP]
 
-        rows: list[list[Any]] = []
-        chars = 0
-        for record in fetched:
-            values = list(record)
-            row_chars = sum(len(str(v)) for v in values)
-            if chars + row_chars > _ANALYSIS_CHAR_CAP:
-                truncated = True
-                break
-            chars += row_chars
-            rows.append(values)
+            rows: list[list[Any]] = []
+            chars = 0
+            for record in fetched:
+                values = list(record)
+                row_chars = sum(len(str(v)) for v in values)
+                if chars + row_chars > _ANALYSIS_CHAR_CAP:
+                    truncated = True
+                    break
+                chars += row_chars
+                rows.append(values)
 
-        return AnalysisTable(
-            columns=columns,
-            rows=rows,
-            row_count=len(rows),
-            truncated=truncated,
-            note="results are capped at 100 rows and 8000 characters" if truncated else None,
-        )
+            return AnalysisTable(
+                columns=columns,
+                rows=rows,
+                row_count=len(rows),
+                truncated=truncated,
+                note="results are capped at 100 rows and 8000 characters" if truncated else None,
+            )
+
+        return await self.store.call(body)
 
     async def get_analysis_schema(self, session: MerchantSessionContext) -> str | None:
         return _ANALYSIS_SCHEMA

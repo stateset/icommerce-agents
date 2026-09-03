@@ -80,6 +80,9 @@ def build_shopping_server(
     backend = EngineStorefront(store)
 
     email = customer_email or DEFAULT_CUSTOMER_EMAIL
+    # Synchronous on purpose: this runs during server construction, before any event
+    # loop is serving requests (like `seed_store` just above), so there is no loop to
+    # block and no concurrent writer to race.
     customer = store.commerce.customers.get_by_email(email)
     session_id = DEFAULT_SESSION_ID
     store.bind(session_id, customer.id, "customer")

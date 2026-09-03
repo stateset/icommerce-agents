@@ -85,34 +85,51 @@ async def _apply_write(
     raise ChangeNotApplicable(f"unknown change kind {change.kind!r}")
 
 
-def _log_apply(
+async def _log_apply(
     ctx: ApplyContext, change: StagedChange, summary: str
 ) -> tuple[str, staging.Evidence]:
     """Record the apply as an activity-log entry, the evidence for an ungoverned write.
     ``activity_logs.record`` requires a real UUID for ``subject_id`` -- the engine has
     no notion of a ``chg-...`` staged-change id -- so the change is referenced by its
-    own id in ``metadata`` instead, under the ``staged_change`` subject type."""
-    entry = ctx.store.commerce.activity_logs.record(
-        subject_type=staging.STAGED_TYPE,
-        subject_id=str(uuid4()),
-        action="apply",
-        summary=summary,
-        actor_kind="user",
-        actor=ctx.operator,
-        metadata=json.dumps({"change_id": change.change_id}),
-    )
+    own id in ``metadata`` instead, under the ``staged_change`` subject type.
+
+    Routed through ``store.write`` under the same ``staged_change:{change_id}`` key
+    ``staging.save`` uses for this change, so the log entry a write produced can never
+    run concurrently with the write itself or with another log entry for the same
+    change. ``apply_change`` (``merchant.py``) does not hold that lock while this apply
+    runs -- it only takes it afterwards, in ``staging.save`` -- so acquiring it here
+    does not nest under an outer holder of the same key."""
+
+    def body(c: Any) -> Any:
+        return c.activity_logs.record(
+            subject_type=staging.STAGED_TYPE,
+            subject_id=str(uuid4()),
+            action="apply",
+            summary=summary,
+            actor_kind="user",
+            actor=ctx.operator,
+            metadata=json.dumps({"change_id": change.change_id}),
+        )
+
+    entry = await ctx.store.write(f"staged_change:{change.change_id}", body)
     note = f"applied via direct binding write; activity log {entry.id}"
     return note, staging.Evidence(kind="activity_log", id=entry.id, note=note)
 
 
-def _record_custom_object(ctx: ApplyContext, type_handle: str, handle: str, payload: Any) -> None:
-    """Synchronous and unlocked, unlike ``staging``'s writes: it runs inside an apply
-    that already holds the change, on the store's own ``Commerce`` handle."""
-    custom_objects.put_payload(
-        ctx.store.commerce,
+async def _record_custom_object(
+    ctx: ApplyContext, change: StagedChange, type_handle: str, handle: str, payload: Any
+) -> None:
+    """Routed through ``custom_objects.write_payload`` under the same
+    ``staged_change:{change_id}`` key ``staging.save`` uses for this change (not
+    necessarily ``handle`` itself -- a campaign's object handle is the campaign id,
+    not the change id), so this write and the activity-log entry for the same apply
+    (see ``_log_apply``) serialize against each other and against ``staging.save``."""
+    await custom_objects.write_payload(
+        ctx.store,
         type_handle,
         type_handle.replace("_", " ").title(),
         payload,
+        lock_key=f"staged_change:{change.change_id}",
         object_handle=handle,
     )
 
@@ -130,7 +147,7 @@ async def _apply_price_update(
             "updated_at = datetime('now'), version = version + 1 WHERE sku = ?",
             (price, item.target),
         )
-        results.append(_log_apply(ctx, change, f"set price of {item.target} to {price}"))
+        results.append(await _log_apply(ctx, change, f"set price of {item.target} to {price}"))
     return results
 
 
@@ -177,7 +194,7 @@ async def _apply_restock(
                 f"inventory.item.create for {sku!r} failed: "
                 f"{receipt.error_code} {receipt.error_message}"
             )
-        _log_apply(ctx, change, f"created inventory item {sku} via kernel command")
+        await _log_apply(ctx, change, f"created inventory item {sku} via kernel command")
         note = (
             "governed via kernel command inventory.item.create; "
             f"sealed receipt {receipt.receipt_id}"
@@ -188,7 +205,7 @@ async def _apply_restock(
         c.inventory.adjust(sku, added, reason="restock")
 
     await ctx.store.write(f"stock:{sku}", body)
-    return _log_apply(ctx, change, f"restocked {sku} by {added}")
+    return await _log_apply(ctx, change, f"restocked {sku} by {added}")
 
 
 async def _apply_status_change(
@@ -203,7 +220,7 @@ async def _apply_status_change(
         "updated_at = datetime('now'), version = version + 1 WHERE id = ?",
         (str(item.after), product.id),
     )
-    return _log_apply(ctx, change, f"set status of {item.target} to {item.after}")
+    return await _log_apply(ctx, change, f"set status of {item.target} to {item.after}")
 
 
 async def _apply_listing_update(
@@ -238,7 +255,7 @@ async def _apply_listing_update(
 
     updated_merch = merch.model_copy(update=updates)
     await write_merchandising(ctx.store, product.id, updated_merch)
-    return [_log_apply(ctx, change, f"updated listing content for {change.items[0].target}")]
+    return [await _log_apply(ctx, change, f"updated listing content for {change.items[0].target}")]
 
 
 async def _apply_promotion(
@@ -252,8 +269,8 @@ async def _apply_promotion(
             "updated_at = datetime('now'), version = version + 1 WHERE sku = ?",
             (money.exact(item.after), item.target),
         )
-    _record_custom_object(ctx, PROMOTION_TYPE, change.change_id, payload)
-    return [_log_apply(ctx, change, f"applied promotion {change.change_id}")]
+    await _record_custom_object(ctx, change, PROMOTION_TYPE, change.change_id, payload)
+    return [await _log_apply(ctx, change, f"applied promotion {change.change_id}")]
 
 
 async def _apply_campaign(
@@ -269,5 +286,7 @@ async def _apply_campaign(
         starts=payload.get("starts"),
         ends=payload.get("ends"),
     )
-    _record_custom_object(ctx, CAMPAIGN_TYPE, campaign_id, campaign.model_dump(mode="json"))
-    return [_log_apply(ctx, change, f"wrote campaign {campaign_id}")]
+    await _record_custom_object(
+        ctx, change, CAMPAIGN_TYPE, campaign_id, campaign.model_dump(mode="json")
+    )
+    return [await _log_apply(ctx, change, f"wrote campaign {campaign_id}")]
