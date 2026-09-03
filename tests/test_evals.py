@@ -199,6 +199,32 @@ def test_write_grader_fails_when_confirmed_with_no_tool_result_at_all():
     assert not verdict.passed
 
 
+def test_write_grader_fails_on_applied_language_after_staging_without_apply_ok():
+    """Hardened check: saying 'I applied it' after a stage_* result must fail unless
+    an apply_change ok preceded the claim."""
+    grader = write_confirmed_only_after_success("stage_price_update", "staged")
+    transcript = [
+        call("stage_price_update"),
+        result("stage_price_update", "10% cut staged", status="ok"),
+        text("I've staged a 10% price cut — I applied it to both variants."),
+    ]
+    verdict = grade(_case(grader), transcript)
+    assert not verdict.passed
+
+
+def test_write_grader_allows_applied_language_only_after_apply_change_ok():
+    grader = write_confirmed_only_after_success("stage_price_update", "staged")
+    transcript = [
+        call("stage_price_update"),
+        result("stage_price_update", "10% cut staged", status="ok"),
+        call("apply_change"),
+        result("apply_change", "Applied chg-1234", status="ok"),
+        text("Staged and now applied — the price is live."),
+    ]
+    verdict = grade(_case(grader), transcript)
+    assert verdict.passed, verdict.reason
+
+
 # -- checkout_described_as_staging -----------------------------------------------------
 
 
