@@ -56,12 +56,12 @@ One row per write `engine_backend/apply.py`'s `apply_change` can perform:
 
 | `ChangeKind` | Engine write | Governed? | Evidence |
 |---|---|---|---|
-| `PRICE_UPDATE` | `commerce.products().updateVariant` | No | activity-log entry |
+| `PRICE_UPDATE` | unsupported on Python wheel 1.30.0 (fails closed) | No | none |
 | `INVENTORY_ACTION` (restock, SKU has an inventory item) | `commerce.inventory.adjust` | No | activity-log entry |
 | `INVENTORY_ACTION` (restock, SKU has **no** inventory item) | kernel `inventory.item.create` | **Yes** | sealed receipt |
-| `INVENTORY_ACTION` (pause/activate) | `commerce.products().activate` / `.archive` | No | activity-log entry |
-| `LISTING_UPDATE` | `write_merchandising` custom object; `commerce.products().update` for `description` | No | activity-log entry |
-| `PROMOTION` | `commerce.products().updateVariant` price update(s) + `promotion` custom object | No | activity-log entry |
+| `INVENTORY_ACTION` (pause/activate) | `commerce.products().update(id, status=...)` | No | activity-log entry |
+| `LISTING_UPDATE` | `write_merchandising` custom object; `commerce.products().update(id, description=...)` | No | activity-log entry |
+| `PROMOTION` | unsupported on Python wheel 1.30.0 (contains variant price changes; fails closed) | No | none |
 | `CAMPAIGN` | `campaign` custom object | No | activity-log entry |
 
 `payload` is the promotion or campaign draft the change was staged from
@@ -134,17 +134,11 @@ is the same drift class one level up.
 
 ## No direct-SQL write fallbacks for merchandising
 
-As of `stateset-embedded==1.28.5`, the Python binding exposes supported mutators for
-the three merchandising fields this deployment edits during apply:
-
-- `products.update(id, { description?, status? })`
-- `products.activate(id)` / `products.archive(id)` (status helpers)
-- `products.updateVariant(id, { sku, price, name?, compareAtPrice?, isDefault? })`
-
-`engine_backend/apply.py` uses these mutators for price changes, product status
-changes, and product descriptions. No raw-SQL write is used for these fields. The only
-SQL outside the binding in this repo is read-only (see above), plus legacy test code
-that exercises the WAL coordination rules.
+As of `stateset-embedded==1.30.0`, `products.update(...)` is available for product
+fields (including `description`/`status` as kwargs). There is no published Python
+mutator for variant price at this version; price/promotion applies fail closed. No
+raw-SQL write is used. The only SQL outside the binding in this repo is read-only
+(see above), plus legacy test code that exercises the WAL coordination rules.
 
 ### Two SQLite libraries, one file: why the store pins a connection
 

@@ -100,12 +100,12 @@ this stack stops an unreviewed merchandising write.
 | Checkout (complete an order) | no agent tool reaches this route — `POST /shopping/checkout` is a human-clicked host route, not a tool | `checkout.commit` | sealed kernel receipt (`receipt_id`) |
 | Stage a price update | `check_listing_provenance`, `check_listing_record_read`, guardrail discount cap (`merchant_agent.changes.check_guardrails`) | none (staging only; no live write) | `StagedChange` record |
 | Stage a listing/promotion/campaign/inventory action | same staging gates as above, per kind | none (staging only) | `StagedChange` record |
-| Apply a price update | `check_apply_change` (provenance, guardrails, `APPROVAL_GATE` when `require_host_approval`) + `EngineMerchant.apply_change`'s own `approved_ids` check | none — `commerce.products().updateVariant` | activity-log id |
+| Apply a price update | `check_apply_change` (provenance, guardrails, `APPROVAL_GATE` when `require_host_approval`) + `EngineMerchant.apply_change`'s own `approved_ids` check | none — unsupported on Python wheel 1.30.0; apply fails closed | none |
 | Apply an inventory action — restock, SKU has an inventory item | same as above | none — `commerce.inventory.adjust` (not in the governed set) | activity-log id |
 | Apply an inventory action — restock, SKU has **no** inventory item | same as above | `inventory.item.create` | **sealed kernel receipt** |
-| Apply an inventory action — pause/activate | same as above | none — `commerce.products().activate` / `archive` | activity-log id |
-| Apply a listing content update | same as above | none — `write_merchandising` custom object; `commerce.products().update` for `description` | activity-log id |
-| Apply a promotion | same as above | none — `commerce.products().updateVariant` price update(s) + `promotion` custom object | activity-log id |
+| Apply an inventory action — pause/activate | same as above | none — `commerce.products().update(id, status=...)` | activity-log id |
+| Apply a listing content update | same as above | none — `write_merchandising` custom object; `commerce.products().update(id, description=...)` | activity-log id |
+| Apply a promotion | same as above | none — unsupported on Python wheel 1.30.0 (contains variant price changes); apply fails closed | none |
 | Apply a campaign | same as above | none — `campaign` custom object | activity-log id |
 | Refund | (issued only as a governed command — no tool in this repo issues a refund directly) | `payments.create_refund` (`requires_approval: true` in policy) | sealed kernel receipt, or an `agent-layer: blocked` outcome if attempted without approval evidence |
 
@@ -117,17 +117,16 @@ nothing about whether the engine itself checked it — because for these writes,
 not. A `blocked` outcome is `ToolOutcome.blocked` naming the gate that held the call;
 the engine is never reached.
 
-## Binding mutators for merchandising fields (no direct SQL)
+## Binding mutators and current published-wheel gap (no direct SQL)
 
-As of `stateset-embedded==1.28.5`, the Python binding exposes supported mutators for
-the merchandising fields this deployment edits during apply:
+As of `stateset-embedded==1.30.0`, the Python binding exposes `products.update(...)`
+for product fields (including `description` and `status` as kwargs). There is no Python
+export for a variant-price mutator on 1.28.x, 1.29.x, or 1.30.0 — `update_variant` /
+`updateVariant` exist in Rust/Node only at this version.
 
-- `commerce.products().update(id, { description?, status? })`
-- `commerce.products().activate(id)` / `commerce.products().archive(id)` (status helpers)
-- `commerce.products().updateVariant(id, { sku, price, name?, compareAtPrice?, isDefault? })`
-
-`engine_backend/apply.py` uses these mutators for price changes, product status
-changes, and product descriptions. No raw-SQL write is used for these fields.
+- `engine_backend/apply.py` uses `products.update(...)` for `description` and `status`.
+- Variant price changes (including promotions) are unsupported on the published Python
+  wheel and fail closed at apply time. No raw-SQL write is used.
 
 The store still pins one read-only SQLite connection (`EngineStore._pin_connection`)
 for other reasons — chiefly to keep a stable, WAL-index-holding reader in-process for

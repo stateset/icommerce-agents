@@ -31,12 +31,10 @@ async def _apply(backend, change):
 
 async def test_an_ungoverned_apply_persists_structured_activity_log_evidence(store, kernel):
     backend = EngineMerchant(store, kernel)
-    applied = await _apply(
-        backend,
-        await backend.stage_price_update(
-            session(), [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.00)]
-        ),
-    )
+    # Use a listing description update (ungoverned) instead of a price update.
+    pid = store.commerce.products.get_variant_by_sku("TENT-RIDGE-TAN").product_id
+    change = await backend.stage_listing_update(session(), pid, {"description": "New copy"})
+    applied = await _apply(backend, change)
     evidence = await load_evidence(store, applied.change_id)
     assert evidence, f"no structured evidence persisted for {applied.change_id!r}"
     assert [e.kind for e in evidence] == ["activity_log"]
@@ -65,12 +63,9 @@ async def test_a_governed_apply_persists_structured_kernel_receipt_evidence(stor
 
 async def test_the_host_change_update_event_carries_the_structured_field_verbatim(store, kernel):
     backend = EngineMerchant(store, kernel)
-    applied = await _apply(
-        backend,
-        await backend.stage_price_update(
-            session(), [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.00)]
-        ),
-    )
+    pid = store.commerce.products.get_variant_by_sku("TENT-RIDGE-TAN").product_id
+    change = await backend.stage_listing_update(session(), pid, {"description": "New copy"})
+    applied = await _apply(backend, change)
     from commerce_common.streaming import AgentEvent
 
     event = AgentEvent(type="change_update", data={"change": applied.model_dump(mode="json")})

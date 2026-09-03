@@ -248,6 +248,12 @@ def seed_store(commerce: Commerce) -> None:
                 for v in entry["variants"]
             ],
         )
+        # Publish the product so variants are purchasable on wheels that require active status.
+        try:
+            commerce.products.update(product.id, status="active")
+        except Exception:
+            # Older wheels without update() accept drafts; ignore on those.
+            pass
         commerce.custom_objects.create_object(
             type_handle=MERCHANDISING_TYPE,
             values_json=json.dumps({"payload": Merchandising(**entry["merch"]).model_dump()}),
