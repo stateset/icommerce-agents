@@ -20,6 +20,14 @@ those 26 are the transaction spine — checkout, payments, refunds, returns, ord
 reservation transitions, and the inventory ledger. That is a fact about the engine,
 independent of any one deployment of it.
 
+The 26, in full: `checkout.commit`, `payments.create`, `payments.create_refund`,
+`returns.transition`, `orders.transition`, `orders.ship`, `inventory.item.create`,
+`inventory.reserve`, `inventory.reservation.confirm`, `inventory.reservation.release`,
+`products.create`, `ledger.post`, the composite entry that bundles a checkout's
+sub-commands, and the A2A escrow and x402 settlement commands (`x402.settle` and the
+escrow/dispute pair). Not one of them touches a listing's price, status, description,
+imagery, promotion, or campaign.
+
 This deployment enables five of those 26 in its own kernel policy
 (`config/kernel-policy.json`): `inventory.item.create`, `checkout.commit`,
 `payments.create`, `payments.create_refund`, `products.create`. That is a fact about

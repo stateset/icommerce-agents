@@ -32,7 +32,7 @@ from engine_backend.store import EngineStore
 CONFIG = Path(__file__).resolve().parent.parent / "config"
 
 
-async def denial_one_agent_layer_cart_write(store: EngineStore) -> bool:
+async def denial_one_agent_layer_cart_write() -> bool:
     """A cart write naming a product id the model never saw. `check_provenance` is the
     same gate `gated_add_to_cart` runs before it ever calls the storefront backend --
     the engine never sees this request."""
@@ -113,7 +113,7 @@ async def main(db_path: str) -> int:
 
     results = []
     print("=" * 72)
-    results.append(await denial_one_agent_layer_cart_write(store))
+    results.append(await denial_one_agent_layer_cart_write())
     print("-" * 72)
     results.append(await denial_two_agent_layer_apply_without_approval(store, kernel))
     print("-" * 72)

@@ -1,6 +1,6 @@
 """Drift check: exits non-zero when the code and the documentation about it disagree.
 
-Three checks:
+Four checks:
 
 1. Neither engine backend (`EngineStorefront`, `EngineMerchant`) has an unimplemented
    abstract method left over -- `__abstractmethods__` must be empty on both.
@@ -9,6 +9,9 @@ Three checks:
 3. Every function in `engine_backend/` that reads through `store.readonly_sql()` --
    the read-only SQL fallback for a method the engine's Python binding does not expose
    -- is named in `docs/mapping.md`.
+4. Every function in `engine_backend/` that opens its own connection with
+   `sqlite3.connect(` -- a direct-SQL *write* path, the more dangerous category, since
+   it bypasses the binding's own validation entirely -- is named there too.
 """
 
 from __future__ import annotations
@@ -92,37 +95,49 @@ def _top_level_defs(node: ast.AST) -> list[ast.AsyncFunctionDef | ast.FunctionDe
     return defs
 
 
-def _readonly_sql_functions() -> set[str]:
-    """Every top-level function/method name in engine_backend/ whose body calls
-    `store.readonly_sql()` or `self.store.readonly_sql()`, directly or via a nested
-    closure defined inside it."""
+def _functions_containing(needle: str) -> set[str]:
+    """Every top-level function/method name in engine_backend/ whose body contains
+    `needle`, directly or via a nested closure defined inside it."""
     names: set[str] = set()
     for path in sorted(ENGINE_BACKEND.glob("*.py")):
         source_text = path.read_text()
         tree = ast.parse(source_text, filename=str(path))
         for node in _top_level_defs(tree):
             source = ast.get_source_segment(source_text, node) or ""
-            if "readonly_sql(" in source:
+            if needle in source:
                 names.add(node.name)
     return names
 
 
-def check_readonly_sql_fallbacks_documented() -> list[str]:
-    """Each name must appear as a backticked reference (`` `name` `` or `` `name(...)` ``,
-    optionally inside a fenced code span), not merely as a substring anywhere in the
-    file -- a bare substring match would silently pass if a function's name happened to
-    appear inside unrelated prose or another identifier."""
+def _documented(mapping_text: str, name: str) -> bool:
+    """Whether `name` appears as a backticked reference -- `` `name` ``, `` `name()` ``,
+    or qualified as `` `Class.name` `` -- rather than merely as a substring anywhere in
+    the file. A bare substring match would silently pass if a function's name happened
+    to appear inside unrelated prose or another identifier."""
+    reference = re.compile(
+        r"`(?:[A-Za-z_][A-Za-z0-9_]*\.)*" + re.escape(name) + r"(\(\)|\(\.\.\.\))?`"
+    )
+    return reference.search(mapping_text) is not None
+
+
+def check_sql_paths_documented() -> list[str]:
+    """Both direct-SQL categories must be named in `docs/mapping.md`: the read-only
+    fallbacks that go through `store.readonly_sql()`, and the write paths that open
+    their own `sqlite3.connect(` connection."""
     if not MAPPING.is_file():
         return [f"{MAPPING} does not exist"]
     mapping_text = MAPPING.read_text()
     problems = []
-    for name in sorted(_readonly_sql_functions()):
-        reference = re.compile(r"`" + re.escape(name) + r"(\(\)|\(\.\.\.\))?`")
-        if reference.search(mapping_text) is None:
-            problems.append(
-                f"{name!r} reads through store.readonly_sql() but is not named as a "
-                f"backticked reference (e.g. `{name}`) in {MAPPING.relative_to(ROOT)}"
-            )
+    for needle, what in (
+        ("readonly_sql(", "reads through store.readonly_sql()"),
+        ("sqlite3.connect(", "opens its own SQLite connection with sqlite3.connect()"),
+    ):
+        for name in sorted(_functions_containing(needle)):
+            if not _documented(mapping_text, name):
+                problems.append(
+                    f"{name!r} {what} but is not named as a backticked reference "
+                    f"(e.g. `{name}`) in {MAPPING.relative_to(ROOT)}"
+                )
     return problems
 
 
@@ -130,7 +145,7 @@ def main() -> int:
     problems: list[str] = []
     problems += check_no_abstract_methods()
     problems += check_submodule_commit()
-    problems += check_readonly_sql_fallbacks_documented()
+    problems += check_sql_paths_documented()
 
     if problems:
         print("scripts/check.py found drift:")

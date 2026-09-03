@@ -4,7 +4,7 @@
 (`StorefrontBackend`, `MerchantBackend`) meet the StateSet iCommerce engine
 (`stateset-embedded`, installed as a pinned wheel, version `1.28.5`). This file records
 what each read and write actually does, the one place the engine's Python binding is
-read around with raw SQL, the write fallbacks Task 10 found, and the pinned vendor
+read around with raw SQL, the write fallbacks the binding forces, and the pinned vendor
 commit `scripts/check.py` verifies against.
 
 ## Pinned vendor commit
@@ -26,23 +26,23 @@ and keeps provenance ids stable across turns.
 
 | `StorefrontBackend` method | Engine call |
 |---|---|
-| `search_products` | `engine_backend.search.search` over `commerce.products.list()`, filtered/sorted in Python; `category` is the one filter the engine understands natively |
+| `search_products` | `engine_backend.search.search` over `commerce.products.list()`; every filter, `category` included, is applied in Python against this repo's own `Merchandising` custom object — the engine's catalog has no category column |
 | `get_product_details` | `commerce.products.get` / `get_variant_by_sku` + `catalog.read_merchandising` + `catalog.list_variants` |
-| `get_cart` / `add_to_cart` / `update_cart_item` / `remove_from_cart` | `commerce.carts.*` (`for_customer`, `add_item`, `update_item`, `remove_item`) |
+| `get_cart` / `add_to_cart` / `update_cart_item` / `remove_from_cart` | `commerce.carts.*` (`create` once per session, then `get_items`, `add_item`, `update_item`, `remove_item`). The session→cart mapping is `EngineStorefront._cart_ids`, read by the host through the host-only `session_cart_id`; `carts.for_customer` is not used by any backend method |
 | `get_orders` / `get_order` | `commerce.orders.list` / `.get` |
 | `get_preferences` | derived from `commerce.customers.get` (no preferences object in the engine) |
 | `search_policies` / `get_disclosure` | `engine_backend/content.py`'s static ACME Supply policy text (the engine has no policy/disclosure domain) |
-| `get_fulfillment_options` | fixed ACME Supply shipping options (the engine has no fulfillment-options domain) |
+| `get_fulfillment_options` | `commerce.carts.get_shipping_rates` for the session's own cart; `product_ids` is unused (the engine has no per-item quote) and a session with no cart yet gets `[]` |
 | `checkout_handoff` | renders the cart; charges nothing. Completing an order is `POST /shopping/checkout` on the host, which calls the governed `checkout.commit` kernel command directly — no agent tool reaches it. See `docs/enforcement.md`. |
 
 ## `EngineMerchant` (`engine_backend/merchant.py`)
 
 | `MerchantBackend` method | Engine call |
 |---|---|
-| `get_business_snapshot` | `commerce.analytics.sales_summary` / `.customer_metrics` |
-| `query_metrics` | `commerce.analytics.revenue_by_period` / `.top_products`; unsupported metrics and segments return an empty series with a `note` (see `task-9-report.md`) |
+| `get_business_snapshot` | `commerce.analytics.sales_summary` plus `get_inventory_alerts` for the low-stock count; traffic and conversion are `None` with a `note` (`customer_metrics` is not called) |
+| `query_metrics` | `commerce.analytics.revenue_by_period` / `.top_products`; an unsupported metric or segment returns a series with no points and a `note` saying why, never a defaulted zero |
 | `get_campaign_performance` | `campaign` custom objects (the engine has no campaign domain) |
-| `search_listings` / `get_listing` | `catalog.catalog_rows` (category filtered via `engine_search`; the rest in Python) |
+| `search_listings` / `get_listing` | `catalog.catalog_rows`, with one catalog scan per call; every filter and sort is applied in Python |
 | `get_inventory_alerts` | `commerce.analytics.low_stock_items` (only `kind="low_stock"`; the engine has no slow-mover analytic) |
 | `get_order_issues` | derived from `commerce.orders.list` (age vs. `fulfillment_status`) |
 | `get_pricing_context` | `catalog.catalog_rows` + `Merchandising.unit_cost` |
@@ -52,7 +52,7 @@ and keeps provenance ids stable across turns.
 
 ### `apply_change` × engine write × governed? × evidence
 
-One row per write `apply_change` can perform (from Task 10's report):
+One row per write `apply_change` can perform:
 
 | `ChangeKind` | Engine write | Governed? | Evidence |
 |---|---|---|---|
@@ -66,6 +66,18 @@ One row per write `apply_change` can perform (from Task 10's report):
 
 Full detail, including the exact error codes and the schema/trigger inspection behind
 the direct-SQL path, is in `docs/enforcement.md`.
+
+## Money at the seam
+
+Every engine money figure is an exact decimal string (`product_variants.price` is a
+`TEXT` column; every `*_exact` field is a string). `engine_backend/money.py` is the one
+place that form changes: `exact(...)` quantizes to a two-place string (`ROUND_HALF_UP`)
+and is what any write to an engine money column passes through, `to_float(...)` is the
+one-way display conversion for the `float` price fields on the `commerce-agents` types,
+and `discounted(...)` computes a promotion price in `Decimal` from the variant's own
+exact string. No money arithmetic in this repo happens in binary floating point, and a
+`PRICE_UPDATE`/`PROMOTION` `ChangeItem` carries its `before`/`after` as exact strings so
+the figure that reaches `product_variants.price` is the one that was staged.
 
 ## The one read-only SQL fallback
 
@@ -94,9 +106,22 @@ them with a direct parameterized `UPDATE` on the store's own SQLite file, serial
 against other direct-SQL writes under one lock key (`"direct_sql"`), with
 `PRAGMA busy_timeout` set so genuine contention waits rather than raising:
 
-- `product_variants.price` (price updates, promotions)
+- `product_variants.price` (price updates, promotions) — always a two-place decimal
+  string from `engine_backend/money.py`
 - `products.status` (pause/activate)
 - `products.description` (listing content)
+
+`_write_sql` is the only write path in `engine_backend/` that opens its own connection.
+`scripts/check.py` scans `engine_backend/*.py` for every function containing
+`sqlite3.connect(` and fails if `docs/mapping.md` does not name it — currently
+`_write_sql` and `readonly_sql` itself — so a second direct-SQL write path cannot be
+added silently.
+
+A direct-SQL write is not free of consequence beyond the row it touches: an external
+connection that writes *while the store is being seeded* leaves this engine handle
+reading a stale snapshot of any table a later `mode=ro` reader has touched (observed
+with `stateset-embedded` 1.28.5 on a WAL store). `seed_store` therefore does no direct
+SQL at all, and the engine's own binding is the only thing that writes during seeding.
 
 This was verified against the schema and triggers directly, not assumed:
 `PRAGMA table_info` on `products` and `product_variants` shows neither table has a
@@ -110,7 +135,7 @@ from the engine's own handle — a status/description write through this path ke
 
 ## The `web-shared` decision
 
-`web/storefront` and `web/portal` (Task 13) import `AgentApi`, `useSession`,
+`web/storefront` and `web/portal` import `AgentApi`, `useSession`,
 `useAgentTurn`, and the `AgentEvent`/`ChatItem`/`UIBlock` types from
 `vendor/commerce-agents/examples/web-shared` via an npm workspace
 (`vendor/commerce-agents/examples/web-shared` listed alongside `web/*` in the root

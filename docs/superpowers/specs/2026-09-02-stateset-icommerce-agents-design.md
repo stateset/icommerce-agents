@@ -152,6 +152,14 @@ workaround stays visible and disappears when the binding grows the method.
 
 ## 5. Enforcement: two layers, and where the second one stops
 
+> **As built.** This section is the design record and is left as written. Two of its
+> claims did not survive the build: `returns.transition` is not in
+> `config/kernel-policy.json` and no return flow exists anywhere in the repo, and there
+> is no host route that issues a refund — `payments.create_refund` is reachable only
+> from `scripts/denials.py` and `tests/test_kernel.py`. `docs/enforcement.md` is the
+> accurate account of what this deployment governs.
+
+
 `kernel/mutation-boundary.json` in the engine repo reports 938 tools, 474 mutations, and
 **26 governed commands**. That asymmetry is the most useful fact in either repository, and
 this reference is built around stating it precisely rather than flatteringly.
