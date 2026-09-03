@@ -8,6 +8,36 @@ StateSet iCommerce embedded engine (`stateset-embedded`) instead of an in-memory
 backend. One fictional store, ACME Supply, one SQLite-backed engine instance, two agent
 roles.
 
+Upstream's guardrails sit in front of the model: fencing, provenance gates, caps,
+staged writes, host approval. They stop a misbehaving model. The engine's policy kernel
+sits underneath, refusing inside the database transaction and returning a sealed
+receipt; it stops any caller, including one that never goes through an agent. Running
+the two together is what this repo is for, and showing where the second layer stops is
+what it is for.
+
+## What it demonstrates
+
+Two merchant writes — same operator, same approval, same apply path:
+
+```
+price update, TENT-RIDGE-TAN 219.00 -> 199.00
+  evidence  kind=activity_log     id=46d07ac4-...
+
+restock of a SKU with no inventory item
+  evidence  kind=kernel_receipt   id=5e2eb8f8-...
+```
+
+The restock is a governed command, so the engine seals a receipt for it. The price
+change is merchandising, which the engine does not govern, so the record is an
+activity-log entry and the agent layer's approval gate is the only thing that refused
+an unapproved apply. `web/portal` renders the two differently on purpose.
+
+`scripts/denials.py` prints three refusals end to end, no API key required: a cart
+write naming a product the model never saw (agent layer), an apply with no operator
+approval (agent layer), and a refund of 10,000.00 against a 219.00 payment — refused by
+the engine inside the transaction, `commerce.refund.exceeds_captured`, with a receipt
+id. The first two protect you from the model. The third holds against anything.
+
 ## Layout
 
 - `vendor/commerce-agents/` — the upstream repo, a git submodule, never edited.
@@ -75,14 +105,19 @@ correct."
 ## Enforcement
 
 Every write in this repo goes through the agent layer's gates (`shopping_agent.gates`,
-`merchant_agent.gates`). Only the five commands this deployment's kernel policy governs
-are *also* checked by a second, independent layer — the engine's own kernel — and no
-merchandising write is one of them. `docs/enforcement.md` is the full
-account, including the finding it exists to state: the engine governs the transaction
-spine — checkout, payments, refunds, order and reservation transitions, the stock
-ledger — and does not govern merchandising, where the agent layer's guardrails and
-approval gate are the only defense. `scripts/denials.py` demonstrates one refusal from
-each side plus the doubled case.
+`merchant_agent.gates`). Only the commands this deployment's kernel policy governs are
+*also* checked by the engine's own kernel, and no merchandising write is one of them.
+
+The engine governs 26 of its 474 mutations, and they are the transaction spine.
+This deployment enables five of those 26 in `config/kernel-policy.json`; two of the five
+have no code path here, which `docs/enforcement.md` names rather than leaves implied.
+That document is the full account — which layer stops which write, what evidence comes
+back, and the reason a merchant agent editing listings and prices has its agent layer
+and nothing beneath it.
+
+The one guarantee enforced twice is approval: upstream's `require_host_approval` at the
+agent layer, and `requires_approval` on `payments.create_refund` in the kernel policy.
+The kernel's copy holds even when the agent layer is bypassed entirely.
 
 ## Verify
 
