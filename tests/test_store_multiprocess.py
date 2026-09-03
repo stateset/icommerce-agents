@@ -5,8 +5,11 @@ process -- `scripts/run_demo.py` plus a separately launched MCP server, say -- w
 open question. The measured answer is that **a second process is covered precisely
 because it pins too**, and these tests encode both halves of that.
 
-The staleness is not cross-process in origin: a writer process that opens, writes and
-exits leaves a reader process's handle correct. But a second process's writes are fully
+The staleness is not cross-process in origin, and the reason is that POSIX advisory locks
+are held per process: another process's lock on the WAL index is one this process must
+respect, while the engine's SQLite and Python's, inside one process, do not see each
+other's at all. So a writer process that opens, writes and exits leaves a reader
+process's handle correct. But a second process's writes are fully
 subject to it. `test_an_unpinned_reader_process_goes_stale_...` is the negative leg: with
 the reader's pin dropped and a transient `sqlite3` read left in -- a connection opened
 and closed around one statement, which is what `write_sql` does on every apply -- the

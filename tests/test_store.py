@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sqlite3
 import threading
 import time
@@ -71,14 +72,19 @@ def test_readonly_sql_refuses_memory(store):
 async def test_a_direct_sql_write_is_visible_to_the_engine_handle(tmp_path):
     """`write_sql` is only sound together with the connection `EngineStore` pins for its
     own lifetime: two SQLite libraries are open on this file (the engine's, bundled in
-    the Rust extension, and Python's), and they stay coherent only while the file never
-    drops to zero connections.
+    the Rust extension, and Python's), they coordinate through the WAL index, and they
+    stay coherent only while nothing unlinks that index under a live handle.
 
-    Disable the pin and this fails on the second iteration: `commerce` keeps serving the
+    Weaken the pin and this fails on the second iteration: `commerce` keeps serving the
     first price for the rest of its life while the row on disk is correct. That is the
     bug in production terms -- the host holds one `Commerce`, `catalog.list_variants`
     resolves through `get_variant_by_sku`, so the second applied price change of a
     process would never reach listings, cart lines or `subtotal_exact`.
+
+    "Weaken", not only "disable": a pin that opens a connection but reads no table is as
+    good as absent, and that is exactly the bug this test caught in CI while passing on
+    the machine it was written on. What decides whether it shows up is the SQLite version
+    behind Python's `sqlite3`, which the failure message names for that reason.
 
     `readonly_sql()` is deliberately never called here. It happens to hold a connection
     open too, which is what masked this for so long; the point of the pin is that the
@@ -120,10 +126,64 @@ async def test_a_direct_sql_write_is_visible_to_the_engine_handle(tmp_path):
         )
         assert disk_price() == price, "the row on disk is wrong"
         variant = store.commerce.products.get_variant_by_sku("TENT-RIDGE-TAN")
-        assert variant.price_exact == price, "the engine handle is serving a stale price"
+        assert variant.price_exact == price, (
+            "the engine handle is serving a stale price "
+            f"(Python's sqlite3 is {sqlite3.sqlite_version}; the engine bundles its own "
+            "SQLite, and the two coordinate through the WAL index -- see "
+            "`EngineStore._pin_connection`)"
+        )
 
 
 def test_the_store_pins_a_connection_for_its_own_lifetime(tmp_path):
     store = EngineStore(str(tmp_path / "store.db"))
     assert store._pin is not None
     assert EngineStore(":memory:")._pin is None
+
+
+@pytest.mark.skipif(
+    not os.path.isdir("/proc/self/fd"),
+    reason="the WAL index is checked through /proc/self/fd, which only Linux has",
+)
+async def test_the_pin_keeps_the_wal_index_from_being_unlinked(tmp_path):
+    """The mechanism the price test observes from the outside, asserted directly.
+
+    `write_sql`'s connection closing is what used to unlink `-wal` and `-shm` -- Python's
+    SQLite and the engine's do not see each other's advisory locks inside one process, so
+    nothing stopped it -- leaving the engine's handle mapped to an index no one would
+    write to again. The visible half is a frozen price; the physical half is a live
+    descriptor on a deleted file, which is what this asserts.
+
+    A pin that opens a connection but never reads a table (`SELECT 1`) never maps the
+    index and does not prevent the unlink. Whether that shows up as a stale price depends
+    on the SQLite version behind Python's `sqlite3` -- it did not on 3.50.4 and did on
+    3.45.1, 3.46.0 and 3.47.1 -- so this test is the environment-independent half of the
+    guarantee and the price test above is the behavioural half. Keep both.
+    """
+    from engine_backend.seed import seed_store
+
+    db_path = str(tmp_path / "store.db")
+    store = EngineStore(db_path)
+    seed_store(store.commerce)
+    before = os.stat(db_path + "-shm").st_ino
+
+    await store.write_sql(
+        "UPDATE product_variants SET price = ? WHERE sku = ?", ("149.00", "TENT-RIDGE-TAN")
+    )
+    # a transient reader of the ordinary kind: opened, used once, closed -- the shape
+    # `write_sql` itself takes, and the close is the moment that used to unlink the index
+    transient = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    transient.execute("SELECT 1 FROM products").fetchall()
+    transient.close()
+
+    deleted = []
+    for entry in os.listdir("/proc/self/fd"):
+        try:
+            target = os.readlink(f"/proc/self/fd/{entry}")
+        except OSError:  # pragma: no cover - the descriptor closed under us
+            continue
+        if target.startswith(db_path) and target.endswith("(deleted)"):
+            deleted.append(target)
+    assert not deleted, f"the WAL index was unlinked under a live engine handle: {deleted}"
+    assert os.stat(db_path + "-shm").st_ino == before, (
+        "the WAL index was replaced; the engine handle is still mapped to the old one"
+    )

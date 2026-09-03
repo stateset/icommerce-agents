@@ -132,6 +132,16 @@ full-text search index in sync, are schema-level rather than connection-level, s
 fire identically for a write from this module's own connection as for one from the
 engine's own handle. See `docs/mapping.md` for the full write-fallback list.
 
+Reaching the row correctly is only half of sound, and the other half is not free. Two
+SQLite libraries are open on that file — the engine's and Python's — and a direct-SQL
+write is visible to the engine's handle only because `EngineStore._pin_connection` holds
+a share of the WAL index for the store's lifetime. Without that, the write lands on disk
+and the handle serving the storefront never sees it, silently and for the rest of the
+process's life; and the pin holds that share only because it reads a table, not merely
+because it opens a connection. `docs/mapping.md` has the mechanism, the measurements, and
+why the symptom appears on some Python SQLite builds and not others. Anything that
+weakens the pin makes this workaround unsound again, whatever the schema says.
+
 ## The MCP path's approval is weaker than the HTTP host's
 
 `docs/mcp.md` covers this in full; it is not restated here beyond the one sentence that

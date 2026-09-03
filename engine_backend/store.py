@@ -26,37 +26,39 @@ class PrincipalBinding(BaseModel):
 class EngineStore:
     """One engine handle, one pinned connection, and the session→principal bindings.
 
-    The connection :meth:`_pin_connection` holds is per *process*, so two host processes
-    on one store file -- ``scripts/run_demo.py`` alongside a separately launched MCP
-    server -- were an open question rather than a covered case. They are now measured, in
-    ``tests/test_store_multiprocess.py``, and the answer is that **a second process is
-    covered precisely because it pins too.**
+    The connection :meth:`_pin_connection` holds is per *process*, and what it holds is
+    a share of the WAL index -- see that method for the mechanism and for why holding a
+    file descriptor alone is not enough. Two host processes on one store file
+    (``scripts/run_demo.py`` alongside a separately launched MCP server) are measured in
+    ``tests/test_store_multiprocess.py``, and **a second process is covered precisely
+    because it pins too.**
 
-    The staleness is not cross-process in origin: one process's direct-SQL connection
-    churn does not by itself poison another process's handle, and a writer process that
-    opens, writes and exits leaves a reader's handle correct. But a second process's
-    writes are fully subject to the hazard. The moment an *unpinned* reader process makes
-    a transient ``sqlite3`` connection of its own -- one opened and closed around a
-    single statement, which is exactly what :meth:`write_sql` does on every apply -- its
-    ``Commerce`` handle stops seeing the other process's ``write_sql`` writes,
-    permanently, while disk is correct. What matters is the open-and-close, not whether
-    the statement is a read or a write: :meth:`readonly_sql` is *not* an instance of it,
-    because it caches one connection per thread and holds it for that thread's life.
-    Measured over four successive price writes applied by a separate process, with the
-    reader's pin dropped and its transient read left in, the handle tracks the first
-    write and then freezes on it for the rest of its life; with the pin held it tracks
-    all four. Deterministic over three repeats.
+    The staleness is in-process in origin, which is the opposite of the obvious guess.
+    POSIX advisory locks are held per process, so the lock a *second* process takes on
+    the WAL index really does block this process from tearing it down; two SQLite
+    libraries inside *one* process do not block each other at all. That is why a writer
+    process that opens, writes and exits leaves a reader's handle correct, while the same
+    open-and-close inside the reader's own process destroys it. An *unpinned* process
+    that makes a transient ``sqlite3`` connection of its own -- one opened and closed
+    around a single statement, which is exactly what :meth:`write_sql` does on every
+    apply -- loses its ``Commerce`` handle's view of every later ``write_sql``,
+    permanently, while disk stays correct. What matters is the open-and-close, not
+    whether the statement is a read or a write: :meth:`readonly_sql` is *not* an instance
+    of it, because it caches one connection per thread and holds it for that thread's
+    life.
 
     So the pin is not redundant across processes and is not merely a single-process
-    concern: it is the only thing standing between a two-process deployment and silently
-    stale prices. Each process that opens a store gets its own, which is why the
-    per-process scope is the right scope rather than a gap.
+    concern: it is the only thing standing between a deployment and silently stale
+    prices. Each process that opens a store gets its own, which is why the per-process
+    scope is the right scope rather than a gap.
 
     One caution for anyone reproducing this: an incidental extra connection anywhere in
     the harness masks the whole effect, which is how it stayed hidden here twice. A
     reader that performs an engine binding write before its read, or a diagnostic
     connection left open beside the store, reads correct values with the pin off and
-    proves nothing.
+    proves nothing. A third way to be misled is to reproduce it on one machine only: the
+    symptom depends on the SQLite version behind Python's ``sqlite3`` (see
+    :meth:`_pin_connection`), so a green run proves nothing about another host.
 
     Three things about a second process are true and are *not* guarantees this class
     makes:
@@ -123,16 +125,37 @@ class EngineStore:
             await asyncio.to_thread(body)
 
     def _pin_connection(self) -> sqlite3.Connection | None:
-        """One read-only connection, opened with the store and never used or closed.
+        """One read-only connection that joins the WAL index and then holds a share of it.
 
         This repo has two independent SQLite libraries open on one file: the engine's
         own (bundled in the Rust extension) and Python's ``sqlite3``, which
         :meth:`write_sql` and :meth:`readonly_sql` use for the reads and writes the
         binding does not expose. On a WAL database they coordinate through the
-        shared-memory WAL index, and that coordination is only stable while the file
-        stays continuously open: let the last connection close, and the next connection
-        rebuilds the index from scratch while another library's handle is still caching
-        the old one.
+        shared-memory WAL index, the ``-shm`` file beside the ``-wal``. When a connection
+        closes and SQLite believes it is the last user of that index, it checkpoints and
+        **unlinks** ``-wal`` and ``-shm``. A handle that still has the unlinked index
+        mapped keeps reading it: it is now a private copy of a file no one else will ever
+        write to, so every WAL frame appended afterwards -- through the ``-wal`` the next
+        connection creates -- is invisible to it, for the rest of its life, while the row
+        on disk is correct.
+
+        "Believes it is the last user" is where the two libraries part company. That
+        belief rests on a POSIX advisory lock, and POSIX advisory locks are held per
+        *process*: a lock taken by the engine's SQLite does not block Python's
+        ``sqlite3`` in the same process from taking it exclusively, so
+        :meth:`write_sql`'s connection unlinks the index out from under a live
+        ``Commerce`` handle every time it closes. It is only within one library that
+        SQLite tracks its own open connections and refuses. Hence the shape of this
+        method: the pin must be a connection of *Python's* library, and it must actually
+        be a user of the WAL index, not merely a descriptor on the file.
+
+        That distinction is the whole fix. ``SELECT 1`` touches no table, so it opens no
+        read transaction and never maps ``-shm``; a pin that only ran ``SELECT 1`` was
+        counted by nothing and prevented nothing. Reading ``sqlite_schema`` opens a real
+        read transaction, which maps the index and leaves this connection registered as a
+        user of it for as long as the connection is open -- while releasing the read
+        transaction itself, so checkpointing is not blocked and the WAL does not grow
+        without bound.
 
         The symptoms of getting this wrong are not subtle, and all three were observed
         here: the engine's ``Commerce`` handle serving a pre-write price for the rest of
@@ -143,22 +166,30 @@ class EngineStore:
         different table; and ``PRAGMA wal_checkpoint(TRUNCATE)`` leaving the engine
         handle raising ``disk I/O error``.
 
-        Holding one connection open for the life of the store removes the whole class:
-        the file is never down to zero connections, so the WAL index is never torn down
-        and rebuilt underneath a live handle. Measured over 60 write-then-read cycles
-        with a transient reader opening and closing on every cycle, the engine handle is
-        correct every time with this connection held and stale on all but the first
-        without it, in both ``wal`` and ``delete`` journal modes.
+        Whether the ``SELECT 1`` pin *appeared* to work depended on the SQLite version
+        behind Python's ``sqlite3``, which is why this was believed settled twice.
+        Measured on one machine, against the same engine build (``stateset-embedded``
+        1.28.5 bundles SQLite 3.46.0 in both its sdist and its ``manylinux`` wheel), four
+        successive ``write_sql`` price writes with a transient reader between them:
+        stale from the second write on with Python's SQLite at 3.45.1, 3.46.0 and 3.47.1;
+        correct with 3.50.4. The repo's own machine ships 3.50.4 and CI ships an older
+        one, so the bug shipped and only CI ever saw it. With the ``sqlite_schema`` read
+        below, all four versions track every write.
 
-        It is deliberately never read from: its only job is to exist. An in-memory store
-        has no file to pin and no ``readonly_sql`` either, so it gets ``None``.
+        The connection is never read from again: its only job is to hold that share. An
+        in-memory store has no file to pin and no ``readonly_sql`` either, so it gets
+        ``None``.
         """
         if self.db_path == ":memory:":
             return None
         connection = sqlite3.connect(
             f"file:{self.db_path}?mode=ro", uri=True, check_same_thread=False
         )
-        connection.execute("SELECT 1").fetchone()
+        # A real table read, run to completion: it maps the WAL index (which `SELECT 1`
+        # does not) and then ends its read transaction (which `fetchone` on an unfinished
+        # statement would not), leaving this connection a registered user of the index
+        # without holding a read mark against the checkpointer.
+        connection.execute("SELECT count(*) FROM sqlite_schema").fetchall()
         return connection
 
     def readonly_sql(self) -> sqlite3.Connection:

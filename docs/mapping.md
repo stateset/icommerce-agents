@@ -158,20 +158,33 @@ stops a second write path being added that forgets.
 This process has two independent SQLite libraries open on the same database: the
 engine's own, bundled in the `stateset-embedded` Rust extension, and Python's `sqlite3`,
 which `write_sql` and `readonly_sql` use for the writes and reads the binding does not
-expose. On a WAL database they coordinate through the shared-memory WAL index, and that
-coordination is stable only while the file stays continuously open. Let the last
-connection close and the next one rebuilds the index from scratch while another
-library's handle is still caching the old one.
+expose. On a WAL database they coordinate through the shared-memory WAL index — the
+`-shm` file beside the `-wal`. When a connection closes and SQLite believes it is the
+last user of that index, it checkpoints and **unlinks** both files. A handle that still
+has the unlinked `-shm` mapped goes on reading it, now a private copy of a file nothing
+will ever write to again, so every WAL frame appended afterwards is invisible to it for
+the rest of its life while the row on disk is correct.
 
-The invariant is therefore: **the store keeps at least one connection open on the file
-at all times.** `EngineStore._pin_connection` opens one read-only connection when the
-store is constructed and never uses or closes it. This is not seeding-specific, not
-table-scoped, and does not depend on what was written — any moment at which the file
-drops to zero connections is enough, and a short-lived reader coming and going (a second
-process, a backup, a debugging query) is the ordinary way that happens.
+"Believes it is the last user" is where the two libraries part company, and it is the
+whole of this hazard. That belief rests on a POSIX advisory lock, and POSIX advisory
+locks are held per *process*: a lock taken by the engine's SQLite does not stop Python's
+`sqlite3`, in the same process, from taking it exclusively. So `write_sql`'s connection
+unlinked the index out from under a live `Commerce` handle on every close, and only a
+connection belonging to *Python's* library could stop it. Between two processes the same
+lock does work, which is why the cross-process results below come out the other way.
+
+The invariant is therefore: **the store keeps one connection of Python's `sqlite3` open
+on the file, and that connection must be a registered user of the WAL index — not merely
+a descriptor on the file.** `EngineStore._pin_connection` opens one read-only connection
+when the store is constructed, runs a single `SELECT count(*) FROM sqlite_schema` on it,
+and never uses or closes it again. The read matters as much as the connection: it is what
+maps the index. A pin that ran `SELECT 1` touched no table, opened no read transaction,
+mapped nothing and prevented nothing; running the statement to completion (rather than
+leaving a row unfetched) also releases the read transaction, so the pin does not block
+checkpointing and the WAL does not grow without bound.
 
 Three symptoms were observed with `stateset-embedded` 1.28.5 when nothing pinned the
-file, all of them from the same cause:
+index, all of them from the same cause:
 
 - The engine's `Commerce` handle serving a pre-write price for the rest of its life
   while the row on disk is correct. In production terms this is the serious one: the
@@ -192,10 +205,40 @@ write, it only works if the old handle is fully released *before* the new one is
 (a new handle opened alongside the old one inherits the same stale view), and it does
 not protect `readonly_sql`'s own reads.
 
-`tests/test_store.py::test_a_direct_sql_write_is_visible_to_the_engine_handle` is the
-regression test: it applies four successive direct-SQL price writes with an engine
-binding write between them, exactly as an apply does, and asserts the engine handle
-tracks every one. Disable the pin and it fails on the second write.
+#### Whether the symptom appears depends on Python's SQLite version
+
+The engine's own SQLite is fixed: `stateset-embedded` 1.28.5 statically bundles SQLite
+3.46.0, and the sdist and the `manylinux_2_34` wheel bundle the same source id, so a host
+that compiles the engine and one that installs the wheel run identical engine-side code.
+Python's `sqlite3` is not fixed, and that is the variable.
+
+A `SELECT 1` pin — one that holds a descriptor but never joins the WAL index — was
+measured against the four successive `write_sql` price writes the regression test
+performs, on one machine, against one engine build:
+
+| Python's `sqlite3` | with a `SELECT 1` pin | with the `sqlite_schema` pin |
+|---|---|---|
+| 3.45.1 | **stale from the second write on** | tracks every write |
+| 3.46.0 | **stale from the second write on** | tracks every write |
+| 3.47.1 | **stale from the second write on** | tracks every write |
+| 3.50.4 | tracks every write | tracks every write |
+
+So the weak pin was a real product defect, not a test artefact: on any host whose Python
+links a SQLite older than the versions where this stops biting — most Linux
+distributions — every merchandising write (price, product status, product description)
+reached disk and never reached the engine handle serving the storefront. It survived
+because this repo's own machine ships 3.50.4 and CI ships an older build, so only CI ever
+saw it, and it was read as CI flakiness twice.
+
+Two tests hold the guarantee, and they are complementary because of that table:
+`tests/test_store.py::test_a_direct_sql_write_is_visible_to_the_engine_handle` applies
+four successive direct-SQL price writes with an engine binding write between them,
+exactly as an apply does, and asserts the engine handle tracks every one — the
+behavioural half, whose sensitivity depends on the host's SQLite, and whose failure
+message names that version. `test_the_pin_keeps_the_wal_index_from_being_unlinked`
+asserts the physical half on any Linux host and any SQLite version: after a `write_sql`,
+no descriptor in the process points at a deleted `-wal` or `-shm` and the `-shm` inode is
+unchanged.
 
 #### The pin is per process, and that is exactly what a second process needs
 
@@ -205,10 +248,12 @@ not covered by the first process's connection. `tests/test_store_multiprocess.py
 measures what actually happens, and the answer is that **a second process is covered
 precisely because it pins too.**
 
-The staleness is not cross-process in origin. One process's direct-SQL connection churn
-does not by itself poison another process's handle, and a writer process that opens,
-writes and exits leaves a reader process's handle correct. But a second process's writes
-are fully subject to the hazard. The moment an **unpinned** reader process makes a
+The staleness is not cross-process in origin, and the reason is the per-process scope of
+POSIX advisory locks stated above. One process's direct-SQL connection churn does not by
+itself poison another process's handle — the other process's own lock on the WAL index is
+one this process really does have to respect — and a writer process that opens, writes
+and exits leaves a reader process's handle correct. But a second process's writes are
+fully subject to the hazard. The moment an **unpinned** reader process makes a
 transient `sqlite3` connection of its own — one opened and closed around a single
 statement, which is exactly what `write_sql` does on every apply — its `Commerce` handle
 stops seeing the other process's `write_sql` writes, permanently, while the row on disk
@@ -228,9 +273,11 @@ process, deterministic over three repeats:
 | dropped | no | `199` OK, `189` OK, `179` OK, `169` OK |
 
 So the pin is neither redundant across processes nor merely a single-process concern: it
-is the only thing standing between a two-process deployment and silently stale prices,
-and every process that opens a store gets one. No fix is required beyond the pin already
-being in the constructor, and there is no "one process per store file" constraint.
+is the only thing standing between a deployment and silently stale prices, and every
+process that opens a store gets one. That measurement was taken with a pin that only ran
+`SELECT 1`, on a host whose Python links SQLite 3.50.4; read it as being about the pinned
+connection existing, and read the version table above for what the connection has to
+*do*. There is no "one process per store file" constraint.
 
 The bottom row of that table is a trap worth naming, because it is how the wrong
 conclusion was reached here twice: **an incidental extra connection anywhere masks the
