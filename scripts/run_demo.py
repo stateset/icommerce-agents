@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the reference demo: the FastAPI host on :8000, and with ``--web`` the two Next.js
-web apps alongside it. The web apps do not exist yet in this repo, so ``--web`` degrades
-to a warning rather than crashing.
+web apps (``web/storefront``, ``web/portal``) alongside it. ``--web`` degrades to a
+warning rather than crashing if a web app's ``package.json`` is missing.
 """
 
 from __future__ import annotations
@@ -13,8 +13,8 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-STOREFRONT_WEB = REPO_ROOT / "storefront-web"
-MERCHANT_WEB = REPO_ROOT / "merchant-web"
+STOREFRONT_WEB = REPO_ROOT / "web" / "storefront"
+MERCHANT_WEB = REPO_ROOT / "web" / "portal"
 
 
 def _run_web_app(path: Path, port: int) -> subprocess.Popen | None:
