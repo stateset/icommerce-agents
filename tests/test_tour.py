@@ -37,3 +37,19 @@ def test_main_exits_zero_with_no_api_key_set(tmp_path, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     code = main(["--db", str(tmp_path / "tour-cli.db")])
     assert code == 0
+
+
+def test_a_rerun_against_the_same_db_exits_zero_both_times(tmp_path):
+    """The second thing a curious reader does is run the tour again. A fixed SKU/slug
+    for the restock listing would crash the second run on `Duplicate product slug`
+    -- the same wart just fixed in `scripts/denials.py`'s idempotency key. Run twice
+    against one db file and assert both runs complete the same narrated arc."""
+    db_path = str(tmp_path / "tour-rerun.db")
+
+    for attempt in (1, 2):
+        code = main(["--db", db_path])
+        assert code == 0, f"attempt {attempt} did not exit 0"
+
+    result = run_tour(db_path)
+    assert result.ok, result.steps
+    assert set(result.evidence_kinds) == {"activity_log", "kernel_receipt"}

@@ -212,3 +212,56 @@ def test_approving_a_change_that_is_no_longer_staged_is_refused(tmp_path):
     response = c.post(approve, headers=headers)
     assert response.status_code == 409
     assert "applied" in response.json()["detail"]
+
+
+def test_capabilities_reports_presence_never_validity(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    c = client(tmp_path)
+    body = c.get("/capabilities").json()
+    assert body == {"assistant": "unconfigured"}
+    assert "key" not in str(body).lower()
+
+
+def test_shopping_cart_read_matches_what_was_added(tmp_path):
+    c = client(tmp_path)
+    headers = {"X-Session-Id": c.post("/shopping/session").json()["session_id"]}
+    c.post(
+        "/shopping/cart/add",
+        json={"product_id": "TENT-RIDGE-GRN", "quantity": 1},
+        headers=headers,
+    )
+    read_back = c.get("/shopping/cart", headers=headers).json()
+    assert [item["product_id"] for item in read_back["items"]] == ["TENT-RIDGE-GRN"]
+    assert read_back["grand_total_exact"]
+
+
+def test_shopping_orders_read_requires_a_session(tmp_path):
+    assert client(tmp_path).get("/shopping/orders").status_code == 401
+
+
+def test_merchant_changes_read_excludes_discarded_changes(tmp_path):
+    """`GET /merchant/changes` reports pending and applied changes -- a discarded one
+    has nothing left to show and must not appear."""
+    import asyncio
+
+    from merchant_agent.types import ActorKind, ChangeItem, ChangeKind
+
+    from engine_backend import staging
+    from engine_backend.store import EngineStore
+
+    db_path = str(tmp_path / "store.db")
+    c = TestClient(create_app(db_path))
+    headers = {"X-Session-Id": c.post("/merchant/session").json()["session_id"]}
+
+    store = EngineStore(db_path)
+    change = staging.new_change(
+        ChangeKind.PRICE_UPDATE,
+        "Update price for TENT-RIDGE-TAN",
+        [ChangeItem(target="TENT-RIDGE-TAN", field="price", before="219.00", after="199.00")],
+        "user:acme-operator",
+    )
+    asyncio.run(staging.save(store, change))
+    asyncio.run(staging.discard(store, change.change_id, "user:acme-operator", ActorKind.OPERATOR))
+
+    changes = c.get("/merchant/changes", headers=headers).json()["changes"]
+    assert change.change_id not in {item["change_id"] for item in changes}

@@ -11,15 +11,36 @@ the HTTP routes above already wrote to -- never a mock, never a fabricated resul
 
 Exit 0 means every expected outcome happened, including the refusal: an unapproved
 apply that *succeeded* is a failure this script reports, not a pass.
+
+Re-running against an existing db (the second thing a curious reader does) must
+produce the same narrated arc and exit 0, not crash on state the first run left
+behind: the restock step's brand-new listing gets a per-run-unique SKU and slug for
+exactly that reason (mirrors the fix in ``scripts/denials.py`` for the same wart).
+
+Two ways to point this at an engine: ``db_path`` alone (the default) builds and holds
+the FastAPI app in-process via ``TestClient`` -- the convenient path for a one-shot
+run. Passing ``base_url`` instead drives an *already-running* host over real HTTP,
+which is what a caller wanting to point the tour at a live ``uvicorn`` process (as
+``run_demo.py --tour`` will, in Task 3) needs, and it avoids ever opening a second
+``EngineStore`` handle on the same db file the running host already holds open --
+this repo has already spent three rounds discovering how badly two SQLite handles on
+one file can interact. Staging and applying a merchant change still have no HTTP
+route (only chat, which needs a model), so both modes fall back to a direct,
+short-lived ``EngineMerchant`` against ``db_path`` for exactly those two calls; in
+``base_url`` mode this is still the *only* place a second handle is opened, and only
+briefly, immediately after the HTTP calls that touch the same rows have completed.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import secrets
 import sys
 from pathlib import Path
+from typing import Any
 
+import httpx
 from fastapi.testclient import TestClient
 from merchant_agent.changes import ChangeNotApplicable
 from merchant_agent.types import InventoryActionItem, MerchantSessionContext, PriceUpdateItem
@@ -35,7 +56,6 @@ CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 OPERATOR = "user:acme-operator"
 CART_SKU = "TENT-RIDGE-GRN"
 PRICE_UPDATE_SKU = "TENT-RIDGE-TAN"
-NEW_SKU = "WIDGET-TOUR-NEW"
 
 
 class TourResult:
@@ -59,26 +79,56 @@ class TourResult:
         self.ok = False
 
 
-def run_tour(db_path: str) -> TourResult:
-    """Drive the whole tour against a fresh engine store at ``db_path``. Returns a
-    :class:`TourResult` -- always, even on failure -- so a caller (or a test) can
-    inspect exactly which expected outcome went missing."""
-    result = TourResult()
-    client = TestClient(create_app(db_path))
+def run_tour(
+    db_path: str,
+    *,
+    base_url: str | None = None,
+    session_ids: dict[str, str] | None = None,
+) -> TourResult:
+    """Drive the whole tour. ``db_path`` names the engine store either way -- the one
+    ``TestClient`` builds in-process (``base_url`` omitted), or the one an
+    already-running host at ``base_url`` holds open (``base_url`` given): the merchant
+    stage/apply steps need it directly regardless, since neither has an HTTP route.
 
+    ``session_ids`` lets a caller that already holds open shopping/merchant sessions
+    (against the same store) hand them in as ``{"shopping": ..., "merchant": ...}``
+    instead of this minting fresh ones. Returns a :class:`TourResult` -- always, even
+    on failure -- so a caller (or a test) can inspect exactly which expected outcome
+    went missing."""
+    result = TourResult()
+    session_ids = dict(session_ids or {})
+    http_client: Any = (
+        httpx.Client(base_url=base_url) if base_url else TestClient(create_app(db_path))
+    )
+    with http_client as http:
+        return _drive_tour(http, db_path, session_ids, result)
+
+
+def _drive_tour(
+    http: Any, db_path: str, session_ids: dict[str, str], result: TourResult
+) -> TourResult:
+    """The body of the tour, run inside `run_tour`'s `with` block so `http` (an
+    `httpx.Client` in `base_url` mode, or the `TestClient` `run_tour` built) is always
+    closed -- on an early return as much as on the happy path."""
     # -- Shopping: cart, checkout, the sealed receipt ----------------------------
 
-    result.narrate("Opening a shopping session (POST /shopping/session)...")
-    session_response = client.post("/shopping/session")
-    session_id = session_response.json().get("session_id") if session_response.is_success else None
-    if not session_id:
-        result.fail(f"could not open a shopping session: {session_response.text}")
-        return result
+    session_id = session_ids.get("shopping")
+    if session_id:
+        result.narrate(f"Reusing shopping session {session_id}...")
+    else:
+        result.narrate("Opening a shopping session (POST /shopping/session)...")
+        session_response = http.post("/shopping/session")
+        session_id = (
+            session_response.json().get("session_id") if session_response.is_success else None
+        )
+        if not session_id:
+            result.fail(f"could not open a shopping session: {session_response.text}")
+            return result
     result.session_ids["shopping"] = session_id
     shopping_headers = {"X-Session-Id": session_id}
 
     result.narrate(f"Adding {CART_SKU} to the cart (POST /shopping/cart/add)...")
-    cart = client.post(
+    cart = http.post(
         "/shopping/cart/add",
         json={"product_id": CART_SKU, "quantity": 1},
         headers=shopping_headers,
@@ -87,13 +137,13 @@ def run_tour(db_path: str) -> TourResult:
         result.fail(f"cart is empty after add: {cart}")
         return result
 
-    cart_read = client.get("/shopping/cart", headers=shopping_headers).json()
+    cart_read = http.get("/shopping/cart", headers=shopping_headers).json()
     if not cart_read.get("items"):
         result.fail(f"GET /shopping/cart did not show the item just added: {cart_read}")
         return result
 
     result.narrate("Placing the order through POST /shopping/checkout...")
-    checkout = client.post("/shopping/checkout", headers=shopping_headers).json()
+    checkout = http.post("/shopping/checkout", headers=shopping_headers).json()
     receipt = checkout.get("receipt") or {}
     order_number = checkout.get("order_number")
     if not order_number or receipt.get("status") != "succeeded":
@@ -102,7 +152,7 @@ def run_tour(db_path: str) -> TourResult:
     result.order_number = order_number
     result.narrate(f"Order {order_number} placed. Sealed receipt: {receipt}")
 
-    orders = client.get("/shopping/orders", headers=shopping_headers).json().get("orders", [])
+    orders = http.get("/shopping/orders", headers=shopping_headers).json().get("orders", [])
     if not any(order.get("total_exact") for order in orders):
         result.fail(f"GET /shopping/orders did not carry an exact total: {orders}")
         return result
@@ -110,16 +160,20 @@ def run_tour(db_path: str) -> TourResult:
 
     # -- Merchant: stage, refuse, approve, apply, evidence -----------------------
 
-    result.narrate("Opening a merchant session (POST /merchant/session)...")
-    merchant_session_response = client.post("/merchant/session")
-    merchant_session_id = (
-        merchant_session_response.json().get("session_id")
-        if merchant_session_response.is_success
-        else None
-    )
-    if not merchant_session_id:
-        result.fail(f"could not open a merchant session: {merchant_session_response.text}")
-        return result
+    merchant_session_id = session_ids.get("merchant")
+    if merchant_session_id:
+        result.narrate(f"Reusing merchant session {merchant_session_id}...")
+    else:
+        result.narrate("Opening a merchant session (POST /merchant/session)...")
+        merchant_session_response = http.post("/merchant/session")
+        merchant_session_id = (
+            merchant_session_response.json().get("session_id")
+            if merchant_session_response.is_success
+            else None
+        )
+        if not merchant_session_id:
+            result.fail(f"could not open a merchant session: {merchant_session_response.text}")
+            return result
     result.session_ids["merchant"] = merchant_session_id
     merchant_headers = {"X-Session-Id": merchant_session_id}
 
@@ -158,14 +212,22 @@ def run_tour(db_path: str) -> TourResult:
         f"Approving {price_change.change_id} "
         f"(POST /merchant/changes/{price_change.change_id}/approve)..."
     )
-    approve_response = client.post(
+    approve_response = http.post(
         f"/merchant/changes/{price_change.change_id}/approve", headers=merchant_headers
     )
     if approve_response.status_code != 200:
         result.fail(f"approve did not succeed: {approve_response.text}")
         return result
-    # The HTTP call above recorded the approval on the host's own `EngineMerchant`
-    # instance; this script's local one needs the same mark before it can apply.
+    # `approve` only ever marks an in-memory `_approved` set on the `EngineMerchant`
+    # instance it is called on -- it writes nothing to the store -- so the HTTP call
+    # above marked the host's own instance, not this script's `merchant`. This mirrors
+    # that mark locally so `merchant.apply_change` below sees it approved. FRAGILE: if
+    # `approve` (or what `apply_change` checks) ever grows a second side effect --
+    # persisting to the store, say, or checking anything beyond `_approved` -- this
+    # local call stops being an accurate stand-in and the two instances can silently
+    # desync, e.g. a change the host considers approved that this script's apply
+    # refuses, or the reverse. There is no cross-check to catch that today; the fix if
+    # it does happen is a real apply route in `host/app.py`, not another mirror call.
     merchant.approve(price_change.change_id, OPERATOR)
 
     result.narrate(f"Applying {price_change.change_id}...")
@@ -177,29 +239,36 @@ def run_tour(db_path: str) -> TourResult:
     result.evidence_kinds.append(price_evidence[0].kind)
     result.narrate(f"Applied. activity_log evidence: {price_evidence[0].model_dump()}")
 
-    result.narrate(f"Creating a brand-new listing ({NEW_SKU}) with no inventory item yet...")
+    # A per-run suffix on both the name and the SKU, not a fixed one: a rerun against
+    # an existing `--db` file would otherwise hit "Duplicate product slug" on this
+    # `create` call (the slug derives from the name) -- the exact wart just fixed in
+    # `scripts/denials.py`'s idempotency key, here in the script whose whole job is
+    # surviving a second run.
+    run_id = secrets.token_hex(4)
+    new_sku = f"WIDGET-TOUR-{run_id}"
+    result.narrate(f"Creating a brand-new listing ({new_sku}) with no inventory item yet...")
     store.commerce.products.create(
-        name="Tour Widget",
+        name=f"Tour Widget {run_id}",
         description="A widget with no inventory item yet, created for the tour.",
-        variants=[CreateProductVariantInput(sku=NEW_SKU, price=25.00)],
+        variants=[CreateProductVariantInput(sku=new_sku, price=25.00)],
     )
 
-    result.narrate(f"Staging a restock of {NEW_SKU}...")
+    result.narrate(f"Staging a restock of {new_sku}...")
     restock_change = asyncio.run(
         merchant.stage_inventory_action(
             backend_session,
-            [InventoryActionItem(listing_id=NEW_SKU, action="restock", quantity=20)],
+            [InventoryActionItem(listing_id=new_sku, action="restock", quantity=20)],
         )
     )
 
     result.narrate(f"Approving {restock_change.change_id}...")
-    approve_restock = client.post(
+    approve_restock = http.post(
         f"/merchant/changes/{restock_change.change_id}/approve", headers=merchant_headers
     )
     if approve_restock.status_code != 200:
         result.fail(f"approve did not succeed: {approve_restock.text}")
         return result
-    merchant.approve(restock_change.change_id, OPERATOR)
+    merchant.approve(restock_change.change_id, OPERATOR)  # see the FRAGILE note above
 
     result.narrate(f"Applying {restock_change.change_id}...")
     applied_restock = asyncio.run(merchant.apply_change(backend_session, restock_change.change_id))
@@ -210,7 +279,7 @@ def run_tour(db_path: str) -> TourResult:
     result.evidence_kinds.append(restock_evidence[0].kind)
     result.narrate(f"Applied. kernel_receipt evidence: {restock_evidence[0].model_dump()}")
 
-    changes = client.get("/merchant/changes", headers=merchant_headers).json().get("changes", [])
+    changes = http.get("/merchant/changes", headers=merchant_headers).json().get("changes", [])
     seen_ids = {item["change_id"] for item in changes}
     if not {price_change.change_id, restock_change.change_id} <= seen_ids:
         result.fail(f"GET /merchant/changes did not carry both applied changes: {changes}")
@@ -224,13 +293,21 @@ def run_tour(db_path: str) -> TourResult:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default="tour-demo.db", help="path to the store db file")
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help=(
+            "drive an already-running host at this URL over HTTP, instead of building "
+            "one in-process; --db must still name the db file that host is using"
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     print("=" * 72)
-    result = run_tour(args.db)
+    result = run_tour(args.db, base_url=args.base_url)
     print("=" * 72)
     if result.ok:
         print("Tour succeeded.")
