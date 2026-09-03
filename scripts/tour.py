@@ -21,14 +21,22 @@ Two ways to point this at an engine: ``db_path`` alone (the default) builds and 
 the FastAPI app in-process via ``TestClient`` -- the convenient path for a one-shot
 run. Passing ``base_url`` instead drives an *already-running* host over real HTTP,
 which is what a caller wanting to point the tour at a live ``uvicorn`` process (as
-``run_demo.py --tour`` will, in Task 3) needs, and it avoids ever opening a second
-``EngineStore`` handle on the same db file the running host already holds open --
-this repo has already spent three rounds discovering how badly two SQLite handles on
-one file can interact. Staging and applying a merchant change still have no HTTP
-route (only chat, which needs a model), so both modes fall back to a direct,
-short-lived ``EngineMerchant`` against ``db_path`` for exactly those two calls; in
-``base_url`` mode this is still the *only* place a second handle is opened, and only
-briefly, immediately after the HTTP calls that touch the same rows have completed.
+``run_demo.py --tour`` will, in Task 3) needs.
+
+Staging and applying a merchant change have no HTTP route (only chat, which needs a
+model), so both modes still open a direct ``EngineStore``/``EngineMerchant`` against
+``db_path`` for those two calls -- and, honestly, for the whole merchant section
+built on them: the handle is opened once, before that section starts, and stays open
+across both ``approve`` round-trips, ``products.create``, both ``apply_change``
+calls, and the final ``GET /merchant/changes``, not just for the two calls that force
+it. In ``base_url`` mode that is a second live ``EngineStore`` handle held open on the
+same db file the running host already holds open, concurrently, across several HTTP
+round-trips to that host -- the same two-handles-on-one-file shape
+``engine_backend.store.EngineStore``'s own pin exists to make safe, not a narrower
+window than that. Narrowing it to just the two calls that force it would mean
+rebuilding the store/kernel/merchant trio (and re-resolving ``backend_session``) twice
+mid-flow for no correctness gain, so this leaves the window as-is and says so
+plainly rather than describing a smaller one.
 """
 
 from __future__ import annotations
@@ -178,9 +186,15 @@ def _drive_tour(
     merchant_headers = {"X-Session-Id": merchant_session_id}
 
     # Staging and applying have no HTTP route in this host (only chat, which needs a
-    # model, and approve, which this script also uses over HTTP below) -- so this talks
-    # to the same `EngineMerchant` the host wires up, directly, against the very store
-    # file the HTTP calls above already wrote to. Nothing here is mocked or faked.
+    # model), so this talks to the same `EngineMerchant` the host wires up, directly,
+    # against the very store file the HTTP calls above already wrote to -- nothing
+    # here is mocked or faked. This handle stays open for the rest of the merchant
+    # section below (both approves, `products.create`, both applies, the final
+    # `GET /merchant/changes`), not just for the stage/apply calls that force it: in
+    # `base_url` mode that means a second live `EngineStore` on the same db file the
+    # running host already holds open, concurrently, across several HTTP round-trips
+    # to it -- the two-handles-on-one-file shape `EngineStore`'s own pin exists to
+    # make safe, held for longer than the two calls that strictly need it.
     store = EngineStore(db_path)
     kernel = KernelClient(
         store, CONFIG_DIR / "kernel-policy.json", CONFIG_DIR / "kernel-principal.json"
