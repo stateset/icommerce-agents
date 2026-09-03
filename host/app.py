@@ -25,6 +25,7 @@ from typing import Any
 
 from commerce_common.streaming import AgentEvent, to_sse
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from merchant_agent.types import (
     ChangeStatus,
@@ -118,6 +119,18 @@ def create_app(db_path: str) -> FastAPI:
     merchant_sessions: SessionRegistry[MerchantSessionState] = SessionRegistry(MerchantSessionState)
 
     app = FastAPI(title="StateSet iCommerce agents host")
+
+    # `web/storefront` (:3000) and `web/portal` (:3100) call this host from their own
+    # origin -- there is no reverse proxy or Next.js rewrite in front of either -- so a
+    # browser refuses to expose any response to their JS without this. No credentials
+    # cross this boundary (identity is the unguessable `X-Session-Id` the host mints,
+    # never a cookie), so an explicit, narrow origin list costs nothing.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:3000", "http://localhost:3100"],
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "X-Session-Id"],
+    )
 
     # -- Health -----------------------------------------------------------------
 

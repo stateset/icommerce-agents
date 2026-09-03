@@ -77,8 +77,10 @@ and `GET /merchant/changes`.
   approval guarantee), `testing.md` (what the suite covers and what it does not).
 - `tests/` — one file per module above, run with `pytest`.
 - `.github/workflows/` — CI: a Python job (ruff, pytest, the drift check, the denial
-  walkthrough) and a Node 22 job (`npm audit --audit-level=high`, then the two web
-  builds); see its own `README.md`.
+  walkthrough, the keyless tour run twice against the same db) and a Node 22 job
+  (`npm audit --audit-level=high`, the two web builds, then a headless Chromium check
+  that runs the tour against a live host and asserts the portal and storefront
+  actually render it); see its own `README.md`.
 
 ## Run it
 

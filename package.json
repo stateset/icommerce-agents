@@ -1,5 +1,8 @@
 {
   "name": "stateset-icommerce-agents-web",
   "private": true,
-  "workspaces": ["web/*", "vendor/commerce-agents/examples/web-shared"]
+  "workspaces": ["web/*", "vendor/commerce-agents/examples/web-shared"],
+  "devDependencies": {
+    "@playwright/test": "^1.55.0"
+  }
 }

@@ -51,6 +51,17 @@ jobs:
       - name: denial walkthrough
         run: python scripts/denials.py
 
+      # Keyless tour, run twice against the same db: places an order through the
+      # governed checkout.commit, shows an unapproved apply refused, and records both
+      # evidence kinds (activity_log, kernel_receipt) -- no API key, no model. Run
+      # twice because re-runnability against existing state was itself a bug once
+      # (see scripts/tour.py's docstring); this is where a regression in that would
+      # show up first, on a machine that is not the developer's.
+      - name: keyless tour proves checkout, refusal, and both evidence kinds against the real engine (twice, same db)
+        run: |
+          python scripts/tour.py --db /tmp/ci-tour.db
+          python scripts/tour.py --db /tmp/ci-tour.db
+
   web:
     runs-on: ubuntu-latest
     # This job never blocks the python job: it runs independently, in parallel, and
@@ -79,3 +90,46 @@ jobs:
 
       - name: build portal
         run: npm run build --workspace web/portal
+
+      # From here down: an actual browser, painting an actual page, against a host that
+      # actually ran the tour -- docs/testing.md used to say no automated check in this
+      # repo had done that. No API key is set, so /capabilities reports "unconfigured";
+      # that is the state the check asserts against.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install python dependencies (for the host under test)
+        run: pip install -r requirements-dev.txt
+
+      - name: install headless chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: start the host (no ANTHROPIC_API_KEY -- capabilities reports unconfigured)
+        run: |
+          DEMO_DB_PATH=/tmp/ci-web-tour.db nohup python -m uvicorn scripts.run_demo:build_app \
+            --factory --host 0.0.0.0 --port 8000 > /tmp/host.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/capabilities && exit 0
+            sleep 1
+          done
+          echo "host never came up on :8000"; cat /tmp/host.log; exit 1
+
+      - name: run the keyless tour against the live host, so there is state to render
+        run: python scripts/tour.py --db /tmp/ci-web-tour.db --base-url http://127.0.0.1:8000
+
+      - name: start the storefront and portal against the live host
+        run: |
+          nohup npm run start --workspace web/storefront > /tmp/storefront.log 2>&1 &
+          nohup npm run start --workspace web/portal > /tmp/portal.log 2>&1 &
+          for url in http://127.0.0.1:3000 http://127.0.0.1:3100; do
+            for i in $(seq 1 30); do
+              curl -sf "$url" > /dev/null && break
+              sleep 1
+            done
+          done
+
+      - name: headless check -- portal renders a sealed kernel receipt and an activity-log id, visibly distinct; storefront renders live order state
+        run: |
+          STOREFRONT_URL=http://localhost:3000 PORTAL_URL=http://localhost:3100 \
+            node scripts/pw_check.mjs

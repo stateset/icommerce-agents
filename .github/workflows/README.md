@@ -8,9 +8,13 @@
 Checks out the repo with `submodules: recursive` (`vendor/commerce-agents` is a git
 submodule), installs `requirements-dev.txt`, and runs, in order: `ruff check .`,
 `ruff format --check .`, `pytest`, `scripts/check.py` (the drift check between code
-and documentation), and `scripts/denials.py` (the three end-to-end refusals: a cart
+and documentation), `scripts/denials.py` (the three end-to-end refusals: a cart
 write blocked for lack of provenance, an apply blocked for lack of approval, and an
-over-refund the engine itself rejects inside the transaction).
+over-refund the engine itself rejects inside the transaction), and `scripts/tour.py`
+run twice against the same db (a placed order through the governed `checkout.commit`,
+an unapproved apply refused, and both evidence kinds — `activity_log` and a sealed
+`kernel_receipt`). Twice, same db, because re-runnability against existing state was
+itself a bug once; this is where a regression in that would show up first.
 
 Matrix: Python 3.12 only. `pyproject.toml` pins `requires-python = ">=3.12,<3.13"`,
 so a 3.13 job cannot install the package; the matrix stays single-version until that
@@ -38,11 +42,24 @@ bump with nothing failing.
 The Node version is a single top-level `env.NODE_VERSION` value, currently `22`,
 matching the Next 16 / React 19 the workspace builds on (Next 16 requires Node >= 20.9).
 
+After both builds, this job also installs Python 3.12 and `requirements-dev.txt`,
+starts the host with no `ANTHROPIC_API_KEY` (`/capabilities` reports `unconfigured`),
+runs `scripts/tour.py` against it over HTTP so the store has state, starts both built
+web apps against that host, and runs `scripts/pw_check.mjs` (`@playwright/test`,
+headless Chromium, no API key) to assert the portal's DOM actually holds a
+`.evidence.kernel` row and a `.evidence.log` row — visibly distinct by class and label
+text — and that the storefront's order-history panel renders live state rather than
+its unreachable-API fallback. Building this check found that the host had no CORS
+middleware, so neither web app could read a response from it in a real browser at all;
+`host/app.py` now allows `localhost:3000`/`:3100`.
+
 ## What CI does not cover
 
 No job exercises a live model turn or runs an eval suite — both need `ANTHROPIC_API_KEY`,
-and CI has none. `pytest`, `scripts/check.py`, and `scripts/denials.py` all run against
-the deterministic engine and agent layers without ever calling out to a model, so a green
-run proves the agent-layer gates, the engine's own transactional refusals, and the
-storefront/portal builds — not that a live model chooses the right tool calls. See
-`docs/testing.md` for the full account of what the suite does and does not prove.
+and CI has none. `pytest`, `scripts/check.py`, `scripts/denials.py`, and
+`scripts/tour.py` all run against the deterministic engine and agent layers without ever
+calling out to a model, so a green run proves the agent-layer gates, the engine's own
+transactional refusals, the storefront/portal builds, and (via the headless check) that
+both web apps render live engine state correctly — not that a live model chooses the
+right tool calls. See `docs/testing.md` for the full account of what the suite does and
+does not prove.
