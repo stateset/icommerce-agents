@@ -2,7 +2,7 @@
 
 `engine_backend/` is the only place `commerce-agents`' two backend interfaces
 (`StorefrontBackend`, `MerchantBackend`) meet the StateSet iCommerce engine
-(`stateset-embedded`, installed as a pinned wheel, version `1.28.5`). This file records
+(`stateset-embedded`, installed as a pinned wheel, version `1.30.0`). This file records
 what each read and write actually does, the one place the engine's Python binding is
 read around with raw SQL, and the pinned vendor
 commit `scripts/check.py` verifies against.

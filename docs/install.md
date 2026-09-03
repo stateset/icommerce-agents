@@ -1,7 +1,7 @@
 # Install
 
 Python 3.12 exactly (`requires-python = ">=3.12,<3.13"` in `pyproject.toml` — the pinned
-`stateset-embedded==1.28.5` wheel is built for 3.12). Node is needed only for `web/`.
+`stateset-embedded==1.30.0` wheel is built for 3.12). Node is needed only for `web/`.
 
 ```bash
 git clone --recurse-submodules <this repo>
