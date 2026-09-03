@@ -1,18 +1,21 @@
-"""`host/app.py` turns the free-text evidence `EngineMerchant._apply_write` records into
-a structured `evidence` field on the `change_update` event, by regex.
+"""`host/app.py` attaches a structured `evidence` field to the `change_update` event, read
+from the persisted staged-change record (`engine_backend.staging.load_evidence`) -- never
+parsed out of `guardrail_notes` prose.
 
-Nothing else guards that coupling: reword a note in `merchant.py` and the evidence
-silently disappears from the portal with every other test still green. These tests run
-both real apply paths -- the ungoverned one (activity log) and the governed one (sealed
-kernel receipt) -- and assert the host's own parser recognises what they emit.
+These tests run both real apply paths -- the ungoverned one (activity log) and the
+governed one (sealed kernel receipt) -- and assert the structured field, not note text,
+is what the host and portal see. They also pin down that no regex remains anywhere in
+that path.
 """
 
-import pytest
+import inspect
+
 from merchant_agent.types import InventoryActionItem, MerchantSessionContext, PriceUpdateItem
 from stateset_embedded import CreateProductVariantInput
 
+import host.app as host_app
 from engine_backend.merchant import EngineMerchant
-from host.app import _change_evidence
+from engine_backend.staging import load_evidence
 
 
 def session():
@@ -26,7 +29,7 @@ async def _apply(backend, change):
     return await backend.apply_change(session(), change.change_id)
 
 
-async def test_an_ungoverned_apply_produces_notes_the_host_parses_as_an_activity_log(store, kernel):
+async def test_an_ungoverned_apply_persists_structured_activity_log_evidence(store, kernel):
     backend = EngineMerchant(store, kernel)
     applied = await _apply(
         backend,
@@ -34,13 +37,13 @@ async def test_an_ungoverned_apply_produces_notes_the_host_parses_as_an_activity
             session(), [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.00)]
         ),
     )
-    evidence = _change_evidence(applied.guardrail_notes)
-    assert evidence, f"the host parsed no evidence out of {applied.guardrail_notes!r}"
-    assert [e["kind"] for e in evidence] == ["activity_log"]
-    assert evidence[0]["id"]
+    evidence = await load_evidence(store, applied.change_id)
+    assert evidence, f"no structured evidence persisted for {applied.change_id!r}"
+    assert [e.kind for e in evidence] == ["activity_log"]
+    assert evidence[0].id
 
 
-async def test_a_governed_apply_produces_notes_the_host_parses_as_a_kernel_receipt(store, kernel):
+async def test_a_governed_apply_persists_structured_kernel_receipt_evidence(store, kernel):
     store.commerce.products.create(
         name="Brand New Widget",
         description="A widget with no inventory item yet.",
@@ -54,16 +57,33 @@ async def test_a_governed_apply_produces_notes_the_host_parses_as_a_kernel_recei
             [InventoryActionItem(listing_id="WIDGET-NEW-1", action="restock", quantity=20)],
         ),
     )
-    evidence = _change_evidence(applied.guardrail_notes)
-    assert evidence, f"the host parsed no evidence out of {applied.guardrail_notes!r}"
-    assert [e["kind"] for e in evidence] == ["kernel_receipt"]
+    evidence = await load_evidence(store, applied.change_id)
+    assert evidence, f"no structured evidence persisted for {applied.change_id!r}"
+    assert [e.kind for e in evidence] == ["kernel_receipt"]
+    assert evidence[0].id
+
+
+async def test_the_host_change_update_event_carries_the_structured_field_verbatim(store, kernel):
+    backend = EngineMerchant(store, kernel)
+    applied = await _apply(
+        backend,
+        await backend.stage_price_update(
+            session(), [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.00)]
+        ),
+    )
+    from commerce_common.streaming import AgentEvent
+
+    event = AgentEvent(type="change_update", data={"change": applied.model_dump(mode="json")})
+    attached = await host_app._with_change_evidence(store, event)
+    evidence = attached.data["change"]["evidence"]
+    assert [e["kind"] for e in evidence] == ["activity_log"]
     assert evidence[0]["id"]
 
 
-@pytest.mark.parametrize(
-    "note", ["applied via direct binding write; activity log abc-123", "sealed receipt rcpt-9"]
-)
-def test_the_parser_keeps_the_whole_note_alongside_the_id(note):
-    (entry,) = _change_evidence([note])
-    assert entry["note"] == note
-    assert entry["id"] in note
+def test_no_regex_remains_anywhere_in_the_evidence_path():
+    """The old coupling was a `re.compile` pinned to `merchant.py`'s wording. Assert
+    outright that `host/app.py` no longer imports or uses `re` at all."""
+    source = inspect.getsource(host_app)
+    assert "import re" not in source
+    assert "re.compile" not in source
+    assert "re.search" not in source

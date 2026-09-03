@@ -483,9 +483,10 @@ class EngineMerchant(MerchantBackend):
 
         # The five-kind write dispatch lives in engine_backend/apply.py; see its module
         # docstring and docs/enforcement.md for the governed/ungoverned finding.
+        payload = await staging.load_change_payload(self.store, change_id)
         ctx = ApplyContext(store=self.store, kernel=self.kernel, operator=session.operator)
-        applied = await _apply_change(ctx, change)
-        await staging.save(self.store, applied)
+        applied, evidence = await _apply_change(ctx, change, payload)
+        await staging.save(self.store, applied, evidence=evidence)
         return applied
 
     async def discard_change(

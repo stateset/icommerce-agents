@@ -18,7 +18,6 @@ Every other route reads it back from ``X-Session-Id``.
 
 from __future__ import annotations
 
-import re
 import secrets
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -39,6 +38,7 @@ from engine_backend.kernel import KernelClient
 from engine_backend.merchant import EngineMerchant
 from engine_backend.seed import seed_store
 from engine_backend.staging import load as load_staged_change
+from engine_backend.staging import load_evidence
 from engine_backend.store import EngineStore
 from engine_backend.storefront import EngineStorefront
 
@@ -59,34 +59,17 @@ class CartAddRequest(BaseModel):
     quantity: int = 1
 
 
-# ``EngineMerchant._apply_write`` records one of two evidence shapes as free-text into
-# ``StagedChange.guardrail_notes``: a sealed kernel receipt id for a governed write, or an
-# activity-log id for one it only logged. That prose is for a person reading the change
-# history; the web portal must not depend on it, so the host parses it once here into a
-# structured ``evidence`` field on the ``change_update`` event -- a wording change to the
-# note breaks this regex, not a type somewhere in the browser.
-_RECEIPT_NOTE = re.compile(r"sealed receipt (\S+)")
-_ACTIVITY_LOG_NOTE = re.compile(r"activity log (\S+)")
-
-
-def _change_evidence(guardrail_notes: list[str]) -> list[dict[str, str]]:
-    entries: list[dict[str, str]] = []
-    for note in guardrail_notes:
-        receipt = _RECEIPT_NOTE.search(note)
-        if receipt:
-            entries.append({"kind": "kernel_receipt", "id": receipt.group(1), "note": note})
-            continue
-        log = _ACTIVITY_LOG_NOTE.search(note)
-        if log:
-            entries.append({"kind": "activity_log", "id": log.group(1), "note": note})
-    return entries
-
-
-def _with_change_evidence(event: AgentEvent) -> AgentEvent:
+# ``engine_backend.apply`` records one of two evidence shapes at apply time: a sealed
+# kernel receipt id for a governed write, or an activity-log id for one it only logged.
+# ``engine_backend.staging`` persists that as a structured ``Evidence`` list alongside
+# the change, keyed by ``change_id`` -- never inferred from ``guardrail_notes`` prose, so
+# a wording change to a note cannot make evidence disappear from the portal.
+async def _with_change_evidence(store: EngineStore, event: AgentEvent) -> AgentEvent:
     if event.type != "change_update":
         return event
     change = dict(event.data.get("change") or {})
-    change["evidence"] = _change_evidence(change.get("guardrail_notes") or [])
+    evidence = await load_evidence(store, change["change_id"])
+    change["evidence"] = [item.model_dump() for item in evidence]
     return AgentEvent(type=event.type, data={**event.data, "change": change})
 
 
@@ -265,7 +248,7 @@ def create_app(db_path: str) -> FastAPI:
 
         async def event_stream() -> AsyncIterator[str]:
             async for event in merchant_agent.stream_turn(chat.messages, session, chat.state):
-                yield to_sse(_with_change_evidence(event))
+                yield to_sse(await _with_change_evidence(store, event))
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 

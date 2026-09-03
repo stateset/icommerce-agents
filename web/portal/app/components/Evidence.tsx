@@ -1,9 +1,10 @@
 import type { ChangeEvidence } from "../../lib/types";
 
 /** The host attaches this structured field to every `change_update` event
- * (`host/app.py::_with_change_evidence`), parsing `guardrail_notes` server side exactly
- * once. The UI switches on `entry.kind`, never on the note text -- a wording change to
- * the note cannot silently break this distinction the way a browser-side regex would. */
+ * (`host/app.py::_with_change_evidence`), read from the persisted staged-change record
+ * (`engine_backend.staging.load_evidence`) rather than parsed from prose. The UI
+ * switches on `entry.kind`, never on the note text -- a wording change to the note
+ * cannot silently break this distinction the way a regex would. */
 export function Evidence({ entries }: { entries: ChangeEvidence[] | undefined }) {
   if (!entries || !entries.length) return null;
   return (

@@ -41,27 +41,37 @@ class ApplyContext:
     operator: str
 
 
-async def apply_change(ctx: ApplyContext, change: StagedChange) -> StagedChange:
+async def apply_change(
+    ctx: ApplyContext, change: StagedChange, payload: Any = None
+) -> tuple[StagedChange, list[staging.Evidence]]:
     """The engine write for one already-approved, already-guardrail-checked staged
-    change, and the ``APPLIED`` copy of it. The caller (``EngineMerchant.apply_change``)
-    is responsible for loading the change, checking its status and approval, and
-    persisting the result this returns."""
-    extra_notes = await _apply_write(ctx, change)
-    return change.model_copy(
+    change, and the ``APPLIED`` copy of it, alongside the structured evidence the write
+    actually produced. ``payload`` is the promotion or campaign draft the change was
+    staged from (``engine_backend.staging.load_change_payload``); every other kind
+    ignores it. The caller (``EngineMerchant.apply_change``) is responsible for loading
+    the change, checking its status and approval, and persisting both of these."""
+    results = await _apply_write(ctx, change, payload)
+    notes = [note for note, _evidence in results]
+    evidence = [item for _note, item in results]
+    updated = change.model_copy(
         update={
             "status": ChangeStatus.APPLIED,
             "applied_at": staging.datetime.now(staging.UTC),
             "applied_by": ctx.operator,
-            "guardrail_notes": [*change.guardrail_notes, *extra_notes],
+            "guardrail_notes": [*change.guardrail_notes, *notes],
         }
     )
+    return updated, evidence
 
 
-async def _apply_write(ctx: ApplyContext, change: StagedChange) -> list[str]:
-    """The platform write for one staged change. Returns extra ``guardrail_notes``
-    recording the evidence: an activity-log id for an ungoverned direct binding write,
-    or a sealed kernel receipt id for a governed command. Raises, and leaves the change
-    staged, on a failed write."""
+async def _apply_write(
+    ctx: ApplyContext, change: StagedChange, payload: Any
+) -> list[tuple[str, staging.Evidence]]:
+    """The platform write for one staged change. Each result pairs a human-readable
+    note (still appended to ``guardrail_notes``, for a person reading the change
+    history) with the structured evidence it is evidence of: an activity-log id for an
+    ungoverned direct binding write, or a sealed kernel receipt id for a governed
+    command. Raises, and leaves the change staged, on a failed write."""
     if change.kind is ChangeKind.PRICE_UPDATE:
         return await _apply_price_update(ctx, change)
     if change.kind is ChangeKind.INVENTORY_ACTION:
@@ -69,13 +79,15 @@ async def _apply_write(ctx: ApplyContext, change: StagedChange) -> list[str]:
     if change.kind is ChangeKind.LISTING_UPDATE:
         return await _apply_listing_update(ctx, change)
     if change.kind is ChangeKind.PROMOTION:
-        return await _apply_promotion(ctx, change)
+        return await _apply_promotion(ctx, change, payload)
     if change.kind is ChangeKind.CAMPAIGN:
-        return await _apply_campaign(ctx, change)
+        return await _apply_campaign(ctx, change, payload)
     raise ChangeNotApplicable(f"unknown change kind {change.kind!r}")
 
 
-def _log_apply(ctx: ApplyContext, change: StagedChange, summary: str) -> str:
+def _log_apply(
+    ctx: ApplyContext, change: StagedChange, summary: str
+) -> tuple[str, staging.Evidence]:
     """Record the apply as an activity-log entry, the evidence for an ungoverned write.
     ``activity_logs.record`` requires a real UUID for ``subject_id`` -- the engine has
     no notion of a ``chg-...`` staged-change id -- so the change is referenced by its
@@ -89,25 +101,26 @@ def _log_apply(ctx: ApplyContext, change: StagedChange, summary: str) -> str:
         actor=ctx.operator,
         metadata=json.dumps({"change_id": change.change_id}),
     )
-    return f"applied via direct binding write; activity log {entry.id}"
+    note = f"applied via direct binding write; activity log {entry.id}"
+    return note, staging.Evidence(kind="activity_log", id=entry.id, note=note)
 
 
-def _record_custom_object(
-    ctx: ApplyContext, type_handle: str, handle: str, payload_json: str
-) -> None:
+def _record_custom_object(ctx: ApplyContext, type_handle: str, handle: str, payload: Any) -> None:
     """Synchronous and unlocked, unlike ``staging``'s writes: it runs inside an apply
     that already holds the change, on the store's own ``Commerce`` handle."""
     custom_objects.put_payload(
         ctx.store.commerce,
         type_handle,
         type_handle.replace("_", " ").title(),
-        json.loads(payload_json),
+        payload,
         object_handle=handle,
     )
 
 
-async def _apply_price_update(ctx: ApplyContext, change: StagedChange) -> list[str]:
-    notes: list[str] = []
+async def _apply_price_update(
+    ctx: ApplyContext, change: StagedChange
+) -> list[tuple[str, staging.Evidence]]:
+    results: list[tuple[str, staging.Evidence]] = []
     for item in change.items:
         if item.field != "price":
             continue
@@ -117,23 +130,27 @@ async def _apply_price_update(ctx: ApplyContext, change: StagedChange) -> list[s
             "updated_at = datetime('now'), version = version + 1 WHERE sku = ?",
             (price, item.target),
         )
-        notes.append(_log_apply(ctx, change, f"set price of {item.target} to {price}"))
-    return notes
+        results.append(_log_apply(ctx, change, f"set price of {item.target} to {price}"))
+    return results
 
 
-async def _apply_inventory_action(ctx: ApplyContext, change: StagedChange) -> list[str]:
-    notes: list[str] = []
+async def _apply_inventory_action(
+    ctx: ApplyContext, change: StagedChange
+) -> list[tuple[str, staging.Evidence]]:
+    results: list[tuple[str, staging.Evidence]] = []
     for item in change.items:
         if item.field == "stock":
-            notes.append(await _apply_restock(ctx, change, item))
+            results.append(await _apply_restock(ctx, change, item))
         elif item.field == "status":
-            notes.append(await _apply_status_change(ctx, change, item))
+            results.append(await _apply_status_change(ctx, change, item))
         else:
             raise ChangeNotApplicable(f"unsupported inventory field {item.field!r}")
-    return notes
+    return results
 
 
-async def _apply_restock(ctx: ApplyContext, change: StagedChange, item: ChangeItem) -> str:
+async def _apply_restock(
+    ctx: ApplyContext, change: StagedChange, item: ChangeItem
+) -> tuple[str, staging.Evidence]:
     sku = item.target
     added = float(item.after) - float(item.before)
     stock = await ctx.store.call(lambda c: c.inventory.get_stock(sku))
@@ -161,10 +178,11 @@ async def _apply_restock(ctx: ApplyContext, change: StagedChange, item: ChangeIt
                 f"{receipt.error_code} {receipt.error_message}"
             )
         _log_apply(ctx, change, f"created inventory item {sku} via kernel command")
-        return (
+        note = (
             "governed via kernel command inventory.item.create; "
             f"sealed receipt {receipt.receipt_id}"
         )
+        return note, staging.Evidence(kind="kernel_receipt", id=receipt.receipt_id, note=note)
 
     def body(c: Commerce) -> None:
         c.inventory.adjust(sku, added, reason="restock")
@@ -173,7 +191,9 @@ async def _apply_restock(ctx: ApplyContext, change: StagedChange, item: ChangeIt
     return _log_apply(ctx, change, f"restocked {sku} by {added}")
 
 
-async def _apply_status_change(ctx: ApplyContext, change: StagedChange, item: ChangeItem) -> str:
+async def _apply_status_change(
+    ctx: ApplyContext, change: StagedChange, item: ChangeItem
+) -> tuple[str, staging.Evidence]:
     resolved = await resolve_product_and_merch(ctx.store, item.target)
     if resolved is None:
         raise ChangeNotApplicable(f"no listing with id {item.target!r}")
@@ -186,8 +206,9 @@ async def _apply_status_change(ctx: ApplyContext, change: StagedChange, item: Ch
     return _log_apply(ctx, change, f"set status of {item.target} to {item.after}")
 
 
-async def _apply_listing_update(ctx: ApplyContext, change: StagedChange) -> list[str]:
-    notes: list[str] = []
+async def _apply_listing_update(
+    ctx: ApplyContext, change: StagedChange
+) -> list[tuple[str, staging.Evidence]]:
     resolved = await resolve_product_and_merch(ctx.store, change.items[0].target)
     if resolved is None:
         raise ChangeNotApplicable(f"no listing with id {change.items[0].target!r}")
@@ -217,12 +238,12 @@ async def _apply_listing_update(ctx: ApplyContext, change: StagedChange) -> list
 
     updated_merch = merch.model_copy(update=updates)
     await write_merchandising(ctx.store, product.id, updated_merch)
-    notes.append(_log_apply(ctx, change, f"updated listing content for {change.items[0].target}"))
-    return notes
+    return [_log_apply(ctx, change, f"updated listing content for {change.items[0].target}")]
 
 
-async def _apply_promotion(ctx: ApplyContext, change: StagedChange) -> list[str]:
-    notes: list[str] = []
+async def _apply_promotion(
+    ctx: ApplyContext, change: StagedChange, payload: Any
+) -> list[tuple[str, staging.Evidence]]:
     for item in change.items:
         if item.field != "price":
             continue
@@ -231,13 +252,13 @@ async def _apply_promotion(ctx: ApplyContext, change: StagedChange) -> list[str]
             "updated_at = datetime('now'), version = version + 1 WHERE sku = ?",
             (money.exact(item.after), item.target),
         )
-    _record_custom_object(ctx, PROMOTION_TYPE, change.change_id, change.guardrail_notes[0])
-    notes.append(_log_apply(ctx, change, f"applied promotion {change.change_id}"))
-    return notes
+    _record_custom_object(ctx, PROMOTION_TYPE, change.change_id, payload)
+    return [_log_apply(ctx, change, f"applied promotion {change.change_id}")]
 
 
-async def _apply_campaign(ctx: ApplyContext, change: StagedChange) -> list[str]:
-    payload = json.loads(change.guardrail_notes[0])
+async def _apply_campaign(
+    ctx: ApplyContext, change: StagedChange, payload: Any
+) -> list[tuple[str, staging.Evidence]]:
     campaign_id = payload.get("campaign_id") or f"camp-{uuid4().hex[:8]}"
     campaign = Campaign(
         campaign_id=campaign_id,
@@ -248,5 +269,5 @@ async def _apply_campaign(ctx: ApplyContext, change: StagedChange) -> list[str]:
         starts=payload.get("starts"),
         ends=payload.get("ends"),
     )
-    _record_custom_object(ctx, CAMPAIGN_TYPE, campaign_id, campaign.model_dump_json())
+    _record_custom_object(ctx, CAMPAIGN_TYPE, campaign_id, campaign.model_dump(mode="json"))
     return [_log_apply(ctx, change, f"wrote campaign {campaign_id}")]

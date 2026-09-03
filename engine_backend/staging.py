@@ -10,7 +10,7 @@ staged change is approved -- so every function here ends at ``save``, not at a m
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from commerce_common.fencing import truncate_display
@@ -28,6 +28,7 @@ from merchant_agent.types import (
     PromotionDraft,
     StagedChange,
 )
+from pydantic import BaseModel
 from stateset_embedded import Commerce
 
 from engine_backend import money
@@ -44,27 +45,70 @@ STAGED_TYPE = "staged_change"
 STAGED_DISPLAY = "Staged change"
 
 
+class Evidence(BaseModel):
+    """What actually backed one write inside an applied change: a sealed kernel
+    receipt id for a governed command, or an activity-log id for an ungoverned direct
+    binding write. Set once, at apply time, from what happened -- never inferred from
+    ``guardrail_notes`` prose. ``note`` mirrors the human-readable line appended to
+    ``guardrail_notes`` for the same write, kept here so a reader of the structured
+    field never has to go looking for it, but nothing parses ``note`` back apart."""
+
+    kind: Literal["kernel_receipt", "activity_log"]
+    id: str
+    note: str
+
+
 def ensure_types(commerce: Commerce) -> None:
     """Create the ``staged_change`` custom object type. Idempotent."""
     ensure_payload_type(commerce, STAGED_TYPE, STAGED_DISPLAY)
 
 
-async def save(store: EngineStore, change: StagedChange) -> None:
+async def save(
+    store: EngineStore,
+    change: StagedChange,
+    *,
+    evidence: list[Evidence] = (),  # type: ignore[assignment]
+    payload: Any = None,
+) -> None:
+    """Persist ``change``, plus two things upstream's ``StagedChange`` has no room for:
+    the structured ``evidence`` an apply produced, and (for a promotion or campaign) the
+    ``payload`` draft this change was staged from. Both sit as extra keys alongside the
+    vendor model's own fields in the record this writes -- ``StagedChange.model_validate``
+    ignores unknown keys, so ``load`` below sees exactly the vendor fields back."""
+    record = change.model_dump(mode="json")
+    record["evidence"] = [item.model_dump() for item in evidence]
+    record["payload"] = payload
     await write_payload(
         store,
         STAGED_TYPE,
         STAGED_DISPLAY,
-        change.model_dump(mode="json"),
+        record,
         lock_key=f"staged_change:{change.change_id}",
         object_handle=change.change_id,
     )
 
 
 async def load(store: EngineStore, change_id: str) -> StagedChange | None:
-    payload = await read_payload(store, STAGED_TYPE, object_handle=change_id)
-    if payload is None:
+    record = await read_payload(store, STAGED_TYPE, object_handle=change_id)
+    if record is None:
         return None
-    return StagedChange.model_validate(payload)
+    return StagedChange.model_validate(record)
+
+
+async def load_evidence(store: EngineStore, change_id: str) -> list[Evidence]:
+    """The structured evidence an apply recorded for ``change_id``, or ``[]`` for a
+    change that has not been applied (or does not exist)."""
+    record = await read_payload(store, STAGED_TYPE, object_handle=change_id)
+    if record is None:
+        return []
+    return [Evidence.model_validate(item) for item in record.get("evidence") or []]
+
+
+async def load_change_payload(store: EngineStore, change_id: str) -> Any:
+    """The draft a promotion or campaign change was staged from, or ``None`` for every
+    other kind (and for an unknown change id)."""
+    record = await read_payload(store, STAGED_TYPE, object_handle=change_id)
+    return None if record is None else record.get("payload")
 
 
 async def pending(store: EngineStore) -> list[StagedChange]:
@@ -281,15 +325,11 @@ async def stage_promotion(
         raise GuardrailViolation(violations)
 
     summary = truncate_display(f"Promotion {promotion.name!r}", 200)
-    change = new_change(
-        ChangeKind.PROMOTION,
-        summary,
-        change_items,
-        operator,
-        currency="USD",
-        guardrail_notes=[promotion.model_dump_json()],
-    )
-    await save(store, change)
+    change = new_change(ChangeKind.PROMOTION, summary, change_items, operator, currency="USD")
+    # The draft goes on the record's own `payload` field, not into `guardrail_notes` --
+    # that field is guardrail prose shown to the model, not a JSON blob for apply.py to
+    # read back positionally.
+    await save(store, change, payload=promotion.model_dump(mode="json"))
     return change
 
 
@@ -334,7 +374,6 @@ async def stage_campaign(
         change_items,
         operator,
         currency="USD" if campaign.budget is not None else None,
-        guardrail_notes=[campaign.model_dump_json()],
     )
-    await save(store, change)
+    await save(store, change, payload=campaign.model_dump(mode="json"))
     return change
