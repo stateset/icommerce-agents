@@ -31,7 +31,7 @@ export function OrdersPanel({ orders }: { orders: Order[] | null }) {
             .map((order) => (
               <div className="order-card" key={order.order_id}>
                 <div className="order-card-top">
-                  <span className="order-number">{order.order_id.slice(0, 8)}</span>
+                  <span className="order-number">{order.order_number ?? order.order_id.slice(0, 8)}</span>
                   <span className={`order-status ${order.status}`}>{order.status}</span>
                 </div>
                 <div className="order-items">

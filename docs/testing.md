@@ -45,20 +45,25 @@ engine, and never a model.
 
 ## `scripts/tour.py`: a keyless end-to-end check, not a substitute for a live eval
 
-`scripts/tour.py` (`tests/test_tour.py`) drives the real routes against the real
-engine — a checkout, an unapproved apply refused, a price update applied with
-`activity_log` evidence, a restock applied with `kernel_receipt` evidence — with no
-API key and no model in the loop. It proves the routes, the engine, and the
-staging/apply/evidence pipeline work end to end from outside the process, the way a
-browser would call them. **It exercises none of what "Live run, 2026-09-03" below is
-about**: no request reaches `AsyncAnthropic`, so it says nothing about whether a model
-states checkout as staging, completes a medical referral, or confirms a write with the
-right verb. It closes the demo's keyless-first-impression gap, not the eval gap; the two
-remaining live-model findings below are exactly as open after a tour run as before one.
-That the two web apps then render this state correctly is verified by code inspection
-and by the read routes themselves returning the right data (`tests/test_web_build.py`,
-plus direct route calls against a running host); no automated check in this repo has
-watched a browser paint the result.
+`scripts/tour.py` (`tests/test_tour.py`) drives the real engine — a checkout, an
+unapproved apply refused, a price update applied with `activity_log` evidence, a
+restock applied with `kernel_receipt` evidence — with no API key and no model in the
+loop. The shopping calls (session, cart, checkout, orders) go over HTTP routes; staging
+and applying a merchant change have no route (only chat, which needs a model), so those
+calls go directly against `engine_backend.merchant.EngineMerchant`. In the default
+`db_path` mode those routes are an in-process `TestClient` — nothing is outside the
+process; only `run_demo.py --tour`'s `base_url` mode drives them from outside the
+process, the way a browser would call them. It proves the routes, the engine, and the
+staging/apply/evidence pipeline work end to end. **It exercises none of what "Live run,
+2026-09-03" below is about**: no request reaches `AsyncAnthropic`, so it says nothing
+about whether a model states checkout as staging, completes a medical referral, or
+confirms a write with the right verb. It closes the demo's keyless-first-impression
+gap, not the eval gap; the two remaining live-model findings below are exactly as open
+after a tour run as before one. That the two web apps then render this state correctly
+is verified by code inspection and by the read routes themselves returning the right
+data (plus direct route calls against a running host); `tests/test_web_build.py` only
+proves the apps build, not that they render correctly — no automated check in this repo
+has watched a browser paint the result.
 
 ## What the suite does not cover
 
@@ -92,6 +97,10 @@ $ python -m evals.run
 No ANTHROPIC_API_KEY set -- skipping the eval suite. This suite has never been run against
 a live model in this environment; set ANTHROPIC_API_KEY to exercise it.
 ```
+
+`host/anthropic_client.py` auto-loads `.env`, so on a machine with one on disk the
+unconfigured-assistant panel is otherwise unreachable locally; move `.env` aside (e.g.
+`mv .env .env.bak`) before running the host to see it, then restore the file after.
 
 That message is accurate about this machine and CI, which carry no key by default, but
 `evals/` has now been run live at least once, with a key set locally — see "Live run,

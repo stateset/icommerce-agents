@@ -203,8 +203,19 @@ def create_app(db_path: str) -> FastAPI:
 
     @app.get("/shopping/cart")
     async def shopping_cart_read(x_session_id: str | None = Header(default=None)) -> dict[str, Any]:
-        """A read: renders this session's own cart as it stands, no write involved."""
+        """A read: renders this session's own cart as it stands, no write involved.
+
+        A session that has never added anything has no cart yet -- ``get_cart`` (via
+        ``_cart_id``) would create one on first call, which is a write on a GET. Return
+        an empty cart payload directly instead, without touching the store."""
         session = _bound_shopping_context(x_session_id)
+        if storefront.session_cart_id(session.session_id) is None:
+            return {
+                "items": [],
+                "currency": "USD",
+                "subtotal_exact": None,
+                "grand_total_exact": None,
+            }
         cart = await storefront.get_cart(session)
         return await _cart_payload(session, cart)
 
@@ -213,6 +224,13 @@ def create_app(db_path: str) -> FastAPI:
         """This session's own orders, each carrying the engine's own exact total --
         never a figure recomputed from the ``float`` total on the order itself."""
         session = _bound_shopping_context(x_session_id)
+        # `storefront.get_orders` already scans and filters `c.orders.list()` down to
+        # `Order` (the role-neutral shape, no exact-decimal or order-number fields).
+        # This second scan below recovers those two engine-only fields per order; it is
+        # a second full `orders.list()` on top of that first scan, not a second query
+        # by id, because the engine has no `orders.get_many`. Cheap at demo scale; a
+        # real deployment with many orders per customer would want `get_orders` itself
+        # to carry these fields instead of a second full-table scan here.
         orders = await storefront.get_orders(session)
         binding = store.binding(session.session_id)
         engine_orders = {
@@ -227,6 +245,7 @@ def create_app(db_path: str) -> FastAPI:
             item["total_exact"] = (
                 engine_order.total_amount_exact if engine_order is not None else None
             )
+            item["order_number"] = engine_order.order_number if engine_order is not None else None
             payload.append(item)
         return {"orders": payload}
 

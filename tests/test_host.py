@@ -235,8 +235,33 @@ def test_shopping_cart_read_matches_what_was_added(tmp_path):
     assert read_back["grand_total_exact"]
 
 
+def test_shopping_cart_read_on_a_fresh_session_creates_no_cart(tmp_path):
+    """A GET is a read: a session that never called ``cart/add`` must not cause a cart
+    row to appear in the engine's own store just from being read."""
+    from engine_backend.store import EngineStore
+
+    db_path = str(tmp_path / "store.db")
+    c = TestClient(create_app(db_path))
+    headers = {"X-Session-Id": c.post("/shopping/session").json()["session_id"]}
+
+    response = c.get("/shopping/cart", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+
+    store = EngineStore(db_path)
+    assert store.commerce.carts.list() == []
+
+
+def test_shopping_cart_read_requires_a_session(tmp_path):
+    assert client(tmp_path).get("/shopping/cart").status_code == 401
+
+
 def test_shopping_orders_read_requires_a_session(tmp_path):
     assert client(tmp_path).get("/shopping/orders").status_code == 401
+
+
+def test_merchant_changes_read_requires_a_session(tmp_path):
+    assert client(tmp_path).get("/merchant/changes").status_code == 401
 
 
 def test_merchant_changes_read_excludes_discarded_changes(tmp_path):

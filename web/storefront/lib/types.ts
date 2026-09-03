@@ -74,6 +74,10 @@ export interface Order {
   /** The engine's own exact total for this order (`GET /shopping/orders`), read from
    * the matching engine order -- never recomputed from the `float` `total` above. */
   total_exact?: string | null;
+  /** The engine's own human-facing order number, read from the matching engine order.
+   * This is what the checkout response and the tour print -- `order_id` is the
+   * engine's internal id, a different value a reader cannot match to it. */
+  order_number?: string | null;
 }
 
 export interface OrdersPayload {

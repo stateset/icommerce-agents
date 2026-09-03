@@ -39,8 +39,10 @@ the engine inside the transaction, `commerce.refund.exceeds_captured`, with a re
 id. The first two protect you from the model. The third holds against anything.
 
 `python scripts/run_demo.py --web --tour` produces this contrast live, with no API key:
-it drives the checkout and both merchant applies over the real routes, and both web
-apps render the result on load from `GET /shopping/orders` and `GET /merchant/changes`.
+it drives the checkout over the real routes, and both merchant applies go through the
+same backend the host wires up — staging and applying a merchant change have no route
+without a model. Both web apps render the result on load from `GET /shopping/orders`
+and `GET /merchant/changes`.
 
 ## Layout
 
@@ -106,8 +108,11 @@ correct."
   `POST /shopping/checkout`, `GET /shopping/cart`, `GET /shopping/orders`,
   `POST /merchant/session`, `POST /merchant/chat`, `POST /merchant/changes/{id}/approve`,
   `GET /merchant/changes`, `GET /capabilities`, `GET /healthz` — `host/app.py`. The `GET`
-  routes are session-scoped reads (`GET /capabilities` excepted) behind the same 401
-  gate as every other route, and both web apps use them to render live store state.
+  routes are reads (`GET /capabilities` excepted) behind the same 401 gate as every
+  other route — `GET /shopping/cart` and `GET /merchant/changes` are session-scoped,
+  while `GET /shopping/orders` is customer-scoped, so any session bound to the seeded
+  customer sees that customer's orders — and both web apps use them to render live
+  store state.
 - The MCP tool surface — 13 shopping tools, 19 merchant tools — `mcp_servers/`, wired
   up in `docs/mcp.md`.
 - The governed kernel seam — `engine_backend/kernel.py`'s `KernelClient.execute`,

@@ -6,9 +6,11 @@ warning rather than crashing if a web app's ``package.json`` is missing.
 ``--tour`` runs ``scripts/tour.py`` against this same running host over HTTP
 (``run_tour(..., base_url=...)``), once the host answers on :8000, so the store has a
 placed order and both evidence kinds in it before you open a browser -- no API key
-needed. It targets the host's own live handle rather than opening a second
-``EngineStore`` on ``--db``'s file; see ``scripts/tour.py``'s docstring for why that
-distinction matters.
+needed. In this ``base_url`` mode the shopping calls (session, cart, checkout,
+orders) go to the running host over real HTTP instead of a second in-process
+``TestClient`` app; the merchant section still opens a second, pinned ``EngineStore``
+handle on ``--db``'s file, concurrently with the host's own -- safe because of that
+pin. See ``scripts/tour.py``'s docstring for the full shape of that distinction.
 """
 
 from __future__ import annotations
@@ -95,7 +97,9 @@ def main() -> int:
             if _wait_for_host(base_url):
                 from scripts.tour import main as tour_main
 
-                tour_main(["--db", args.db, "--base-url", base_url])
+                tour_rc = tour_main(["--db", args.db, "--base-url", base_url])
+                if tour_rc != 0:
+                    print(f"warning: --tour exited {tour_rc}")
             else:
                 print("warning: host never came up on :8000; skipping --tour")
         host_process.wait()
