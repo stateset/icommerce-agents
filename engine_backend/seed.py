@@ -27,6 +27,12 @@ def _price(value: float) -> float:
     two places -- before it ever reaches the binding, the same discipline
     ``engine_backend.merchant`` and ``engine_backend.storefront`` use for every other
     read of an engine money field.
+
+    This does not make ``price_exact`` a padded two-place string: the binding's own
+    formatter trims trailing zeros regardless of what reaches it (``219.00`` persists as
+    ``"219"``, ``62.68`` as ``"62.68"``), which is why the read side still canonicalizes
+    through :func:`money.exact` rather than comparing the raw field. See
+    ``tests/test_seed_money.py``'s module docstring for the full write-up.
     """
     return money.to_float(money.exact(value))
 
@@ -159,6 +165,15 @@ _CATALOG = [
         },
     },
     {
+        # This product exists to exercise the money seam, not the catalog: its price
+        # is the one seeded value that is deliberately not cent-exact
+        # (250.70 / 4 = 62.675), so it is the value that actually exercises
+        # `money.exact`'s ROUND_HALF_UP quantization to 62.68 -- every other seeded
+        # price is already a clean two-place literal and would round to itself either
+        # way. tests/test_seed_money.py depends on this variant to catch a regression
+        # in `_price`; removing it would silently weaken that test back to asserting
+        # nothing but binary-exact values, exactly the "luck, not discipline" this
+        # seam was added to close.
         "name": "Camp Table (Folding)",
         "description": "A packable aluminium table for a camp kitchen.",
         "variants": [
