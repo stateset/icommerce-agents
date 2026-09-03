@@ -16,4 +16,4 @@ dependencies = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["engine_backend"]
+packages = ["engine_backend", "host"]
