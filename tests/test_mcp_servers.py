@@ -45,7 +45,7 @@ async def _stage_a_price_change(store, kernel) -> str:
     return change.change_id
 
 
-async def test_apply_change_refuses_without_a_prior_host_approve(store, kernel):
+async def test_apply_change_refuses_without_out_of_band_approval(store, kernel):
     from mcp.shared.memory import create_connected_server_and_client_session
 
     from mcp_servers.merchant import build_merchant_server
