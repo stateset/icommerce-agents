@@ -124,7 +124,11 @@ def create_app(db_path: str) -> FastAPI:
     # origin -- there is no reverse proxy or Next.js rewrite in front of either -- so a
     # browser refuses to expose any response to their JS without this. No credentials
     # cross this boundary (identity is the unguessable `X-Session-Id` the host mints,
-    # never a cookie), so an explicit, narrow origin list costs nothing.
+    # never a cookie), so an explicit, narrow origin list costs nothing. These two
+    # hardcoded localhost origins are a demo convenience for this fixed local
+    # deployment, not a pattern to carry into one with real origins or authentication
+    # -- a deployed host needs its actual origin(s) configured, and `allow_credentials`
+    # reconsidered the moment identity moves off `X-Session-Id`.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:3000", "http://localhost:3100"],

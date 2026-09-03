@@ -3,6 +3,7 @@
   "private": true,
   "workspaces": ["web/*", "vendor/commerce-agents/examples/web-shared"],
   "devDependencies": {
-    "@playwright/test": "^1.55.0"
+    "@playwright/test": "^1.55.0",
+    "playwright-core": "^1.62.1"
   }
 }
