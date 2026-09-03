@@ -47,12 +47,12 @@ and keeps provenance ids stable across turns.
 | `get_order_issues` | derived from `commerce.orders.list` (age vs. `fulfillment_status`) |
 | `get_pricing_context` | `catalog.catalog_rows` + `Merchandising.unit_cost` |
 | `execute_analysis_query` / `get_analysis_schema` | a capped, `SELECT`-only query straight through `store.readonly_sql()` (see below) — a deliberate feature, not a binding gap |
-| `stage_*` / `get_pending_changes` / `discard_change` | `engine_backend/staging.py`'s `custom_objects`-backed `StagedChange` store; no live write |
-| `apply_change` | dispatches by `ChangeKind` — see the table below |
+| `stage_*` / `get_pending_changes` / `discard_change` | delegates to `engine_backend/staging.py`, which resolves the catalog rows, checks guardrails, and persists the result in its `custom_objects`-backed `StagedChange` store; no live write |
+| `apply_change` | loads, validates status/approval, re-checks guardrails, then delegates the write to `engine_backend/apply.py`'s `apply_change(ctx, change)` — see the table below |
 
-### `apply_change` × engine write × governed? × evidence
+### `apply.apply_change` × engine write × governed? × evidence
 
-One row per write `apply_change` can perform:
+One row per write `engine_backend/apply.py`'s `apply_change` can perform:
 
 | `ChangeKind` | Engine write | Governed? | Evidence |
 |---|---|---|---|
@@ -111,10 +111,11 @@ set so genuine contention waits rather than raising:
 - `products.status` (pause/activate)
 - `products.description` (listing content)
 
-`EngineMerchant._write_sql` is a one-line delegate to it. The write lives on the store,
-not on the merchant backend, because of the invariant in the next section: a direct-SQL
-write is only sound in combination with something the store owns, and keeping the two in
-one class is what stops a second write path being added that forgets.
+`engine_backend/apply.py`'s dispatch functions call it directly (`ctx.store.write_sql`).
+The write lives on the store, not on the merchant backend or its apply dispatch,
+because of the invariant in the next section: a direct-SQL write is only sound in
+combination with something the store owns, and keeping the two in one class is what
+stops a second write path being added that forgets.
 
 `scripts/check.py` scans `engine_backend/*.py` for every function containing
 `sqlite3.connect(` and fails if this file does not name it — currently `write_sql`,

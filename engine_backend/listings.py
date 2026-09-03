@@ -10,12 +10,16 @@ available on the shape for each side to pick from.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
+from merchant_agent.types import Listing
 from stateset_embedded import Product, ProductVariant
 
 from engine_backend import money
 from engine_backend.catalog import CatalogRow, Merchandising, catalog_rows, list_variants
 from engine_backend.store import EngineStore
+
+_STATUSES = {"active", "paused", "draft", "out_of_stock"}
 
 
 def title(product: Product, variant: ProductVariant, variant_count: int) -> str:
@@ -42,9 +46,7 @@ class ListingShape:
     variant_of: str | None = None
 
 
-def to_listing(
-    row: CatalogRow, variant_count: int = 1, variant_of: str | None = None
-) -> ListingShape:
+def shape(row: CatalogRow, variant_count: int = 1, variant_of: str | None = None) -> ListingShape:
     """The shape for one purchasable variant: ``id`` is the SKU."""
     stock = int(row.stock)
     return ListingShape(
@@ -61,7 +63,7 @@ def to_listing(
     )
 
 
-def family_listing(
+def family_shape(
     product: Product,
     variants: list[ProductVariant],
     merch: Merchandising,
@@ -128,3 +130,58 @@ async def resolve_family_or_variant(
         return VariantResolution(row=variant_row, variant_count=variant_count)
 
     return None
+
+
+# -- The merchant side's own type, built from the shape above -------------------------
+
+
+def _content_quality(merch: Merchandising) -> Literal["good", "needs_work", "poor"]:
+    has_description = bool(merch.long_description)
+    has_specs = bool(merch.specs)
+    if has_description and has_specs:
+        return "good"
+    if has_description or has_specs:
+        return "needs_work"
+    return "poor"
+
+
+def _status(
+    product_status: str, in_stock: bool
+) -> Literal["active", "paused", "draft", "out_of_stock"]:
+    base = product_status if product_status in _STATUSES else "active"
+    if base == "active" and not in_stock:
+        return "out_of_stock"
+    return base
+
+
+def _to_listing(listing_shape: ListingShape) -> Listing:
+    return Listing(
+        listing_id=listing_shape.id,
+        title=listing_shape.title,
+        status=_status(listing_shape.product_status, listing_shape.in_stock),
+        price=listing_shape.price,
+        stock=listing_shape.stock,
+        category=listing_shape.merch.category,
+        content_quality=_content_quality(listing_shape.merch),
+        attributes=dict(listing_shape.merch.attributes),
+        image_url=listing_shape.merch.image_url,
+        short_description=listing_shape.short_description,
+        option_values=dict(listing_shape.option_values),
+        options=dict(listing_shape.options),
+        variant_of=listing_shape.variant_of,
+    )
+
+
+def to_listing(row: CatalogRow, variant_count: int = 1, variant_of: str | None = None) -> Listing:
+    """A plain listing, or one variant of a family (``variant_of`` set)."""
+    return _to_listing(shape(row, variant_count=variant_count, variant_of=variant_of))
+
+
+def family_listing(
+    product: Product,
+    variants: list[ProductVariant],
+    merch: Merchandising,
+    rows: list[CatalogRow],
+) -> Listing:
+    """The family listing: ``listing_id`` is the engine product id."""
+    return _to_listing(family_shape(product, variants, merch, rows))

@@ -44,10 +44,10 @@ from engine_backend.listings import (
     FamilyResolution,
     ListingShape,
     VariantResolution,
-    family_listing,
+    family_shape,
     resolve_family_or_variant,
-    to_listing,
 )
+from engine_backend.listings import shape as _shape_variant
 from engine_backend.search import search as engine_search
 from engine_backend.store import EngineStore
 
@@ -91,23 +91,23 @@ def _to_order(order: EngineOrder) -> Order:
     )
 
 
-def _to_product(shape: ListingShape) -> Product:
+def _to_product(listing_shape: ListingShape) -> Product:
     return Product(
-        product_id=shape.id,
-        title=shape.title,
-        brand=shape.merch.brand,
-        price=shape.price,
-        rating=shape.merch.rating,
-        review_count=shape.merch.review_count,
-        image_url=shape.merch.image_url,
-        category=shape.merch.category,
-        labels=list(shape.merch.labels),
-        attributes=dict(shape.merch.attributes),
-        in_stock=shape.in_stock,
-        short_description=shape.short_description,
-        option_values=dict(shape.option_values),
-        options=dict(shape.options),
-        variant_of=shape.variant_of,
+        product_id=listing_shape.id,
+        title=listing_shape.title,
+        brand=listing_shape.merch.brand,
+        price=listing_shape.price,
+        rating=listing_shape.merch.rating,
+        review_count=listing_shape.merch.review_count,
+        image_url=listing_shape.merch.image_url,
+        category=listing_shape.merch.category,
+        labels=list(listing_shape.merch.labels),
+        attributes=dict(listing_shape.merch.attributes),
+        in_stock=listing_shape.in_stock,
+        short_description=listing_shape.short_description,
+        option_values=dict(listing_shape.option_values),
+        options=dict(listing_shape.options),
+        variant_of=listing_shape.variant_of,
     )
 
 
@@ -116,7 +116,7 @@ def to_product(
 ) -> Product:
     """A purchasable record for one variant: ``product_id`` is the SKU."""
     count = variant_count if variant_count is not None else 1
-    return _to_product(to_listing(row, variant_count=count, variant_of=variant_of))
+    return _to_product(_shape_variant(row, variant_count=count, variant_of=variant_of))
 
 
 def to_family(
@@ -126,7 +126,7 @@ def to_family(
     rows: list[CatalogRow],
 ) -> Product:
     """The family record: ``product_id`` is the engine product id."""
-    return _to_product(family_listing(product, variants, merch, rows))
+    return _to_product(family_shape(product, variants, merch, rows))
 
 
 class EngineStorefront(StorefrontBackend):
@@ -166,7 +166,7 @@ class EngineStorefront(StorefrontBackend):
 
         if isinstance(resolution, FamilyResolution):
             family = _to_product(
-                family_listing(
+                family_shape(
                     resolution.product, resolution.variants, resolution.merch, resolution.rows
                 )
             )

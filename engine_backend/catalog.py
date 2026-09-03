@@ -84,6 +84,26 @@ class CatalogRow:
     stock: float
 
 
+async def resolve_variant_row(store: EngineStore, sku: str) -> CatalogRow | None:
+    """The catalog row for one variant SKU, or ``None`` when no such SKU exists."""
+    rows = await catalog_rows(store)
+    return next((r for r in rows if r.variant.sku == sku), None)
+
+
+async def resolve_product_and_merch(
+    store: EngineStore, listing_id: str
+) -> tuple[Product, Merchandising] | None:
+    """``listing_id`` resolved to its product and merchandising, whether it names a
+    product family directly or one of its variant SKUs."""
+    product = await store.call(lambda c: c.products.get(listing_id))
+    if product is not None:
+        return product, await read_merchandising(store, listing_id)
+    row = await resolve_variant_row(store, listing_id)
+    if row is not None:
+        return row.product, row.merch
+    return None
+
+
 async def catalog_rows(store: EngineStore) -> list[CatalogRow]:
     """Every purchasable variant with its product, merchandising, and stock."""
     products = await store.call(lambda c: c.products.list())

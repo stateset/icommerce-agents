@@ -95,11 +95,12 @@ the engine is never reached.
 
 The installed `stateset-embedded` binding (1.28.5) exposes no mutator for variant
 price, product status, or product description — no `products.update`, no variant-price
-setter. `EngineMerchant._write_sql` writes these three fields with direct parameterized
-SQL against the store's own SQLite file instead. This was checked against the schema
-and its triggers directly, not assumed: `PRAGMA table_info` shows neither `products` nor
-`product_variants` has a trigger that maintains `updated_at` or `version`, so setting
-both by hand (as `_write_sql` does) is complete — there is nothing else on either table
+setter. `engine_backend/apply.py`'s dispatch functions write these three fields with
+direct parameterized SQL, through `EngineStore.write_sql`, against the store's own
+SQLite file instead. This was checked against the schema and its triggers directly, not
+assumed: `PRAGMA table_info` shows neither `products` nor `product_variants` has a
+trigger that maintains `updated_at` or `version`, so setting both by hand (as those
+writes do) is complete — there is nothing else on either table
 for a raw `UPDATE` to miss. `products`' `product_fts_{ai,ad,au}` triggers, which keep its
 full-text search index in sync, are schema-level rather than connection-level, so they
 fire identically for a write from this module's own connection as for one from the
