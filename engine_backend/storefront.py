@@ -40,6 +40,14 @@ from engine_backend.catalog import (
     list_variants,
     read_merchandising,
 )
+from engine_backend.listings import (
+    FamilyResolution,
+    ListingShape,
+    VariantResolution,
+    family_listing,
+    resolve_family_or_variant,
+    to_listing,
+)
 from engine_backend.search import search as engine_search
 from engine_backend.store import EngineStore
 
@@ -83,10 +91,24 @@ def _to_order(order: EngineOrder) -> Order:
     )
 
 
-def _title(product: EngineProduct, variant: ProductVariant, variant_count: int) -> str:
-    if variant_count > 1 and variant.name:
-        return f"{product.name} ({variant.name})"
-    return product.name
+def _to_product(shape: ListingShape) -> Product:
+    return Product(
+        product_id=shape.id,
+        title=shape.title,
+        brand=shape.merch.brand,
+        price=shape.price,
+        rating=shape.merch.rating,
+        review_count=shape.merch.review_count,
+        image_url=shape.merch.image_url,
+        category=shape.merch.category,
+        labels=list(shape.merch.labels),
+        attributes=dict(shape.merch.attributes),
+        in_stock=shape.in_stock,
+        short_description=shape.short_description,
+        option_values=dict(shape.option_values),
+        options=dict(shape.options),
+        variant_of=shape.variant_of,
+    )
 
 
 def to_product(
@@ -94,22 +116,7 @@ def to_product(
 ) -> Product:
     """A purchasable record for one variant: ``product_id`` is the SKU."""
     count = variant_count if variant_count is not None else 1
-    return Product(
-        product_id=row.variant.sku,
-        title=_title(row.product, row.variant, count),
-        brand=row.merch.brand,
-        price=money.to_float(row.variant.price_exact),
-        rating=row.merch.rating,
-        review_count=row.merch.review_count,
-        image_url=row.merch.image_url,
-        category=row.merch.category,
-        labels=list(row.merch.labels),
-        attributes=dict(row.merch.attributes),
-        in_stock=row.stock > 0,
-        short_description=row.product.description or None,
-        option_values=dict(row.merch.variant_options.get(row.variant.sku, {})),
-        variant_of=variant_of,
-    )
+    return _to_product(to_listing(row, variant_count=count, variant_of=variant_of))
 
 
 def to_family(
@@ -119,33 +126,7 @@ def to_family(
     rows: list[CatalogRow],
 ) -> Product:
     """The family record: ``product_id`` is the engine product id."""
-    by_sku = {row.variant.sku: row for row in rows}
-    options: dict[str, list[str]] = {name: [] for name in merch.option_names}
-    for sku in (v.sku for v in variants):
-        values = merch.variant_options.get(sku, {})
-        for name in merch.option_names:
-            value = values.get(name)
-            if value is not None and value not in options[name]:
-                options[name].append(value)
-
-    prices = [money.to_float(v.price_exact) for v in variants]
-    in_stock = any(by_sku[v.sku].stock > 0 for v in variants if v.sku in by_sku)
-
-    return Product(
-        product_id=product.id,
-        title=product.name,
-        brand=merch.brand,
-        price=min(prices) if prices else 0.0,
-        rating=merch.rating,
-        review_count=merch.review_count,
-        image_url=merch.image_url,
-        category=merch.category,
-        labels=list(merch.labels),
-        attributes=dict(merch.attributes),
-        in_stock=in_stock,
-        short_description=product.description or None,
-        options=options,
-    )
+    return _to_product(family_listing(product, variants, merch, rows))
 
 
 class EngineStorefront(StorefrontBackend):
@@ -181,35 +162,35 @@ class EngineStorefront(StorefrontBackend):
     async def get_product_details(
         self, session: ShoppingSessionContext, product_id: str
     ) -> ProductDetails | None:
-        rows = await catalog_rows(self.store)
+        resolution = await resolve_family_or_variant(self.store, product_id)
 
-        family_rows = [r for r in rows if r.product.id == product_id]
-        if family_rows:
-            product = family_rows[0].product
-            merch = family_rows[0].merch
-            variants = await list_variants(self.store, product.id)
-            family = to_family(product, variants, merch, family_rows)
+        if isinstance(resolution, FamilyResolution):
+            family = _to_product(
+                family_listing(
+                    resolution.product, resolution.variants, resolution.merch, resolution.rows
+                )
+            )
             variant_products = [
-                to_product(r, variant_count=len(family_rows), variant_of=product.id)
-                for r in family_rows
+                to_product(r, variant_count=len(resolution.rows), variant_of=resolution.product.id)
+                for r in resolution.rows
             ]
             return ProductDetails(
                 **family.model_dump(),
-                long_description=merch.long_description,
-                specs=dict(merch.specs),
+                long_description=resolution.merch.long_description,
+                specs=dict(resolution.merch.specs),
                 variants=variant_products,
             )
 
-        variant_row = next((r for r in rows if r.variant.sku == product_id), None)
-        if variant_row is not None:
-            variant_count = len([r for r in rows if r.product.id == variant_row.product.id])
+        if isinstance(resolution, VariantResolution):
             product = to_product(
-                variant_row, variant_count=variant_count, variant_of=variant_row.product.id
+                resolution.row,
+                variant_count=resolution.variant_count,
+                variant_of=resolution.row.product.id,
             )
             return ProductDetails(
                 **product.model_dump(),
-                long_description=variant_row.merch.long_description,
-                specs=dict(variant_row.merch.specs),
+                long_description=resolution.row.merch.long_description,
+                specs=dict(resolution.row.merch.specs),
                 variants=[],
             )
 

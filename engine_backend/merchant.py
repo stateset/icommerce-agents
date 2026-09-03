@@ -58,6 +58,14 @@ from engine_backend.catalog import (
     write_merchandising,
 )
 from engine_backend.kernel import KernelClient
+from engine_backend.listings import (
+    FamilyResolution,
+    ListingShape,
+    VariantResolution,
+    family_listing,
+    resolve_family_or_variant,
+)
+from engine_backend.listings import to_listing as _shape_listing
 from engine_backend.search import search as engine_search
 from engine_backend.store import EngineStore
 
@@ -81,12 +89,6 @@ Read-only tables (a single SELECT, capped at 100 rows / 8000 characters):
 """
 
 
-def _title(product: Any, variant: Any, variant_count: int) -> str:
-    if variant_count > 1 and variant.name:
-        return f"{product.name} ({variant.name})"
-    return product.name
-
-
 def _content_quality(merch: Merchandising) -> Literal["good", "needs_work", "poor"]:
     has_description = bool(merch.long_description)
     has_specs = bool(merch.specs)
@@ -106,53 +108,33 @@ def _status(
     return base
 
 
+def _to_listing(shape: ListingShape) -> Listing:
+    return Listing(
+        listing_id=shape.id,
+        title=shape.title,
+        status=_status(shape.product_status, shape.in_stock),
+        price=shape.price,
+        stock=shape.stock,
+        category=shape.merch.category,
+        content_quality=_content_quality(shape.merch),
+        attributes=dict(shape.merch.attributes),
+        image_url=shape.merch.image_url,
+        short_description=shape.short_description,
+        option_values=dict(shape.option_values),
+        options=dict(shape.options),
+        variant_of=shape.variant_of,
+    )
+
+
 def to_listing(row: CatalogRow, variant_count: int = 1, variant_of: str | None = None) -> Listing:
     """A plain listing, or one variant of a family (``variant_of`` set)."""
-    return Listing(
-        listing_id=row.variant.sku,
-        title=_title(row.product, row.variant, variant_count),
-        status=_status(row.product.status, row.stock > 0),
-        price=money.to_float(row.variant.price_exact),
-        stock=int(row.stock),
-        category=row.merch.category,
-        content_quality=_content_quality(row.merch),
-        attributes=dict(row.merch.attributes),
-        image_url=row.merch.image_url,
-        short_description=row.product.description or None,
-        option_values=dict(row.merch.variant_options.get(row.variant.sku, {})),
-        variant_of=variant_of,
-    )
+    return _to_listing(_shape_listing(row, variant_count=variant_count, variant_of=variant_of))
 
 
 def _to_family_listing(
     product: Any, variants: list[Any], merch: Merchandising, rows: list[CatalogRow]
 ) -> Listing:
-    by_sku = {row.variant.sku: row for row in rows}
-    options: dict[str, list[str]] = {name: [] for name in merch.option_names}
-    for variant in variants:
-        values = merch.variant_options.get(variant.sku, {})
-        for name in merch.option_names:
-            value = values.get(name)
-            if value is not None and value not in options[name]:
-                options[name].append(value)
-
-    prices = [money.to_float(v.price_exact) for v in variants]
-    total_stock = sum(int(by_sku[v.sku].stock) for v in variants if v.sku in by_sku)
-    any_in_stock = any(by_sku[v.sku].stock > 0 for v in variants if v.sku in by_sku)
-
-    return Listing(
-        listing_id=product.id,
-        title=product.name,
-        status=_status(product.status, any_in_stock),
-        price=min(prices) if prices else 0.0,
-        stock=total_stock,
-        category=merch.category,
-        content_quality=_content_quality(merch),
-        attributes=dict(merch.attributes),
-        image_url=merch.image_url,
-        short_description=product.description or None,
-        options=options,
-    )
+    return _to_listing(family_listing(product, variants, merch, rows))
 
 
 class EngineMerchant(MerchantBackend):
@@ -314,33 +296,31 @@ class EngineMerchant(MerchantBackend):
     async def get_listing(
         self, session: MerchantSessionContext, listing_id: str
     ) -> ListingDetails | None:
-        rows = await catalog_rows(self.store)
+        resolution = await resolve_family_or_variant(self.store, listing_id)
 
-        family_rows = [r for r in rows if r.product.id == listing_id]
-        if family_rows:
-            product = family_rows[0].product
-            merch = family_rows[0].merch
-            variants = await list_variants(self.store, product.id)
-            family = _to_family_listing(product, variants, merch, family_rows)
+        if isinstance(resolution, FamilyResolution):
+            family = _to_family_listing(
+                resolution.product, resolution.variants, resolution.merch, resolution.rows
+            )
             variant_listings = [
-                to_listing(r, variant_count=len(family_rows), variant_of=product.id)
-                for r in family_rows
+                to_listing(r, variant_count=len(resolution.rows), variant_of=resolution.product.id)
+                for r in resolution.rows
             ]
             return ListingDetails(
                 **family.model_dump(),
-                long_description=merch.long_description,
+                long_description=resolution.merch.long_description,
                 variants=variant_listings,
             )
 
-        variant_row = next((r for r in rows if r.variant.sku == listing_id), None)
-        if variant_row is not None:
-            variant_count = len([r for r in rows if r.product.id == variant_row.product.id])
+        if isinstance(resolution, VariantResolution):
             listing = to_listing(
-                variant_row, variant_count=variant_count, variant_of=variant_row.product.id
+                resolution.row,
+                variant_count=resolution.variant_count,
+                variant_of=resolution.row.product.id,
             )
             return ListingDetails(
                 **listing.model_dump(),
-                long_description=variant_row.merch.long_description,
+                long_description=resolution.row.merch.long_description,
                 variants=[],
             )
 
