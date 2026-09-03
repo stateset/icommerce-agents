@@ -101,31 +101,72 @@ and `execute_analysis_query` are named above for that reason.
 ## Direct-SQL write fallbacks
 
 The binding exposes no mutator at all for three fields — no `products.update`, no
-variant-price setter, no `products.update_status`. `EngineMerchant._write_sql` writes
-them with a direct parameterized `UPDATE` on the store's own SQLite file, serialized
-against other direct-SQL writes under one lock key (`"direct_sql"`), with
-`PRAGMA busy_timeout` set so genuine contention waits rather than raising:
+variant-price setter, no `products.update_status`. `EngineStore.write_sql` writes them
+with a direct parameterized `UPDATE` on the store's own SQLite file, serialized against
+other direct-SQL writes under one lock key (`"direct_sql"`), with `PRAGMA busy_timeout`
+set so genuine contention waits rather than raising:
 
 - `product_variants.price` (price updates, promotions) — always a two-place decimal
   string from `engine_backend/money.py`
 - `products.status` (pause/activate)
 - `products.description` (listing content)
 
-`_write_sql` is the only write path in `engine_backend/` that opens its own connection.
-`scripts/check.py` scans `engine_backend/*.py` for every function containing
-`sqlite3.connect(` and fails if `docs/mapping.md` does not name it — currently
-`_write_sql` and `readonly_sql` itself — so a second direct-SQL write path cannot be
-added silently.
+`EngineMerchant._write_sql` is a one-line delegate to it. The write lives on the store,
+not on the merchant backend, because of the invariant in the next section: a direct-SQL
+write is only sound in combination with something the store owns, and keeping the two in
+one class is what stops a second write path being added that forgets.
 
-A direct-SQL write is not free of consequence beyond the row it touches: an external
-connection that writes *while the store is being seeded* leaves this engine handle
-reading a stale snapshot of any table a later `mode=ro` reader has touched (observed
-with `stateset-embedded` 1.28.5 on a WAL store). `seed_store` therefore does no direct
-SQL at all, and the engine's own binding is the only thing that writes during seeding.
+`scripts/check.py` scans `engine_backend/*.py` for every function containing
+`sqlite3.connect(` and fails if this file does not name it — currently `write_sql`,
+`_pin_connection`, and `readonly_sql` — so a new direct-SQL path cannot appear silently.
+
+### Two SQLite libraries, one file: why the store pins a connection
+
+This process has two independent SQLite libraries open on the same database: the
+engine's own, bundled in the `stateset-embedded` Rust extension, and Python's `sqlite3`,
+which `write_sql` and `readonly_sql` use for the writes and reads the binding does not
+expose. On a WAL database they coordinate through the shared-memory WAL index, and that
+coordination is stable only while the file stays continuously open. Let the last
+connection close and the next one rebuilds the index from scratch while another
+library's handle is still caching the old one.
+
+The invariant is therefore: **the store keeps at least one connection open on the file
+at all times.** `EngineStore._pin_connection` opens one read-only connection when the
+store is constructed and never uses or closes it. This is not seeding-specific, not
+table-scoped, and does not depend on what was written — any moment at which the file
+drops to zero connections is enough, and a short-lived reader coming and going (a second
+process, a backup, a debugging query) is the ordinary way that happens.
+
+Three symptoms were observed with `stateset-embedded` 1.28.5 when nothing pinned the
+file, all of them from the same cause:
+
+- The engine's `Commerce` handle serving a pre-write price for the rest of its life
+  while the row on disk is correct. In production terms this is the serious one: the
+  host holds one `Commerce` per process and `catalog.list_variants` resolves through
+  `get_variant_by_sku`, so the *second* applied price update or promotion of a process
+  silently never reached the storefront — listings, cart lines and `subtotal_exact` all
+  kept the stale price. That breaks the rule this repo exists to demonstrate, every
+  money figure derives from an engine value, for exactly the writes that move money.
+- A `mode=ro` connection returning a row from an entirely different table.
+- `PRAGMA wal_checkpoint(TRUNCATE)` from another connection leaving the engine handle
+  raising `disk I/O error`.
+
+Measured over 60 write-then-read cycles with a short-lived reader on each cycle, the
+engine handle is correct every time with the pinned connection held and stale on all but
+the first without it, in both `wal` and `delete` journal modes. Reopening the `Commerce`
+handle after each write was tried first and is not a substitute: it costs ~50ms per
+write, it only works if the old handle is fully released *before* the new one is opened
+(a new handle opened alongside the old one inherits the same stale view), and it does
+not protect `readonly_sql`'s own reads.
+
+`tests/test_store.py::test_a_direct_sql_write_is_visible_to_the_engine_handle` is the
+regression test: it applies four successive direct-SQL price writes with an engine
+binding write between them, exactly as an apply does, and asserts the engine handle
+tracks every one. Disable the pin and it fails on the second write.
 
 This was verified against the schema and triggers directly, not assumed:
 `PRAGMA table_info` on `products` and `product_variants` shows neither table has a
-trigger that maintains `updated_at` or `version` — `_write_sql` sets both by hand, and
+trigger that maintains `updated_at` or `version` — the caller sets both by hand, and
 there is nothing else on either table for a raw `UPDATE` to miss. `products` does carry
 `product_fts_{ai,ad,au}` triggers that keep its full-text index in sync from
 `name`/`description`/`slug`; a trigger is schema-level, not connection-level, so it

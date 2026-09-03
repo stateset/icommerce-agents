@@ -799,10 +799,18 @@ class EngineMerchant(MerchantBackend):
 
     async def _write_sql(self, sql: str, params: tuple[Any, ...]) -> None:
         """A write for a field the Python binding exposes no mutator for at all
-        (``product_variants.price``, ``products.status``, ``products.description``) —
+        (``product_variants.price``, ``products.status``, ``products.description``) --
         the engine's own binding has no ``products.update`` or a variant price setter.
         This mirrors ``catalog.py``'s ``list_variants``, which reads what the binding
         does not expose; here it is a write.
+
+        The write itself, its serialization, and the engine-handle reopen that has to
+        follow it all live in :meth:`EngineStore.write_sql` -- deliberately, so that a
+        direct-SQL write cannot be performed without the reopen. Read that docstring
+        before adding another one: skipping the reopen leaves this process's engine
+        handle serving the pre-write value for the rest of its life while disk is
+        correct, which is how the second applied price change of a session used to
+        vanish from the storefront.
 
         Schema and triggers on ``products`` / ``product_variants`` were inspected
         directly (``PRAGMA table_info`` and ``sqlite_master`` triggers), not assumed:
@@ -814,27 +822,8 @@ class EngineMerchant(MerchantBackend):
         schema-level and fire for any UPDATE on the table regardless of which
         connection issues it, so a status/description write through this path still
         keeps the search index correct. ``product_variants`` has no trigger at all.
-
-        This opens its own connection and serializes only against other direct-SQL
-        writes from this class (the ``"direct_sql"`` lock key) — it does not serialize
-        against a concurrent binding write from ``self.store.write``/``self.store.call``
-        on the same row (e.g. ``_apply_restock``'s ``inventory.adjust`` under
-        ``f"stock:{sku}"``), since those go through a different connection entirely.
-        ``busy_timeout`` makes that contention wait and retry rather than raise
-        ``sqlite3.OperationalError: database is locked``.
         """
-        import sqlite3
-
-        def body() -> None:
-            connection = sqlite3.connect(self.store.db_path, timeout=30)
-            try:
-                connection.execute("PRAGMA busy_timeout = 30000")
-                connection.execute(sql, params)
-                connection.commit()
-            finally:
-                connection.close()
-
-        await self.store.write("direct_sql", lambda _c: body())
+        await self.store.write_sql(sql, params)
 
     def _log_apply(self, change: StagedChange, operator: str, summary: str) -> str:
         """Record the apply as an activity-log entry, the evidence for an ungoverned

@@ -1,6 +1,8 @@
 import asyncio
+import sqlite3
 import threading
 import time
+from uuid import uuid4
 
 import pytest
 
@@ -64,3 +66,64 @@ def test_binding_is_server_held(store):
 def test_readonly_sql_refuses_memory(store):
     with pytest.raises(RuntimeError):
         store.readonly_sql()
+
+
+async def test_a_direct_sql_write_is_visible_to_the_engine_handle(tmp_path):
+    """`write_sql` is only sound together with the connection `EngineStore` pins for its
+    own lifetime: two SQLite libraries are open on this file (the engine's, bundled in
+    the Rust extension, and Python's), and they stay coherent only while the file never
+    drops to zero connections.
+
+    Disable the pin and this fails on the second iteration: `commerce` keeps serving the
+    first price for the rest of its life while the row on disk is correct. That is the
+    bug in production terms -- the host holds one `Commerce`, `catalog.list_variants`
+    resolves through `get_variant_by_sku`, so the second applied price change of a
+    process would never reach listings, cart lines or `subtotal_exact`.
+
+    `readonly_sql()` is deliberately never called here. It happens to hold a connection
+    open too, which is what masked this for so long; the point of the pin is that the
+    guarantee no longer depends on some other read having happened first.
+    """
+    from engine_backend.seed import seed_store
+    from engine_backend.store import EngineStore
+
+    store = EngineStore(str(tmp_path / "store.db"))
+    seed_store(store.commerce)
+
+    def disk_price():
+        # A short-lived reader -- a second process, a backup, a debugging query -- left to
+        # be collected rather than closed by hand, which is the ordinary case. One of
+        # these coming and going is enough to desynchronise the handles when nothing else
+        # holds the file open.
+        return (
+            sqlite3.connect(f"file:{store.db_path}?mode=ro", uri=True)
+            .execute("SELECT price FROM product_variants WHERE sku = 'TENT-RIDGE-TAN'")
+            .fetchone()[0]
+        )
+
+    for price in ("199.00", "189.00", "179.00", "169.00"):
+        await store.write_sql(
+            "UPDATE product_variants SET price = ?, updated_at = datetime('now'), "
+            "version = version + 1 WHERE sku = ?",
+            (price, "TENT-RIDGE-TAN"),
+        )
+        # An engine binding write between the direct-SQL writes, exactly as an apply does
+        # (`_write_sql` then `_log_apply`'s activity_logs.record).
+        store.commerce.activity_logs.record(
+            subject_type="staged_change",
+            subject_id=str(uuid4()),
+            action="apply",
+            summary=f"set price to {price}",
+            actor_kind="user",
+            actor="user:acme-operator",
+            metadata="{}",
+        )
+        assert disk_price() == price, "the row on disk is wrong"
+        variant = store.commerce.products.get_variant_by_sku("TENT-RIDGE-TAN")
+        assert variant.price_exact == price, "the engine handle is serving a stale price"
+
+
+def test_the_store_pins_a_connection_for_its_own_lifetime(tmp_path):
+    store = EngineStore(str(tmp_path / "store.db"))
+    assert store._pin is not None
+    assert EngineStore(":memory:")._pin is None

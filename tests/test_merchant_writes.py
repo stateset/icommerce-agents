@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 import pytest
 from merchant_agent.types import ChangeStatus, MerchantSessionContext, PriceUpdateItem
@@ -252,3 +253,56 @@ async def test_a_promotion_over_the_guardrail_cap_is_refused(store, kernel):
         )
     # Untouched: still exactly what the engine's own seeding write put there.
     assert store.commerce.products.get_variant_by_sku("TENT-RIDGE-GRN").price == 219.00
+
+
+async def test_two_successive_applies_both_reach_the_engine_handle(store, kernel):
+    """The regression this exists to catch: a direct-SQL write is not reliably visible to
+    the `Commerce` handle this process already holds, so the *second* applied price change
+    silently never reached the storefront -- listings, cart lines and `subtotal_exact` kept
+    the stale price while the row on disk was correct. The host holds one `Commerce` per
+    process and `catalog.list_variants` resolves through `get_variant_by_sku`, so this is
+    the path every shopper read takes.
+
+    The transient read-only connection in `_disk_price` is not scene-setting: any other
+    connection opening and closing on the file is enough to trigger the incoherence, and a
+    second reader, a backup, or a worker thread's collected read-only connection all do it.
+    `EngineStore.write_sql` is what makes it impossible to skip the handle reopen that
+    fixes it; without that reopen this test fails on the second iteration.
+
+    Each price is asserted three ways: on disk, on the engine handle, and through the
+    storefront the shopper actually sees.
+    """
+    from shopping_agent.types import ShoppingSessionContext
+
+    from engine_backend import money
+    from engine_backend.storefront import EngineStorefront
+
+    def _disk_price(sku):
+        connection = sqlite3.connect(f"file:{store.db_path}?mode=ro", uri=True)
+        try:
+            return connection.execute(
+                "SELECT price FROM product_variants WHERE sku = ?", (sku,)
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+    backend = EngineMerchant(store, kernel)
+    storefront = EngineStorefront(store)
+    customer = store.commerce.customers.get_by_email("rowan@example.invalid")
+    store.bind("shop-1", customer.id, "customer")
+    shopper = ShoppingSessionContext(session_id="shop-1", user_id=customer.id)
+
+    for new_price in (199.00, 189.00, 179.00):
+        change = await backend.stage_price_update(
+            session(), [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=new_price)]
+        )
+        backend.approve(change.change_id, "user:acme-operator")
+        await backend.apply_change(session(), change.change_id)
+
+        expected = money.exact(new_price)
+        assert _disk_price("TENT-RIDGE-TAN") == expected, "the row on disk is wrong"
+        variant = store.commerce.products.get_variant_by_sku("TENT-RIDGE-TAN")
+        assert variant.price_exact == expected, "the engine handle is serving a stale price"
+        details = await storefront.get_product_details(shopper, "TENT-RIDGE-TAN")
+        assert details is not None
+        assert details.price == money.to_float(expected), "the storefront is serving a stale price"
