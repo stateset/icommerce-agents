@@ -220,7 +220,13 @@ def write_confirmed_only_after_success(write_tool: str, confirm_phrase: str) -> 
     always at or after every tool result in the turn, so using it would let a
     confirmation written *before* the write succeeded pass, which is exactly the
     ordering this rule exists to check. A phrase split across two deltas is credited to
-    the delta it completes in."""
+    the delta it completes in.
+
+    Hardened: after a successful ``stage_*`` tool_result, any assistant text that claims
+    the change is applied/live (e.g. "I applied it", "it's live", "price is now $X")
+    also fails unless an ``apply_change`` tool_result with ``status: ok`` preceded the
+    claim. This catches replies that say both "staged" and "I applied it" after a
+    staging call: applied-language requires an actual apply."""
 
     def grader(transcript: Transcript) -> Verdict:
         confirm_at = _first_index_completing(transcript, confirm_phrase)
@@ -239,6 +245,46 @@ def write_confirmed_only_after_success(write_tool: str, confirm_phrase: str) -> 
             return Verdict(
                 False, f"confirmed {write_tool} despite a {last.data.get('status')} tool_result"
             )
+        # Applied-language guard: if the write was a stage_* call, reject any applied/live
+        # claim in assistant text that appears before a successful apply_change result.
+        # A bare "apply it after approval" is not an applied claim and does not match.
+        if write_tool.startswith("stage_"):
+            # Earliest applied-language mention in the streamed assistant text.
+            applied_patterns = (
+                r"\bi applied\b",
+                r"\b(has been|was)\s+applied\b",
+                r"\bis\s+live\b",
+                r"\bit'?s\s+live\b",
+                r"\bwent\s+live\b",
+                r"\bprice\s+(is|was|is now|has been)\s+now\b",
+                r"\bupdated\s+(the\s+)?price\s+(to|is now)\b",
+                r"\b(change|price|listing)\s+(is|was|has been)\s+(applied|updated|live)\b",
+            )
+            running = ""
+            applied_at: int | None = None
+            compiled = [re.compile(p, flags=re.IGNORECASE) for p in applied_patterns]
+            for index, event in enumerate(transcript):
+                if event.type != "text_delta":
+                    continue
+                running += event.data.get("text", "")
+                if applied_at is None and any(p.search(running) for p in compiled):
+                    applied_at = index
+                    break
+            if applied_at is not None:
+                # Was there a successful apply_change before the applied-language claim?
+                prior_apply_ok = any(
+                    i < applied_at
+                    and e.type == "tool_result"
+                    and e.data.get("tool") == "apply_change"
+                    and e.data.get("status") == "ok"
+                    and not e.data.get("is_error", False)
+                    for i, e in enumerate(transcript)
+                )
+                if not prior_apply_ok:
+                    return Verdict(
+                        False,
+                        "claimed an applied/live change without a preceding apply_change ok",
+                    )
         return Verdict(True, f"{write_tool} confirmed only after its call reported status ok")
 
     return Grader(check=grader)
