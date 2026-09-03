@@ -23,11 +23,23 @@ export interface CartItem {
   quantity: number;
   image_url?: string | null;
   option_values?: Record<string, string>;
+  /** The engine's exact decimal line total for this item (`POST /shopping/cart/add`).
+   * Given by the host -- never recomputed here from `price * quantity`. */
+  total_exact?: string | null;
+  /** A `cart_update` chat event's own server-computed line total (vendor's
+   * `cart_payload`); also given, not client arithmetic, but rounded rather than exact. */
+  line_total?: number;
 }
 
 export interface CartPayload {
   items: CartItem[];
   currency: string;
+  /** The engine's exact decimal subtotal, given by the host. */
+  subtotal_exact?: string | null;
+  grand_total_exact?: string | null;
+  /** A `cart_update` chat event's own server-computed subtotal; given, not computed
+   * here, but rounded rather than exact. */
+  subtotal?: number;
 }
 
 export interface CheckoutResponse {

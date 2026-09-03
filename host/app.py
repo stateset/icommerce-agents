@@ -18,12 +18,13 @@ Every other route reads it back from ``X-Session-Id``.
 
 from __future__ import annotations
 
+import re
 import secrets
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from commerce_common.streaming import to_sse
+from commerce_common.streaming import AgentEvent, to_sse
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from merchant_agent.types import MerchantSessionContext, MerchantSessionState
@@ -56,6 +57,37 @@ class ChatTurnRequest(BaseModel):
 class CartAddRequest(BaseModel):
     product_id: str
     quantity: int = 1
+
+
+# ``EngineMerchant._apply_write`` records one of two evidence shapes as free-text into
+# ``StagedChange.guardrail_notes``: a sealed kernel receipt id for a governed write, or an
+# activity-log id for one it only logged. That prose is for a person reading the change
+# history; the web portal must not depend on it, so the host parses it once here into a
+# structured ``evidence`` field on the ``change_update`` event -- a wording change to the
+# note breaks this regex, not a type somewhere in the browser.
+_RECEIPT_NOTE = re.compile(r"sealed receipt (\S+)")
+_ACTIVITY_LOG_NOTE = re.compile(r"activity log (\S+)")
+
+
+def _change_evidence(guardrail_notes: list[str]) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    for note in guardrail_notes:
+        receipt = _RECEIPT_NOTE.search(note)
+        if receipt:
+            entries.append({"kind": "kernel_receipt", "id": receipt.group(1), "note": note})
+            continue
+        log = _ACTIVITY_LOG_NOTE.search(note)
+        if log:
+            entries.append({"kind": "activity_log", "id": log.group(1), "note": note})
+    return entries
+
+
+def _with_change_evidence(event: AgentEvent) -> AgentEvent:
+    if event.type != "change_update":
+        return event
+    change = dict(event.data.get("change") or {})
+    change["evidence"] = _change_evidence(change.get("guardrail_notes") or [])
+    return AgentEvent(type=event.type, data={**event.data, "change": change})
 
 
 def _session_id(x_session_id: str | None) -> str:
@@ -153,7 +185,15 @@ def create_app(db_path: str) -> FastAPI:
     ) -> dict[str, Any]:
         session = _bound_shopping_context(x_session_id)
         cart = await storefront.add_to_cart(session, request.product_id, request.quantity)
-        return cart.model_dump(mode="json")
+        payload = cart.model_dump(mode="json")
+        # The engine's own exact decimal totals, not a figure recomputed from the
+        # ``float`` prices above: the browser displays these as given, never multiplies.
+        exact = await storefront.cart_exact_totals(session)
+        for item in payload["items"]:
+            item["total_exact"] = exact["line_totals_exact"].get(item["product_id"])
+        payload["subtotal_exact"] = exact["subtotal_exact"]
+        payload["grand_total_exact"] = exact["grand_total_exact"]
+        return payload
 
     @app.post("/shopping/checkout")
     async def shopping_checkout(x_session_id: str | None = Header(default=None)) -> dict[str, Any]:
@@ -223,7 +263,7 @@ def create_app(db_path: str) -> FastAPI:
 
         async def event_stream() -> AsyncIterator[str]:
             async for event in merchant_agent.stream_turn(chat.messages, session, chat.state):
-                yield to_sse(event)
+                yield to_sse(_with_change_evidence(event))
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 

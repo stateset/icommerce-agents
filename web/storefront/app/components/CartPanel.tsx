@@ -4,8 +4,15 @@ import { useState } from "react";
 import { checkout } from "../../lib/api";
 import type { CartPayload, CheckoutResponse } from "../../lib/types";
 
-function money(value: number, currency = "USD"): string {
-  return new Intl.NumberFormat("en-US", { style: "currency", currency }).format(value);
+/** Formats one amount the host already gave us -- a number or an exact decimal string
+ * -- for display. Never sums or multiplies: every total on this panel comes from the
+ * engine (`subtotal_exact`/`grand_total_exact`/`total_exact` on `/shopping/cart/add`, or
+ * the rounded `subtotal`/`line_total` a `cart_update` chat event carries). */
+function displayAmount(value: number | string | null | undefined, currency = "USD"): string | null {
+  if (value === null || value === undefined) return null;
+  const amount = typeof value === "string" ? Number(value) : value;
+  if (Number.isNaN(amount)) return null;
+  return new Intl.NumberFormat("en-US", { style: "currency", currency }).format(amount);
 }
 
 export function CartPanel({ cart, busy }: { cart: CartPayload | null; busy: boolean }) {
@@ -16,8 +23,8 @@ export function CartPanel({ cart, busy }: { cart: CartPayload | null; busy: bool
 
   const items = cart?.items ?? [];
   const count = items.reduce((sum, item) => sum + item.quantity, 0);
-  const subtotal = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
   const currency = cart?.currency ?? "USD";
+  const subtotal = displayAmount(cart?.subtotal_exact ?? cart?.subtotal ?? null, currency);
 
   async function placeOrder() {
     setPlacing(true);
@@ -53,22 +60,27 @@ export function CartPanel({ cart, busy }: { cart: CartPayload | null; busy: bool
         </div>
       ) : (
         <div className="cart-items">
-          {items.map((item) => (
-            <div className="cart-item" key={item.product_id}>
-              <div>
-                <div className="title">{item.title}</div>
-                <div className="meta">Qty {item.quantity}</div>
+          {items.map((item) => {
+            const lineTotal = displayAmount(item.total_exact ?? item.line_total ?? null, currency);
+            return (
+              <div className="cart-item" key={item.product_id}>
+                <div>
+                  <div className="title">{item.title}</div>
+                  <div className="meta">Qty {item.quantity}</div>
+                </div>
+                <div>{lineTotal ?? "—"}</div>
               </div>
-              <div>{money(item.price * item.quantity, currency)}</div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
       <div className="cart-footer">
-        <div className="subtotal-row">
-          <span>Subtotal</span>
-          <span>{money(subtotal, currency)}</span>
-        </div>
+        {subtotal !== null ? (
+          <div className="subtotal-row">
+            <span>Subtotal</span>
+            <span>{subtotal}</span>
+          </div>
+        ) : null}
         <button
           type="button"
           className="place-order-btn"

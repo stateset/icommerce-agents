@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from shopping_agent.backend import StorefrontBackend
 from shopping_agent.types import (
@@ -267,6 +268,22 @@ class EngineStorefront(StorefrontBackend):
     async def get_cart(self, session: ShoppingSessionContext) -> Cart:
         cart_id = await self._cart_id(session)
         return await self._to_cart(cart_id)
+
+    async def cart_exact_totals(self, session: ShoppingSessionContext) -> dict[str, Any]:
+        """Host-only, not part of :class:`StorefrontBackend`: the engine's own exact
+        decimal totals for this cart, so a host route can hand the browser a figure the
+        engine vouched for instead of one recomputed from ``float`` prices. Keyed by
+        ``product_id`` (the engine's SKU, matching :meth:`_to_cart`'s cart items) rather
+        than returned as a ``Cart``, since ``shopping_agent.types.Cart`` has no field for
+        it."""
+        cart_id = await self._cart_id(session)
+        engine_cart = await self.store.call(lambda c: c.carts.get(cart_id))
+        items = await self.store.call(lambda c: c.carts.get_items(cart_id))
+        return {
+            "subtotal_exact": engine_cart.subtotal_exact if engine_cart else None,
+            "grand_total_exact": engine_cart.grand_total_exact if engine_cart else None,
+            "line_totals_exact": {item.sku: item.total_exact for item in items},
+        }
 
     async def add_to_cart(
         self, session: ShoppingSessionContext, product_id: str, quantity: int

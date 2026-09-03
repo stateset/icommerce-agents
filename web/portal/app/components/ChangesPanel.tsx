@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { approveChange } from "../../lib/api";
 import type { StagedChange } from "../../lib/types";
-import { Evidence, parseEvidence } from "./Evidence";
+import { Evidence } from "./Evidence";
 
 function formatValue(value: unknown): string {
   if (value === null || value === undefined) return "--";
@@ -38,7 +38,6 @@ export function ChangesPanel({ changes }: { changes: Record<string, StagedChange
       ) : (
         <div className="changes-list">
           {list.map((change) => {
-            const evidence = parseEvidence(change.guardrail_notes ?? []);
             const approved = approvedIds.has(change.change_id);
             return (
               <div className="change-card" key={change.change_id}>
@@ -76,7 +75,7 @@ export function ChangesPanel({ changes }: { changes: Record<string, StagedChange
                     Ask the assistant to apply {change.change_id} to complete the write.
                   </p>
                 ) : null}
-                {change.status === "applied" ? <Evidence entries={evidence} /> : null}
+                {change.status === "applied" ? <Evidence entries={change.evidence} /> : null}
               </div>
             );
           })}
