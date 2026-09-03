@@ -87,7 +87,9 @@ python -m evals.run                   # the eval suite; needs ANTHROPIC_API_KEY,
 `web/storefront` and `web/portal` are Next.js 16 / React 19 and need **Node >= 20.9**
 (`nvm use 22`). A live chat turn (`/shopping/chat`, `/merchant/chat`, either web app,
 `smoke_chat.py`, or `evals/`) needs `ANTHROPIC_API_KEY` in the environment; everything
-else, including `denials.py` and the full test suite, does not. `docs/testing.md` is
+else, including `denials.py` and the full test suite, does not. An identity-linked key
+also needs `ANTHROPIC_WORKSPACE_ID` set — without it the request fails with a 400 naming
+the `anthropic-workspace-id` header; an unlinked key ignores the variable. `docs/testing.md` is
 the honest account of what the test suite proves and what it does not — read it before
 trusting a green CI run to mean more than "the code, not the agent's behavior, is
 correct."

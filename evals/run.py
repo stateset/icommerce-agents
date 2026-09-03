@@ -113,9 +113,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    from anthropic import AsyncAnthropic
+    from host.anthropic_client import build_anthropic_client
 
-    client = AsyncAnthropic()
+    client = build_anthropic_client()
     results = run(CASES, client)
     failures = [r for r in results if not r.passed]
     for result in results:

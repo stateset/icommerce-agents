@@ -51,4 +51,6 @@ python scripts/denials.py
 ```
 
 Running the host for a live chat turn does need
-`ANTHROPIC_API_KEY` set in the environment.
+`ANTHROPIC_API_KEY` set in the environment. An identity-linked key also needs
+`ANTHROPIC_WORKSPACE_ID` set — without it, a request with such a key fails with a 400
+naming the `anthropic-workspace-id` header; an unlinked key ignores the variable.

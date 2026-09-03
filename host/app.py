@@ -42,6 +42,7 @@ from engine_backend.staging import load_evidence
 from engine_backend.store import EngineStore
 from engine_backend.storefront import EngineStorefront
 
+from .anthropic_client import build_anthropic_client
 from .sessions import SessionRegistry
 
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
@@ -99,8 +100,13 @@ def create_app(db_path: str) -> FastAPI:
     )
     merchant = EngineMerchant(store, kernel)
 
-    shopping_agent = ShoppingAgent(backend=storefront, skills_dir=SKILLS_DIR("shopping"))
-    merchant_agent = MerchantAgent(backend=merchant, skills_dir=SKILLS_DIR("merchant"))
+    anthropic_client = build_anthropic_client()
+    shopping_agent = ShoppingAgent(
+        backend=storefront, skills_dir=SKILLS_DIR("shopping"), client=anthropic_client
+    )
+    merchant_agent = MerchantAgent(
+        backend=merchant, skills_dir=SKILLS_DIR("merchant"), client=anthropic_client
+    )
 
     shopping_sessions: SessionRegistry[ShoppingSessionState] = SessionRegistry(ShoppingSessionState)
     merchant_sessions: SessionRegistry[MerchantSessionState] = SessionRegistry(MerchantSessionState)
