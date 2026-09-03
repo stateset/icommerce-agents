@@ -178,6 +178,7 @@ class EngineStorefront(StorefrontBackend):
                 **family.model_dump(),
                 long_description=resolution.merch.long_description,
                 specs=dict(resolution.merch.specs),
+                review_highlights=list(resolution.merch.review_highlights),
                 variants=variant_products,
             )
 
@@ -191,6 +192,7 @@ class EngineStorefront(StorefrontBackend):
                 **product.model_dump(),
                 long_description=resolution.row.merch.long_description,
                 specs=dict(resolution.row.merch.specs),
+                review_highlights=list(resolution.row.merch.review_highlights),
                 variants=[],
             )
 

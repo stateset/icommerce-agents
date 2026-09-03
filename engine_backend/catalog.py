@@ -1,7 +1,7 @@
 """What the engine's catalog does not model, and the one read its binding does not expose.
 
-Merchandising fields (brand, category, imagery, ratings, option values, unit cost) live in
-one custom object per product, owned by the product. Variants are read with a single
+Merchandising fields (brand, category, imagery, ratings, review text, option values, unit
+cost) live in one custom object per product, owned by the product. Variants are read with a single
 parameterized SELECT on the read-only connection, because Commerce::get_variants exists in
 the Rust crate but is not bound in Python 1.28.5. docs/mapping.md lists that read.
 """
@@ -25,6 +25,11 @@ class Merchandising(BaseModel):
     image_url: str | None = None
     rating: float | None = None
     review_count: int | None = None
+    # Customer review text. The engine has no review domain, so this is the only
+    # third-party text in this deployment's catalog, and it is what makes the fencing
+    # rule demonstrable here: it reaches the model inside ``STOREFRONT_FENCE`` as
+    # ``ProductDetails.review_highlights``, quoted material rather than instructions.
+    review_highlights: list[str] = Field(default_factory=list)
     labels: list[str] = Field(default_factory=list)
     attributes: dict[str, str] = Field(default_factory=dict)
     option_names: list[str] = Field(default_factory=list)
