@@ -1,7 +1,8 @@
 """``MerchantBackend`` over the engine: analytics, catalog and order reads; staging
 (``stage_*`` / ``get_pending_changes`` / ``discard_change``) delegates to
-``engine_backend.staging``, and applying (``apply_change``) delegates to
-``engine_backend.apply`` -- the only place this package mutates live state.
+``engine_backend.staging``, applying (``apply_change``) delegates to
+``engine_backend.apply`` -- the only place this package mutates live state -- and the
+capped read-only ``SELECT`` surface delegates to ``engine_backend.analysis``.
 
 Money mirrors ``storefront.py`` and goes through ``engine_backend.money``: a figure
 already computed by ``commerce.analytics`` is a plain float returned as-is; a figure
@@ -42,7 +43,7 @@ from merchant_agent.types import (
 from shopping_agent.types import SearchFilters
 from stateset_embedded import Commerce
 
-from engine_backend import custom_objects, money, staging
+from engine_backend import analysis, custom_objects, money, staging
 from engine_backend.apply import CAMPAIGN_TYPE, ApplyContext
 from engine_backend.apply import apply_change as _apply_change
 from engine_backend.catalog import CatalogRow, catalog_rows, list_variants
@@ -56,21 +57,6 @@ from engine_backend.listings import (
 )
 from engine_backend.search import search as engine_search
 from engine_backend.store import EngineStore
-
-_ANALYSIS_ROW_CAP = 100
-_ANALYSIS_CHAR_CAP = 8000
-
-_ANALYSIS_SCHEMA = """\
-Read-only tables (a single SELECT, capped at 100 rows / 8000 characters):
-- orders(id, order_number, customer_id, status, total_amount, currency,
-  payment_status, fulfillment_status, tracking_number, created_at, updated_at)
-- order_items(id, order_id, product_id, variant_id, sku, name, quantity,
-  unit_price, discount, tax_amount, total)
-- products(id, name, slug, description, status, created_at, updated_at)
-- product_variants(id, product_id, sku, name, price)
-- customers(id, email, first_name, last_name, created_at)
-- inventory_items(sku, name, quantity_on_hand, quantity_allocated, reorder_point)
-"""
 
 
 class EngineMerchant(MerchantBackend):
@@ -365,49 +351,10 @@ class EngineMerchant(MerchantBackend):
     async def execute_analysis_query(
         self, session: MerchantSessionContext, sql: str
     ) -> AnalysisTable | None:
-        statement = sql.strip()
-        if not statement:
-            raise ValueError("empty query")
-        if ";" in statement.rstrip(";"):
-            raise ValueError("only a single statement is allowed")
-        first_word = statement.split(None, 1)[0].lower() if statement else ""
-        if first_word != "select":
-            raise ValueError("only SELECT statements are allowed")
-
-        # A read, off the loop via ``store.call`` -- like ``catalog.list_variants``, the
-        # other caller of ``readonly_sql``, this runs on a worker thread so the
-        # thread-local connection it opens is never touched from the event-loop thread.
-        def body(_c: Any) -> AnalysisTable:
-            connection = self.store.readonly_sql()
-            cursor = connection.execute(statement.rstrip(";"))
-            columns = [d[0] for d in cursor.description] if cursor.description else []
-            fetched = cursor.fetchmany(_ANALYSIS_ROW_CAP + 1)
-            truncated = len(fetched) > _ANALYSIS_ROW_CAP
-            fetched = fetched[:_ANALYSIS_ROW_CAP]
-
-            rows: list[list[Any]] = []
-            chars = 0
-            for record in fetched:
-                values = list(record)
-                row_chars = sum(len(str(v)) for v in values)
-                if chars + row_chars > _ANALYSIS_CHAR_CAP:
-                    truncated = True
-                    break
-                chars += row_chars
-                rows.append(values)
-
-            return AnalysisTable(
-                columns=columns,
-                rows=rows,
-                row_count=len(rows),
-                truncated=truncated,
-                note="results are capped at 100 rows and 8000 characters" if truncated else None,
-            )
-
-        return await self.store.call(body)
+        return await analysis.run_query(self.store, sql)
 
     async def get_analysis_schema(self, session: MerchantSessionContext) -> str | None:
-        return _ANALYSIS_SCHEMA
+        return analysis.SCHEMA
 
     # -- Merchant context ----------------------------------------------------------
 

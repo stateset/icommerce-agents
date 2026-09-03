@@ -12,6 +12,10 @@ Four checks:
 4. Every function in `engine_backend/` that opens its own connection with
    `sqlite3.connect(` -- a direct-SQL *write* path, the more dangerous category, since
    it bypasses the binding's own validation entirely -- is named there too.
+5. Every module in `engine_backend/` is named in `docs/mapping.md` or `README.md`. This
+   is check 3's drift class one level up: a module added without a line about it
+   anywhere is how `custom_objects.py` and `listings.py` reached a release candidate
+   undocumented.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MAPPING = ROOT / "docs" / "mapping.md"
+README = ROOT / "README.md"
 ENGINE_BACKEND = ROOT / "engine_backend"
 
 SUBMODULE_COMMIT_RE = re.compile(r"submodule-commit:\s*([0-9a-f]{40})")
@@ -141,11 +146,35 @@ def check_sql_paths_documented() -> list[str]:
     return problems
 
 
+def check_modules_documented() -> list[str]:
+    """Every module in `engine_backend/` is named in `docs/mapping.md` or `README.md`.
+
+    A module name is matched as a backticked reference the same way a function name is,
+    so a bare mention inside an unrelated path or sentence does not count. `__init__.py`
+    is exempt: it is the package's own export list, not a module with behavior to
+    describe.
+    """
+    problems = []
+    prose = "\n".join(path.read_text() for path in (MAPPING, README) if path.is_file())
+    for path in sorted(ENGINE_BACKEND.glob("*.py")):
+        if path.name == "__init__.py":
+            continue
+        stem, filename = path.stem, path.name
+        # `engine_backend/listings.py`, `listings.py`, or `listings` all count.
+        if any(re.search(r"`[\w./]*" + re.escape(name) + r"`", prose) for name in (filename, stem)):
+            continue
+        problems.append(
+            f"engine_backend/{filename} is named in neither docs/mapping.md nor README.md"
+        )
+    return problems
+
+
 def main() -> int:
     problems: list[str] = []
     problems += check_no_abstract_methods()
     problems += check_submodule_commit()
     problems += check_sql_paths_documented()
+    problems += check_modules_documented()
 
     if problems:
         print("scripts/check.py found drift:")

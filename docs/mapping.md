@@ -46,9 +46,9 @@ and keeps provenance ids stable across turns.
 | `get_inventory_alerts` | `commerce.analytics.low_stock_items` (only `kind="low_stock"`; the engine has no slow-mover analytic) |
 | `get_order_issues` | derived from `commerce.orders.list` (age vs. `fulfillment_status`) |
 | `get_pricing_context` | `catalog.catalog_rows` + `Merchandising.unit_cost` |
-| `execute_analysis_query` / `get_analysis_schema` | a capped, `SELECT`-only query straight through `store.readonly_sql()` (see below) — a deliberate feature, not a binding gap |
+| `execute_analysis_query` / `get_analysis_schema` | delegates to `engine_backend/analysis.py`'s `run_query` and `SCHEMA`: a capped, `SELECT`-only query straight through `store.readonly_sql()` (see below) — a deliberate feature, not a binding gap |
 | `stage_*` / `get_pending_changes` / `discard_change` | delegates to `engine_backend/staging.py`, which resolves the catalog rows, checks guardrails, and persists the result in its `custom_objects`-backed `StagedChange` store; no live write |
-| `apply_change` | loads, validates status/approval, re-checks guardrails, then delegates the write to `engine_backend/apply.py`'s `apply_change(ctx, change)` — see the table below |
+| `apply_change` | loads, validates status/approval, re-checks guardrails, loads the change's staged payload, then delegates the write to `engine_backend/apply.py`'s `apply_change(ctx, change, payload)` — which returns the `APPLIED` copy of the change **and** the `Evidence` list the write produced. See the two tables below |
 
 ### `apply.apply_change` × engine write × governed? × evidence
 
@@ -64,8 +64,37 @@ One row per write `engine_backend/apply.py`'s `apply_change` can perform:
 | `PROMOTION` | direct SQL price update(s) + `promotion` custom object | No | activity-log entry |
 | `CAMPAIGN` | `campaign` custom object | No | activity-log entry |
 
+`payload` is the promotion or campaign draft the change was staged from
+(`staging.load_change_payload`); every other kind ignores it.
+
 Full detail, including the exact error codes and the schema/trigger inspection behind
 the direct-SQL path, is in `docs/enforcement.md`.
+
+### `Evidence`: what actually backed a write
+
+`apply.apply_change` returns a `staging.Evidence` per write alongside the applied
+change, and `EngineMerchant.apply_change` persists it with the change record:
+
+| Field | Meaning |
+|---|---|
+| `kind` | `"kernel_receipt"` for a governed command, `"activity_log"` for an ungoverned direct binding or direct-SQL write |
+| `id` | the sealed receipt id, or the `commerce.activity_logs.record` entry id |
+| `note` | the same human-readable line appended to the change's `guardrail_notes`, kept here so a reader of the structured field does not have to go looking for it |
+
+It is set once, at apply time, from what actually happened — never inferred from
+`guardrail_notes` prose, so a wording change cannot make evidence disappear.
+`staging.load_evidence` reads it back, and `host/app.py` attaches it to the
+`change_update` event the portal renders (`tests/test_host_evidence.py`).
+
+## The modules `engine_backend/` shares between the two roles
+
+Three modules exist only so a mechanism is defined once rather than in each backend:
+
+| Module | What it owns |
+|---|---|
+| `engine_backend/custom_objects.py` | The one shape this repo stores in the engine's custom objects: a type with a single required JSON `payload` field, one object per record. `ensure_payload_type`, `find_object`, `list_payloads`, `read_payload`, `write_payload`. Four things the engine has no domain for are kept this way — merchandising (`catalog.py`), policies and disclosures (`content.py`), staged changes (`staging.py`), and applied promotions and campaigns (`apply.py`) |
+| `engine_backend/listings.py` | The family-then-variant resolution and shaping both roles do identically: `resolve_family_or_variant` returns a `FamilyResolution` or a `VariantResolution`, and `ListingShape` carries everything `storefront.py`'s `Product` and `merchant.py`'s `Listing` are each built from. The two record types are not collapsed — `Listing` has `stock`/`content_quality`/`status`, `Product` has `rating`/`review_count`/`in_stock` — only the lookup is |
+| `engine_backend/analysis.py` | The merchant's read-only analysis surface: `SCHEMA` (the tables the agent is told about) and `run_query` (the single `SELECT`, capped at 100 rows and 8000 characters, on `store.readonly_sql()`). Kept out of `merchant.py` so a second entry point cannot keep the connection and drop the caps |
 
 ## Money at the seam
 
@@ -89,14 +118,17 @@ reads a product's variant SKUs with one parameterized `SELECT` on
 handle) and resolves each SKU back through the bound `get_variant_by_sku`. This is the
 only read this backend performs outside the Python binding.
 
-`EngineMerchant.execute_analysis_query` also reads through `store.readonly_sql()`, but
-it is not a fallback for a missing binding method — it is the deliberate `SELECT`-only,
-row-capped analysis surface `get_analysis_schema` describes, gated by both a statement
-heuristic and the connection's own `mode=ro` guard (see `tests/test_merchant_reads.py`).
+`engine_backend/analysis.py`'s `run_query` — which `EngineMerchant.execute_analysis_query`
+delegates to — also reads through `store.readonly_sql()`, but it is not a fallback for a
+missing binding method: it is the deliberate `SELECT`-only, row-capped analysis surface
+`get_analysis_schema` describes, gated by both a statement heuristic (`check_statement`)
+and the connection's own `mode=ro` guard (see `tests/test_merchant_reads.py`).
 
 `scripts/check.py` scans `engine_backend/*.py` for every function whose body reaches
-`readonly_sql()` and fails if `docs/mapping.md` does not name it; both `list_variants`
-and `execute_analysis_query` are named above for that reason.
+`readonly_sql()` and fails if `docs/mapping.md` does not name it; `list_variants`,
+`run_query` and `execute_analysis_query` are named above for that reason. It also fails
+when a module in `engine_backend/` is named in neither this file nor `README.md`, which
+is the same drift class one level up.
 
 ## Direct-SQL write fallbacks
 

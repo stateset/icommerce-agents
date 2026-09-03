@@ -13,8 +13,13 @@ roles.
 - `vendor/commerce-agents/` — the upstream repo, a git submodule, never edited.
 - `engine_backend/` — `StorefrontBackend` and `MerchantBackend` implemented over the
   engine: `storefront.py`, `merchant.py`, `catalog.py`, `search.py`, `content.py`,
-  `staging.py`, `kernel.py`, `store.py`, `seed.py`. `docs/mapping.md` is the method-by-
-  method map of what each read and write actually does.
+  `listings.py` (the family/variant resolution both roles share), `analysis.py` (the
+  merchant's capped read-only `SELECT` surface), `staging.py`, `apply.py` (the five-kind
+  apply dispatch, the only place live state is mutated), `custom_objects.py` (the one
+  shape this repo stores in the engine's custom objects), `money.py`, `kernel.py`,
+  `store.py`, `seed.py`. `docs/mapping.md` is the method-by-method map of what each read
+  and write actually does. `scripts/check.py` fails if a module here is named in neither
+  file.
 - `config/` — `kernel-policy.json` and `kernel-principal.json`, the host-owned files
   the kernel checks every governed command against; never model input.
 - `host/` — the FastAPI host: one engine store, both agents, session binding, the
