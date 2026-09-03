@@ -18,6 +18,7 @@ async def test_the_merchant_server_exposes_apply_change(tmp_path):
     server = build_merchant_server(str(tmp_path / "store.db"))
     names = {tool.name for tool in await server.list_tools()}
     assert "apply_change" in names
+    assert "host_approve" not in names
 
 
 def test_servers_build_without_a_model_api_key(tmp_path, monkeypatch):
@@ -59,18 +60,23 @@ async def test_apply_change_refuses_without_a_prior_host_approve(store, kernel):
     assert store.commerce.products.get_variant_by_sku("TENT-RIDGE-TAN").price != 199.00
 
 
-async def test_apply_change_succeeds_after_host_approve(store, kernel):
+async def test_apply_change_succeeds_after_out_of_band_approve(store, kernel):
     from mcp.shared.memory import create_connected_server_and_client_session
 
     from mcp_servers.merchant import build_merchant_server
+    from engine_backend.merchant import EngineMerchant
+    from merchant_agent.types import MerchantSessionContext
 
     change_id = await _stage_a_price_change(store, kernel)
+    # Build a backend and inject it into the MCP server so approval and apply run
+    # against the same in-process EngineMerchant (mirrors the HTTP host path).
+    backend = EngineMerchant(store, kernel)
+    session = MerchantSessionContext(session_id="s", merchant_id=store.store_id, operator="user:acme-operator")
+    backend.approve(change_id, session.operator)
     async with create_connected_server_and_client_session(
-        build_merchant_server(store.db_path)
+        build_merchant_server(store.db_path, merchant_backend=backend)
     ) as client:
         await client.call_tool("get_pending_changes", {})
-        approved = await client.call_tool("host_approve", {"change_id": change_id})
-        assert not approved.isError
         applied = await client.call_tool("apply_change", {"change_id": change_id})
         assert not applied.isError
 

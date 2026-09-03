@@ -45,48 +45,24 @@ at `http://127.0.0.1:8300/mcp` / `http://127.0.0.1:8301/mcp` (ports configurable
 this reference server has no authentication of its own, so that variable exists to be
 set only once an authenticating gateway is actually in front of it.
 
-## Applying a merchant change takes two separate tool calls
+## Approval is out-of-band; MCP cannot approve
 
-`stage_*` tools only record a proposed change for preview. `apply_change` refuses any
-`change_id` that has not first been marked by a separate `host_approve` tool call —
-staging, approving, and applying a change are always three distinct tool calls, so a
-client that surfaces each one to its user (the default in Claude Code, Claude Desktop,
-and Cursor) gives the operator two independent, visible decision points: one before
-`host_approve` runs, a second before `apply_change` runs.
+`stage_*` tools only record a proposed change for preview. `apply_change` is the only
+call that mutates live state, and it refuses any `change_id` that has not first been
+approved via the host's HTTP route:
 
-`host_approve` marks nothing but its own `change_id` — it does no write of its own — and
-`EngineMerchant.apply_change` re-checks that mark independently, so a change that
-reaches `apply_change` through some other path (skipping `host_approve`) still cannot be
-applied.
+- `POST /merchant/changes/{id}/approve` (operator identity comes from the session,
+  never a tool argument or request-body field).
 
-## Limitation: this depends on the connecting client, not on this server
+There is no MCP tool that records approval. The model cannot self-approve; a human
+operator uses the portal (or equivalent HTTP) first, then `apply_change` can succeed.
+`EngineMerchant.apply_change` checks its own backend `approved_ids` independently of
+anything the MCP handler does.
 
-**This is weaker than the Messages API host's approval surface.** The FastAPI host's
-`POST /merchant/changes/{id}/approve` is a route only the operator's own browser session
-can reach — out-of-band by construction, entirely outside the model's or any MCP
-client's discretion. Here, `host_approve` and `apply_change` are both ordinary tools
-sitting behind whatever the connecting MCP client does with a tool call.
+## Approval guarantee on MCP matches the host
 
-**If your MCP client is configured to auto-approve tool calls** — skipping its own
-confirmation prompts — nothing in this repository detects or refuses that, and a model
-can stage, approve, and apply a merchant change unattended. That defeats the guarantee
-this staging design otherwise provides. Do not run these servers unattended, and prefer
-the Messages API host's HTTP approval route (`host/app.py`) over the MCP path for any
-deployment where an operator's own out-of-band confirmation must be guaranteed rather
-than merely conventional.
-
-**This also depends on the model, not only the client.** `host_approve` is an ordinary
-tool; nothing distinguishes a call the model made on its own initiative from one a human
-told it to make. A live run against `claude-sonnet-4-5` (`docs/testing.md`, "Live MCP
-run") asked only to stage a price change and "apply it," and the model found
-`host_approve` unprompted, called it, and then applied successfully — the model
-satisfied, entirely by itself, the gate that exists to require a human between staging
-and applying. A client that surfaces every tool call faithfully does not prevent this:
-a human watching two calls go by and clicking "allow" on each has approved that the
-calls happen, not that the change should apply — the model, not the operator, decided
-`host_approve` was warranted. In the same test, `claude-opus-5` declined to call
-`host_approve` itself, reasoning explicitly that doing so "would defeat the point of the
-two-step gate" — correct judgment, but judgment, not code, and not something this
-server enforces or can enforce. Treat the two-call design as raising the bar a client's
-UX and a model's own restraint must both clear, not as a guarantee this server provides
-on its own.
+The FastAPI host's approval path is out-of-band by construction: only the operator's own
+browser session can reach `POST /merchant/changes/{id}/approve`, and the operator is
+read from the session binding. The merchant MCP server mirrors that guarantee: there is
+no approval tool on the MCP surface, so the model cannot approve on its own. A change
+can be applied only after the host has recorded an approval for its `change_id`.
