@@ -1,0 +1,11 @@
+# requirements.txt — order matters: upstream pins siblings to versions no index carries
+-e ./vendor/commerce-agents/commerce-common[examples,mcp]
+# mcp_servers/ imports mcp.server.fastmcp.FastMCP directly, following upstream's own
+# managed-agents servers; mcp 2.x renames FastMCP to MCPServer and moves the module, so
+# pin below 2 until this repo (and upstream) migrate.
+mcp<2
+-e ./vendor/commerce-agents/shopping-agent/core
+-e ./vendor/commerce-agents/shopping-agent/runtime-messages-api
+-e ./vendor/commerce-agents/merchant-agent/core
+-e ./vendor/commerce-agents/merchant-agent/runtime-messages-api
+-e .
