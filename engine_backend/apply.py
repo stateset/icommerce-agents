@@ -226,6 +226,7 @@ async def _apply_status_change(
     product, _merch = resolved
     # Update status via products.update(product_id, status=...)
     desired = str(item.after)
+
     def body(c: Commerce) -> None:
         _update_product_binding(c, product.id, status=desired)
 
@@ -246,6 +247,7 @@ async def _apply_listing_update(
     attributes = dict(merch.attributes)
     for item in change.items:
         if item.field == "description":
+
             def body(c: Commerce, _desc: str = str(item.after)) -> None:
                 _update_product_binding(c, product.id, description=_desc)
 

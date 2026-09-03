@@ -100,6 +100,7 @@ async def test_applying_a_promotion_leaves_its_draft_payload_intact(store, kerne
 
     backend.approve(change.change_id, "user:acme-operator")
     from merchant_agent.changes import ChangeNotApplicable
+
     try:
         await backend.apply_change(session, change.change_id)
     except ChangeNotApplicable:

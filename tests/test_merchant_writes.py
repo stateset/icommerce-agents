@@ -42,6 +42,7 @@ async def test_an_approved_price_update_writes_and_logs(store, kernel):
     )
     backend.approve(change.change_id, "user:acme-operator")
     from merchant_agent.changes import ChangeNotApplicable
+
     with pytest.raises(ChangeNotApplicable):
         await backend.apply_change(session(), change.change_id)
     # Price unchanged on failure-closed path.
@@ -132,6 +133,7 @@ async def test_an_applied_price_update_persists_a_two_place_decimal_string(store
     )
     backend.approve(change.change_id, "user:acme-operator")
     from merchant_agent.changes import ChangeNotApplicable
+
     with pytest.raises(ChangeNotApplicable):
         await backend.apply_change(session(), change.change_id)
     # Unchanged exact string from seeding.
@@ -159,6 +161,7 @@ async def test_an_applied_promotion_prices_in_decimal_not_float(store, kernel):
     assert {item.before for item in change.items} == {"219.00"}
     backend.approve(change.change_id, "user:acme-operator")
     from merchant_agent.changes import ChangeNotApplicable
+
     with pytest.raises(ChangeNotApplicable):
         await backend.apply_change(session(), change.change_id)
 
@@ -185,6 +188,7 @@ async def test_a_promotion_price_flows_into_a_cart_line_as_a_currency_amount(sto
     )
     backend.approve(change.change_id, "user:acme-operator")
     from merchant_agent.changes import ChangeNotApplicable
+
     with pytest.raises(ChangeNotApplicable):
         await backend.apply_change(session(), change.change_id)
 
