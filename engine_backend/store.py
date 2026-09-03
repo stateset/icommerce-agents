@@ -30,8 +30,7 @@ class EngineStore:
         self.commerce = Commerce(db_path)
         self._locks: dict[str, asyncio.Lock] = {}
         self._bindings: dict[str, PrincipalBinding] = {}
-        self._sql: sqlite3.Connection | None = None
-        self._sql_lock = threading.Lock()
+        self._sql = threading.local()
 
     async def call(self, fn: Callable[[Commerce], T]) -> T:
         return await asyncio.to_thread(fn, self.commerce)
@@ -46,19 +45,23 @@ class EngineStore:
 
         Listed in docs/mapping.md; every use is a single parameterized SELECT.
 
-        Thread-safe: guarded by a lock because callers may reach this from a worker
-        thread inside store.call(...), so two threads could otherwise race the
-        lazy connect and open two connections.
+        One connection per thread, kept for the life of that thread. Callers reach this
+        from two different places -- a worker thread, inside ``store.call(...)``
+        (``catalog.list_variants``), and directly on the event loop
+        (``merchant.execute_analysis_query``) -- and a ``sqlite3.Connection`` and its
+        cursors are not safe to use from two threads concurrently. Sharing one
+        connection would need every *use* serialized, not just the lazy connect; giving
+        each thread its own removes the sharing instead, which is why
+        ``check_same_thread`` is left at its default here.
         """
         if self.db_path == ":memory:":
             raise RuntimeError("a read-only connection needs a file-backed store, not :memory:")
-        with self._sql_lock:
-            if self._sql is None:
-                self._sql = sqlite3.connect(
-                    f"file:{self.db_path}?mode=ro", uri=True, check_same_thread=False
-                )
-                self._sql.row_factory = sqlite3.Row
-            return self._sql
+        connection: sqlite3.Connection | None = getattr(self._sql, "connection", None)
+        if connection is None:
+            connection = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+            connection.row_factory = sqlite3.Row
+            self._sql.connection = connection
+        return connection
 
     def bind(self, session_id: str, subject_id: str, kind: str) -> PrincipalBinding:
         binding = PrincipalBinding(

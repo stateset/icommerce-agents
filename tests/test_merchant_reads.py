@@ -64,3 +64,31 @@ def test_the_readonly_connection_itself_refuses_a_write(store):
     connection = store.readonly_sql()
     with pytest.raises(sqlite3.OperationalError, match="readonly database"):
         connection.execute("DELETE FROM orders")
+
+
+async def test_order_issues_flag_an_order_past_the_48_hour_threshold(store, kernel):
+    """`get_order_issues` compares each unfulfilled order's age against `session.now`,
+    the reference time the caller supplies. A freshly seeded store's orders are minutes
+    old, so the threshold is exercised by asking the question as of three days later --
+    the same branch, reached through the interface's own reference-time parameter rather
+    than by rewriting the engine's `created_at` behind its back."""
+    from datetime import UTC, datetime, timedelta
+
+    backend = EngineMerchant(store, kernel)
+
+    fresh = MerchantSessionContext(
+        session_id="m-1", merchant_id="acme", operator="user:acme-operator", now=datetime.now(UTC)
+    )
+    assert await backend.get_order_issues(fresh) == []
+
+    later = MerchantSessionContext(
+        session_id="m-1",
+        merchant_id="acme",
+        operator="user:acme-operator",
+        now=datetime.now(UTC) + timedelta(days=3),
+    )
+    issues = await backend.get_order_issues(later)
+    assert issues, "no unfulfilled order tripped the 48-hour threshold"
+    assert {i.kind for i in issues} == {"delayed"}
+    assert all(i.order_id and i.issue_id.startswith("issue-") for i in issues)
+    assert all("day(s)" in i.summary for i in issues)

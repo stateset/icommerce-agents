@@ -27,7 +27,7 @@ from typing import Any
 from commerce_common.streaming import AgentEvent, to_sse
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
-from merchant_agent.types import MerchantSessionContext, MerchantSessionState
+from merchant_agent.types import ChangeStatus, MerchantSessionContext, MerchantSessionState
 from merchant_agent_runtime import MerchantAgent
 from pydantic import BaseModel
 from shopping_agent.types import ShoppingSessionContext, ShoppingSessionState
@@ -206,10 +206,12 @@ def create_app(db_path: str) -> FastAPI:
         requires one."""
         session = _bound_shopping_context(x_session_id)
         binding = store.binding(session.session_id)
-        carts = store.commerce.carts.for_customer(binding.subject_id)
-        if not carts:
+        # This session's own cart, not the customer's most recent one: every shopping
+        # session binds to the same seeded customer here, so picking the customer's last
+        # cart would let two concurrent sessions check out each other's.
+        cart_id = storefront.session_cart_id(session.session_id)
+        if cart_id is None:
             raise HTTPException(status_code=409, detail="no cart to check out")
-        cart_id = carts[-1].id
         customer = store.commerce.customers.get(binding.subject_id)
 
         # DEMO PLACEHOLDER: the engine's checkout-readiness check requires a shipping
@@ -277,6 +279,13 @@ def create_app(db_path: str) -> FastAPI:
         change = await load_staged_change(store, change_id)
         if change is None:
             raise HTTPException(status_code=404, detail=f"no change with id {change_id!r}")
+        if change.status is not ChangeStatus.STAGED:
+            # An already-applied or discarded change has nothing left to approve;
+            # accepting one would put a live change id into `approved_ids`.
+            raise HTTPException(
+                status_code=409,
+                detail=f"change {change_id} is {change.status.value}, not staged",
+            )
         merchant.approve(change_id, session.operator)
         return {"change_id": change_id, "approved_by": session.operator}
 

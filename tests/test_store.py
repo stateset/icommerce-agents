@@ -1,4 +1,6 @@
 import asyncio
+import threading
+import time
 
 import pytest
 
@@ -16,17 +18,34 @@ async def test_call_runs_on_a_worker_thread(store):
 
 
 async def test_writes_for_one_session_are_serialized(store):
-    order = []
+    """Both bodies run on worker threads and each holds a real window between its
+    `start-` and `end-` marks, so the two would genuinely overlap if `EngineStore.write`
+    did not serialize them. Remove the per-session lock and this fails: `order` comes
+    back interleaved (`start-a, start-b, end-a, end-b`) and `peak` reaches 2.
+    """
+    order: list[str] = []
+    inside = 0
+    peak = 0
+    counter_lock = threading.Lock()
 
     async def slow(tag):
         def body(_c):
+            nonlocal inside, peak
+            with counter_lock:
+                inside += 1
+                peak = max(peak, inside)
             order.append(f"start-{tag}")
+            time.sleep(0.15)  # a real window for the other write to slip into
             order.append(f"end-{tag}")
+            with counter_lock:
+                inside -= 1
             return tag
 
         return await store.write("s1", body)
 
     await asyncio.gather(slow("a"), slow("b"))
+
+    assert peak == 1, f"two writes for one session ran concurrently: {order}"
     assert order in (
         ["start-a", "end-a", "start-b", "end-b"],
         ["start-b", "end-b", "start-a", "end-a"],
