@@ -142,15 +142,12 @@ because it opens a connection. `docs/mapping.md` has the mechanism, the measurem
 why the symptom appears on some Python SQLite builds and not others. Anything that
 weakens the pin makes this workaround unsound again, whatever the schema says.
 
-## The MCP path's approval is weaker than the HTTP host's
+## The MCP path's approval guarantee matches the HTTP host's
 
-`docs/mcp.md` covers this in full; it is not restated here beyond the one sentence that
-matters for this document's claim. The FastAPI host's `POST /merchant/changes/{id}/approve`
+`docs/mcp.md` covers this in full. The FastAPI host's `POST /merchant/changes/{id}/approve`
 is a route only the operator's own browser session can reach — out-of-band by
 construction, with the operator identity read from the session binding, never a request
-body field. The MCP path's `host_approve` tool has no such separation: it is an ordinary
-tool call, so its guarantee rests entirely on the connecting client prompting a human
-before invoking it, and a client configured to auto-approve tool calls removes that
-guarantee outright, with nothing in this process able to detect or refuse it. The two
-paths are not equivalent, and the engine's own policy check on `payments.create_refund`
-is what still holds regardless of which one an operator used to reach it.
+body field. The merchant MCP server no longer exposes any approval tool; only the HTTP
+host records approval. `apply_change` on MCP refuses any `change_id` the host has not
+approved first. This makes the MCP path's approval requirement equivalent to the host's:
+the model cannot approve on its own.
