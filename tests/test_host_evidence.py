@@ -82,7 +82,11 @@ async def test_the_host_change_update_event_carries_the_structured_field_verbati
 
 def test_no_regex_remains_anywhere_in_the_evidence_path():
     """The old coupling was a `re.compile` pinned to `merchant.py`'s wording. Assert
-    outright that `host/app.py` no longer imports or uses `re` at all."""
+    outright that `host/app.py` no longer imports or uses `re` at all.
+
+    This is a source-text check, not a guarantee: `from re import search as _s` (or any
+    other alias/indirection) would slip past it. It catches the coupling this module
+    actually had, not every conceivable way to reintroduce a regex."""
     source = inspect.getsource(host_app)
     assert "import re" not in source
     assert "re.compile" not in source

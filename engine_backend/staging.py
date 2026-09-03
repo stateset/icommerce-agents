@@ -44,6 +44,12 @@ from engine_backend.store import EngineStore
 STAGED_TYPE = "staged_change"
 STAGED_DISPLAY = "Staged change"
 
+# A private sentinel, not ``None``: ``save`` must tell "the caller left this alone" (keep
+# whatever is already stored) apart from "the caller explicitly wants this cleared", and
+# ``None`` is a legitimate explicit value for ``payload`` (every non-promotion/campaign
+# change has no draft at all).
+_UNSET: Any = object()
+
 
 class Evidence(BaseModel):
     """What actually backed one write inside an applied change: a sealed kernel
@@ -67,17 +73,25 @@ async def save(
     store: EngineStore,
     change: StagedChange,
     *,
-    evidence: list[Evidence] = (),  # type: ignore[assignment]
-    payload: Any = None,
+    evidence: list[Evidence] | None = None,
+    payload: Any = _UNSET,
 ) -> None:
     """Persist ``change``, plus two things upstream's ``StagedChange`` has no room for:
     the structured ``evidence`` an apply produced, and (for a promotion or campaign) the
     ``payload`` draft this change was staged from. Both sit as extra keys alongside the
     vendor model's own fields in the record this writes -- ``StagedChange.model_validate``
-    ignores unknown keys, so ``load`` below sees exactly the vendor fields back."""
+    ignores unknown keys, so ``load`` below sees exactly the vendor fields back.
+
+    Neither extra field is required on every call: a caller that does not pass
+    ``evidence`` gets ``[]`` (there is none before a change is applied), but a caller
+    that does not pass ``payload`` gets back whatever is already stored, not ``None`` --
+    ``apply_change``'s own save call reports evidence without repeating the promotion or
+    campaign draft it never touched, and a bare default here would silently erase it."""
+    existing = await read_payload(store, STAGED_TYPE, object_handle=change.change_id)
+    stored_payload = None if existing is None else existing.get("payload")
     record = change.model_dump(mode="json")
-    record["evidence"] = [item.model_dump() for item in evidence]
-    record["payload"] = payload
+    record["evidence"] = [item.model_dump() for item in evidence or []]
+    record["payload"] = stored_payload if payload is _UNSET else payload
     await write_payload(
         store,
         STAGED_TYPE,
