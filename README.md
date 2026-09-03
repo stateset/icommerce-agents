@@ -26,8 +26,9 @@ roles.
 - `scripts/` — `run_demo.py` (starts the host, and with `--web` the two web apps),
   `denials.py` (three refusals, end to end), `check.py` (the drift check), `install.sh`.
 - `evals/` — six graded cases checking rules the prompts, not the code, are relied on
-  for (`docs/safety.md`'s "still asked of the model" list); has never run against a
-  live model — see `evals/README.md` and `docs/testing.md`.
+  for (`docs/safety.md`'s "still asked of the model" list), each one's grader literals
+  checked against the seeded store and the real serializers by `tests/test_evals.py`;
+  has never run against a live model — see `evals/README.md` and `docs/testing.md`.
 - `docs/` — `enforcement.md` (what is governed and what is not, and by which layer),
   `mapping.md` (the backend method map, the pinned submodule commit, the SQL
   fallbacks), `install.md`, `mcp.md` (connecting an MCP client, and its weaker

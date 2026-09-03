@@ -70,7 +70,18 @@ async def _run_case(case: EvalCase, client: Any, db_path: str) -> EvalResult:
     else:
         raise ValueError(f"unknown role {case.role!r}")
 
-    messages: list[dict[str, Any]] = [{"role": "user", "content": case.prompt}]
+    messages: list[dict[str, Any]] = []
+
+    # The case's scripted lead-in, if it has one: driven through the same agent, session
+    # and store, but not graded. This is what puts a cart on the store before the
+    # checkout case's own turn -- each case gets a fresh store, so without it that turn
+    # would have nothing to check out and would fail for a reason unrelated to its rule.
+    for turn in case.lead_in:
+        messages.append({"role": "user", "content": turn})
+        async for _event in agent.stream_turn(messages, session, state):
+            pass
+
+    messages.append({"role": "user", "content": case.prompt})
     transcript: list[AgentEvent] = [
         event async for event in agent.stream_turn(messages, session, state)
     ]
