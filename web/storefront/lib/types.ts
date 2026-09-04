@@ -53,6 +53,55 @@ export interface CheckoutResponse {
   };
 }
 
+export interface ShippingAddress {
+  first_name: string;
+  last_name: string;
+  company?: string;
+  line1: string;
+  line2?: string;
+  city: string;
+  state: string;
+  postal_code: string;
+  country: string;
+  phone?: string;
+}
+
+export interface PaymentRequirement {
+  scheme: "exact";
+  network: `eip155:${string}`;
+  amount: string;
+  asset: `0x${string}`;
+  payTo: `0x${string}`;
+  maxTimeoutSeconds: number;
+  extra?: { name?: string; version?: string; quoteDigest?: string };
+}
+
+export interface StablecoinChallenge {
+  x402Version: 2;
+  resource: { url: string; description?: string; mimeType?: string };
+  accepts: PaymentRequirement[];
+  extensions?: Record<string, unknown>;
+  paymentId: string;
+  quoteDigest: string;
+  expiresAt: string;
+  detail?: unknown;
+}
+
+export interface StablecoinPayment {
+  payment_id: string;
+  quote_digest: string;
+  state: string;
+  amount: string;
+  currency: string;
+  asset: string;
+  network: string;
+  expires_at: string;
+  transaction_hash?: string | null;
+  order_number?: string | null;
+  receipt?: CheckoutResponse["receipt"];
+  detail?: unknown;
+}
+
 export interface OrderItem {
   product_id: string;
   title: string;
@@ -88,4 +137,6 @@ export interface OrdersPayload {
  * or absent only, never valid or invalid. */
 export interface Capabilities {
   assistant: "available" | "unconfigured";
+  stablecoin_checkout: "available" | "disabled";
+  direct_checkout: "available" | "disabled";
 }

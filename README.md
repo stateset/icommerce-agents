@@ -1,7 +1,7 @@
 # StateSet iCommerce Agents
 
 [![CI](https://github.com/stateset/icommerce-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/stateset/icommerce-agents/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/release-v0.7.1-2563eb)](https://github.com/stateset/icommerce-agents/tree/v0.7.1)
+[![Release](https://img.shields.io/badge/release-v0.8.0-2563eb)](https://github.com/stateset/icommerce-agents/tree/v0.8.0)
 [![Python](https://img.shields.io/badge/python-3.12-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520.9-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-MIT-black)](LICENSE)
@@ -87,6 +87,9 @@ flowchart LR
     trusted --> ledger[Durable approval ledger]
     ledger --> adapters
     trusted --> adapters
+    host --> x402[x402 stablecoin facilitator]
+    x402 --> payledger[Durable payment journal]
+    payledger --> trusted
 
     adapters --> bindings[iCommerce engine bindings]
     adapters --> kernel[Policy kernel]
@@ -106,6 +109,7 @@ outcomes until an operator reconciles observed live state.
 |---|---|---|---|
 | Add or update cart | Provenance and option checks | Not governed | Cart state |
 | Checkout | Human-clicked host route | `checkout.commit` | Sealed kernel receipt |
+| Stablecoin checkout | Immutable cart-bound x402 quote, verify/settle, replay barrier | `checkout.commit` after settlement | Chain transaction + sealed kernel receipt |
 | Stage merchant change | Provenance and guardrails | No live mutation | Staged proposal + digest |
 | Apply price, content, promotion, or campaign change | Approval, single claim, target lease, stale-preview check | Not governed | Activity-log id |
 | Restock a new SKU | Same apply controls | `inventory.item.create` | Sealed kernel receipt |
@@ -121,13 +125,19 @@ exception and avoids implying broader kernel coverage.
 
 - One seeded ACME Supply store backed by a real `stateset-embedded` SQLite engine.
 - Shopping search, catalog, product detail, cart, checkout, and order-history flows.
+- Disabled-by-default x402 v2 stablecoin checkout with exact engine totals, short-lived
+  cart/address/payer-bound quotes, facilitator verification and settlement, durable
+  replay protection, idempotent order completion, and fail-closed reconciliation state.
 - Merchant analytics, listings, inventory alerts, staged changes, approval, apply,
   and explicit reconciliation for ambiguous outcomes.
 - Human-only refund preview/apply with exact decimal amounts, canonical proposal
   digests, idempotency, kernel approval evidence, and sealed receipts.
 - Demo identity for local use and production JWT authentication with issuer, audience,
   expiry, role/scope, tenant, and token-subject/session binding checks.
-- Explicit session termination and configurable in-process session expiry.
+- Same-origin storefront and portal BFFs keep production bearer tokens in secure
+  HttpOnly cookies, restrict forwarded headers, and reject cross-site mutations.
+- Explicit session termination, configurable expiry, and durable principal/cart
+  bindings that survive worker changes and host restarts.
 - Request correlation propagated into checkout/refund kernel envelopes, secure response
   headers, restricted CORS, and logs that omit tokens, session ids, and bodies.
 - Disabled-by-default, separately authenticated Prometheus metrics with low-cardinality
@@ -168,6 +178,9 @@ application, the smoke script, or the eval runner. With no key, `/capabilities` 
 The FastAPI host exposes:
 
 - Shopping: session start/end, streaming chat, cart reads/writes, checkout, and orders.
+- Stablecoin: authenticated x402 quote/settle and shopper-scoped payment status routes.
+- Stablecoin operations: merchant-scoped recovery queue and externally verified
+  settlement reconciliation; ambiguous settlement is never automatically retried.
 - Merchant: session start/end, streaming chat, staged-change approval, apply state,
   reconciliation, and governed refund preview/apply.
 - Operations: `/capabilities`, `/healthz`, `/readyz`, and authenticated opt-in
@@ -188,6 +201,7 @@ Local demo authentication uses seeded identities and must not be exposed publicl
 Enable verified bearer authentication for a deployment:
 
 ```bash
+export ICOMMERCE_ENVIRONMENT=production
 export ICOMMERCE_AUTH_MODE=jwt
 export ICOMMERCE_JWT_ISSUER=https://identity.example.com/
 export ICOMMERCE_JWT_AUDIENCE=icommerce-host
@@ -196,17 +210,27 @@ export ICOMMERCE_ALLOWED_ORIGINS=https://shop.example.com,https://merchant.examp
 export ICOMMERCE_SESSION_TTL_SECONDS=28800
 export ICOMMERCE_STALE_APPLY_SECONDS=900
 export ICOMMERCE_METRICS_TOKEN=replace-with-32-plus-byte-monitoring-secret
+# Server-only value used by each Next.js BFF.
+export ICOMMERCE_API_URL=https://api.example.com
 ```
 
 Public deployments should use asymmetric JWKS verification. The HS256 option exists
 for tests and controlled private environments, requires at least 32 bytes, and is
-mutually exclusive with JWKS. Authenticated checkout also requires a validated shipping
-address; the fictional fallback exists only in demo mode.
+mutually exclusive with JWKS. Direct no-payment checkout and its fictional address are
+demo-only; authenticated deployments fail closed unless a configured payment rail
+settles first.
 
-Chat and principal bindings are currently process-local, while approval records and
-target leases are durable and cross-process safe. Run a single host worker or configure
-sticky routing for each session. The [installation and deployment guide](docs/install.md)
-documents every variable and trust boundary.
+Stablecoin checkout is a separately enabled alternative rail. It requires an x402 v2
+facilitator, public HTTPS API origin, reviewed EVM network/token/recipient configuration,
+and an external signing client. It never stores a payer private key. See the
+[stablecoin checkout guide](docs/stablecoin-checkout.md) for configuration, protocol,
+failure recovery, and the boundaries that remain deployment responsibilities.
+
+Principal/cart bindings, approvals, target leases, and stablecoin payments are durable
+and cross-process safe. Chat transcripts and upstream agent session state remain
+process-local, so run a single host worker or configure sticky routing for chat routes.
+The [installation and deployment guide](docs/install.md) documents every variable and
+trust boundary.
 
 ## Verification
 
@@ -237,7 +261,8 @@ explains exactly what green CI proves—and what it does not.
 - `engine_backend/` — `agent_config.py`, `analysis.py`, `apply.py`, `catalog.py`,
   `content.py`, `custom_objects.py`, `kernel.py`, `listings.py`, `merchant.py`,
   `money.py`, `reconciliation.py`, `refunds.py`, `search.py`, `seed.py`, `staging.py`,
-  `store.py`, and `storefront.py` implement the StateSet adapters and durable controls.
+  `stablecoins.py`, `store.py`, and `storefront.py` implement the StateSet adapters and
+  durable controls.
 - `host/` — FastAPI sessions, JWT identity, streaming agents, human approval/refund
   routes, response policy, metrics, and operational endpoints.
 - `mcp_servers/` — role-specific MCP entry points over the same adapters and gates.
@@ -250,9 +275,11 @@ explains exactly what green CI proves—and what it does not.
 ## Documentation
 
 - [Install and production configuration](docs/install.md)
+- [Production operations and backup/restore](docs/operations.md)
 - [Enforcement boundaries](docs/enforcement.md)
 - [Backend-to-engine mapping](docs/mapping.md)
 - [MCP deployment](docs/mcp.md)
+- [Stablecoin checkout](docs/stablecoin-checkout.md)
 - [Testing scope and live eval record](docs/testing.md)
 - [Workflow design](.github/workflows/README.md)
 

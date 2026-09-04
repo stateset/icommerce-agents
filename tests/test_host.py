@@ -341,7 +341,11 @@ def test_capabilities_reports_presence_never_validity(tmp_path, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     c = client(tmp_path)
     body = c.get("/capabilities").json()
-    assert body == {"assistant": "unconfigured"}
+    assert body == {
+        "assistant": "unconfigured",
+        "stablecoin_checkout": "disabled",
+        "direct_checkout": "available",
+    }
     assert "key" not in str(body).lower()
 
 

@@ -76,6 +76,13 @@ engine, and never a model.
   binding and its in-memory transcript/provenance state (`tests/test_host.py`).
 - Disabled-by-default, separately authenticated Prometheus metrics with route-template
   labels and no principal/session identifiers (`tests/test_metrics.py`).
+- Stablecoin quote binding, x402 facilitator wire contracts, replay/idempotency,
+  one-active-payment-per-cart enforcement, crash recovery, privileged reconciliation,
+  and recovered checkout receipts (`tests/test_stablecoin_checkout.py`).
+- Durable principal/cart recovery across store instances and immediate cross-worker
+  session revocation (`tests/test_store.py`, `tests/test_storefront_cart.py`).
+- Online WAL-safe backup publication, integrity verification, and overwrite refusal
+  (`tests/test_backup_store.py`).
 
 ## `scripts/tour.py`: a keyless end-to-end check, not a substitute for a live eval
 
@@ -110,6 +117,8 @@ the host at `localhost:8000` at all — `run_demo.py --web` had never actually b
 watched work in a browser. `host/app.py` now sends `Access-Control-Allow-Origin` for
 those two dev origins; `tests/test_web_build.py` still only proves the apps build, but
 this closes the gap above it.
+The apps now default to their same-origin BFF, so this browser path also proves the
+restricted proxy reaches the host without exposing a bearer token to client code.
 
 ## What the suite does not cover
 

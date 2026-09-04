@@ -58,7 +58,7 @@ enabled commands one at a time:
 | Command | Issued from | Reachable in a running deployment? |
 |---|---|---|
 | `inventory.item.create` | `engine_backend/apply.py` (restock of a SKU with no inventory item) | **Yes** — an applied, approved staged change reaches it |
-| `checkout.commit` | `host/app.py`'s `POST /shopping/checkout` | **Yes** — a human click on the host route |
+| `checkout.commit` | `host/app.py`'s demo-only direct checkout, or its x402 route after stablecoin settlement | **Yes** — explicit shopper action; no agent tool reaches either route, and JWT mode cannot create an unpaid direct order |
 | `payments.create_refund` | `host/app.py`'s digest-bound operator refund routes; also `scripts/denials.py` and `tests/test_kernel.py` | **Yes** — an authenticated human operator, never an agent tool |
 | `payments.create` | `tests/test_kernel.py` | No — test only |
 | `products.create` | nowhere | No — no code path issues it as a kernel command at all |
@@ -98,7 +98,7 @@ this stack stops an unreviewed merchandising write.
 |---|---|---|---|
 | Add to cart | `check_provenance`, `check_options` (`shopping_agent.gates`) | none | cart state only |
 | Update/remove cart item | `check_provenance` (via `_check_provenance_or_cart`) | none | cart state only |
-| Checkout (complete an order) | no agent tool reaches this route — `POST /shopping/checkout` is a human-clicked host route, not a tool | `checkout.commit` | sealed kernel receipt (`receipt_id`) |
+| Checkout (complete an order) | no agent tool reaches these routes — direct checkout is human-clicked and x402 checkout requires a payer signature plus facilitator settlement | `checkout.commit` | sealed kernel receipt (`receipt_id`); x402 also records the chain transaction |
 | Stage a price update | `check_listing_provenance`, `check_listing_record_read`, guardrail discount cap (`merchant_agent.changes.check_guardrails`) | none (staging only; no live write) | `StagedChange` record |
 | Stage a listing/promotion/campaign/inventory action | same staging gates as above, per kind | none (staging only) | `StagedChange` record |
 | Apply a price update | `check_apply_change` (provenance, guardrails, `APPROVAL_GATE` when `require_host_approval`) + `EngineMerchant.apply_change`'s own `approved_ids` check | none — direct SQL `UPDATE product_variants` | activity-log id |

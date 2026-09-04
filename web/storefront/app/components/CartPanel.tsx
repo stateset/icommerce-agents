@@ -1,8 +1,14 @@
 "use client";
 
-import { useState } from "react";
-import { checkout } from "../../lib/api";
-import type { CartPayload, CheckoutResponse } from "../../lib/types";
+import { useEffect, useState } from "react";
+import {
+  checkout,
+  fetchStablecoinPayment,
+  quoteStablecoin,
+  settleStablecoin,
+} from "../../lib/api";
+import { connectWallet, signStablecoinPayment } from "../../lib/stablecoin";
+import type { CartPayload, ShippingAddress } from "../../lib/types";
 
 /** Formats one amount the host already gave us -- a number or an exact decimal string
  * -- for display. Never sums or multiplies: every total on this panel comes from the
@@ -21,15 +27,33 @@ function displayAmount(value: number | string | null | undefined, currency = "US
 export function CartPanel({
   cart,
   busy,
+  stablecoinAvailable,
+  directCheckoutAvailable,
+  sessionId,
   onPlaced,
 }: {
   cart: CartPayload | null;
   busy: boolean;
+  stablecoinAvailable: boolean;
+  directCheckoutAvailable: boolean;
+  sessionId: string | null;
   onPlaced?: () => void;
 }) {
-  const [placing, setPlacing] = useState(false);
+  const [placing, setPlacing] = useState<"direct" | "stablecoin" | null>(null);
+  const [showStablecoin, setShowStablecoin] = useState(false);
+  const [shipping, setShipping] = useState<ShippingAddress>({
+    first_name: "",
+    last_name: "",
+    line1: "",
+    city: "",
+    state: "",
+    postal_code: "",
+    country: "US",
+  });
   const [result, setResult] = useState<
-    { ok: true; orderNumber: string; sealed: boolean; receiptId: string | null } | { ok: false; message: string } | null
+    { ok: true; orderNumber: string; sealed: boolean; receiptId: string | null; transaction?: string | null }
+    | { ok: false; message: string }
+    | null
   >(null);
 
   const items = cart?.items ?? [];
@@ -37,11 +61,59 @@ export function CartPanel({
   const currency = cart?.currency ?? "USD";
   const subtotal = displayAmount(cart?.subtotal_exact ?? cart?.subtotal ?? null, currency);
 
+  useEffect(() => {
+    if (!stablecoinAvailable || !sessionId) return;
+    const raw = sessionStorage.getItem("icommerce.pendingStablecoinPayment");
+    if (!raw) return;
+    let pending: { paymentId: string; sessionId: string };
+    try {
+      pending = JSON.parse(raw) as { paymentId: string; sessionId: string };
+    } catch {
+      sessionStorage.removeItem("icommerce.pendingStablecoinPayment");
+      return;
+    }
+    if (!pending.paymentId || !pending.sessionId) return;
+
+    let cancelled = false;
+    async function recover() {
+      const response = await fetchStablecoinPayment(pending.paymentId, pending.sessionId);
+      if (cancelled || !response.body) return;
+      const payment = response.body;
+      if (payment.state === "completed" && payment.order_number) {
+        window.clearInterval(timer);
+        sessionStorage.removeItem("icommerce.pendingStablecoinPayment");
+        setResult({
+          ok: true,
+          orderNumber: payment.order_number,
+          sealed: payment.receipt?.sealed ?? false,
+          receiptId: payment.receipt?.receipt_id ?? null,
+          transaction: payment.transaction_hash,
+        });
+        onPlaced?.();
+      } else if (payment.state === "failed" || payment.state === "expired") {
+        window.clearInterval(timer);
+        sessionStorage.removeItem("icommerce.pendingStablecoinPayment");
+        setResult({ ok: false, message: `Payment ${pending.paymentId} did not settle.` });
+      } else if (payment.state === "reconciliation_required") {
+        setResult({
+          ok: false,
+          message: `Payment ${pending.paymentId} needs merchant reconciliation. Do not pay again.`,
+        });
+      }
+    }
+    const timer = window.setInterval(() => void recover(), 5000);
+    void recover();
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [onPlaced, sessionId, stablecoinAvailable]);
+
   async function placeOrder() {
-    setPlacing(true);
+    setPlacing("direct");
     setResult(null);
     const { status, body } = await checkout();
-    setPlacing(false);
+    setPlacing(null);
     if (status === 200 && body?.order_number) {
       setResult({
         ok: true,
@@ -57,6 +129,75 @@ export function CartPanel({
       "The order could not be placed. Check that the bag has items and try again.";
     setResult({ ok: false, message });
   }
+
+  function errorMessage(body: unknown, fallback: string): string {
+    if (!body || typeof body !== "object") return fallback;
+    const detail = (body as { detail?: unknown }).detail;
+    if (typeof detail === "string") return detail;
+    if (detail && typeof detail === "object") {
+      const message = (detail as { error_message?: unknown }).error_message;
+      if (typeof message === "string") return message;
+    }
+    return fallback;
+  }
+
+  async function payWithStablecoin() {
+    setPlacing("stablecoin");
+    setResult(null);
+    try {
+      const account = await connectWallet();
+      const quote = await quoteStablecoin(shipping, account);
+      if (quote.status !== 402 || !quote.body?.paymentId) {
+        throw new Error(errorMessage(quote.body, "The store could not create a payment quote."));
+      }
+      if (!sessionId) throw new Error("The shopping session is not ready.");
+      sessionStorage.setItem(
+        "icommerce.pendingStablecoinPayment",
+        JSON.stringify({ paymentId: quote.body.paymentId, sessionId }),
+      );
+      const paymentSignature = await signStablecoinPayment(quote.body, account);
+      const settled = await settleStablecoin(
+        quote.body.paymentId,
+        quote.body.quoteDigest,
+        paymentSignature,
+      );
+      if (settled.status === 202) {
+        throw new Error(
+          `Payment ${quote.body.paymentId} needs merchant reconciliation. Do not pay again.`,
+        );
+      }
+      if (settled.status !== 200 || settled.body?.state !== "completed" || !settled.body.order_number) {
+        throw new Error(errorMessage(settled.body, "The payment could not be completed."));
+      }
+      setResult({
+        ok: true,
+        orderNumber: settled.body.order_number,
+        sealed: settled.body.receipt?.sealed ?? false,
+        receiptId: settled.body.receipt?.receipt_id ?? null,
+        transaction: settled.body.transaction_hash,
+      });
+      sessionStorage.removeItem("icommerce.pendingStablecoinPayment");
+      setShowStablecoin(false);
+      onPlaced?.();
+    } catch (error) {
+      setResult({
+        ok: false,
+        message: error instanceof Error ? error.message : "The stablecoin payment failed.",
+      });
+    } finally {
+      setPlacing(null);
+    }
+  }
+
+  const shippingComplete = Boolean(
+    shipping.first_name &&
+      shipping.last_name &&
+      shipping.line1 &&
+      shipping.city &&
+      shipping.state &&
+      shipping.postal_code &&
+      /^[A-Z]{2}$/.test(shipping.country),
+  );
 
   return (
     <div className="cart-block">
@@ -93,17 +234,74 @@ export function CartPanel({
             <span>{subtotal}</span>
           </div>
         ) : null}
-        <button
-          type="button"
-          className="place-order-btn"
-          disabled={items.length === 0 || placing || busy}
-          onClick={placeOrder}
-        >
-          {placing ? "Placing order..." : "Place order"}
-        </button>
+        {stablecoinAvailable ? (
+          <button
+            type="button"
+            className="place-order-btn"
+            disabled={items.length === 0 || placing !== null || busy}
+            onClick={() => setShowStablecoin((shown) => !shown)}
+          >
+            Pay with USDC
+          </button>
+        ) : null}
+        {showStablecoin ? (
+          <div className="stablecoin-form">
+            <strong>Shipping address</strong>
+            <div className="stablecoin-grid">
+              {([
+                ["first_name", "First name"],
+                ["last_name", "Last name"],
+                ["line1", "Address"],
+                ["city", "City"],
+                ["state", "State / province"],
+                ["postal_code", "Postal code"],
+                ["country", "Country code"],
+              ] as const).map(([field, label]) => (
+                <label key={field} className={field === "line1" ? "wide" : undefined}>
+                  <span>{label}</span>
+                  <input
+                    value={shipping[field] ?? ""}
+                    maxLength={field === "country" ? 2 : 200}
+                    autoComplete={field.replace("_", "-")}
+                    onChange={(event) =>
+                      setShipping((current) => ({
+                        ...current,
+                        [field]: field === "country"
+                          ? event.target.value.toUpperCase()
+                          : event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+              ))}
+            </div>
+            <button
+              type="button"
+              className="stablecoin-confirm"
+              disabled={!shippingComplete || placing !== null || busy}
+              onClick={payWithStablecoin}
+            >
+              {placing === "stablecoin" ? "Confirm in wallet..." : "Review and sign USDC payment"}
+            </button>
+            <p>
+              Your wallet signs an exact, short-lived authorization. The store never receives
+              your private key and will not retry an uncertain settlement.
+            </p>
+          </div>
+        ) : null}
+        {directCheckoutAvailable ? (
+          <button
+            type="button"
+            className="demo-order-btn"
+            disabled={items.length === 0 || placing !== null || busy}
+            onClick={placeOrder}
+          >
+            {placing === "direct" ? "Placing demo order..." : "Place demo order"}
+          </button>
+        ) : null}
         <p className="place-order-note">
-          This is the only action that completes an order. The assistant can add items and
-          show you the bag, but it never checks out for you.
+          Only a trusted checkout action completes an order. The assistant can manage the bag,
+          but it never signs or submits payment for you.
         </p>
         {result ? (
           result.ok ? (
@@ -114,6 +312,7 @@ export function CartPanel({
               ) : (
                 <span>Receipt recorded, unsealed -- the kernel did not vouch for this write.</span>
               )}
+              {result.transaction ? <span>On-chain transaction {result.transaction}</span> : null}
             </div>
           ) : (
             <div className="order-result error">{result.message}</div>

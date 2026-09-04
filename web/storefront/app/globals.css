@@ -384,9 +384,79 @@ a {
   padding: 12px;
 }
 
-.place-order-btn:disabled {
+.place-order-btn:disabled,
+.demo-order-btn:disabled,
+.stablecoin-confirm:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+.demo-order-btn,
+.stablecoin-confirm {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--card);
+  color: var(--ink);
+  font-weight: 650;
+  font-size: 13px;
+  padding: 10px;
+  margin-top: 8px;
+}
+
+.stablecoin-confirm {
+  background: var(--ink);
+  color: var(--paper);
+  border-color: var(--ink);
+}
+
+.stablecoin-form {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+}
+
+.stablecoin-form > strong {
+  display: block;
+  margin-bottom: 10px;
+  font-size: 12.5px;
+}
+
+.stablecoin-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.stablecoin-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  color: var(--ink-soft);
+  font-size: 10.5px;
+}
+
+.stablecoin-grid label.wide {
+  grid-column: 1 / -1;
+}
+
+.stablecoin-grid input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--ink);
+  padding: 7px 8px;
+  font-size: 12px;
+}
+
+.stablecoin-form p {
+  margin: 8px 0 0;
+  color: var(--ink-soft);
+  font-size: 10.5px;
+  line-height: 1.4;
 }
 
 .place-order-note {

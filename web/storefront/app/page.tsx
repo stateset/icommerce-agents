@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAgentTurn, useSession } from "web-shared";
 import type { AgentEvent } from "web-shared";
 import { api, capabilities, fetchCart, fetchOrders, healthy, UNREACHABLE } from "../lib/api";
@@ -14,6 +14,8 @@ export default function StorefrontPage() {
   const [assistant, setAssistant] = useState<"checking" | "available" | "unconfigured">(
     "checking",
   );
+  const [stablecoinAvailable, setStablecoinAvailable] = useState(false);
+  const [directCheckoutAvailable, setDirectCheckoutAvailable] = useState(false);
   const [cart, setCart] = useState<CartPayload | null>(null);
   const [orders, setOrders] = useState<Order[] | null>(null);
   const [input, setInput] = useState("");
@@ -26,7 +28,11 @@ export default function StorefrontPage() {
       setReachable(ok);
       if (!ok) return;
       capabilities().then((caps) => {
-        if (!cancelled) setAssistant(caps?.assistant ?? "unconfigured");
+        if (!cancelled) {
+          setAssistant(caps?.assistant ?? "unconfigured");
+          setStablecoinAvailable(caps?.stablecoin_checkout === "available");
+          setDirectCheckoutAvailable(caps?.direct_checkout === "available");
+        }
       });
     });
     return () => {
@@ -39,22 +45,21 @@ export default function StorefrontPage() {
   // Live store state: fetched as soon as a session exists, independent of whether an
   // assistant is configured -- this is what makes a keyless tour's order visible on
   // first load, with no typing.
-  const refreshCart = () => {
+  const refreshCart = useCallback(() => {
     fetchCart().then((next) => {
       if (next) setCart(next);
     });
-  };
-  const refreshOrders = () => {
+  }, []);
+  const refreshOrders = useCallback(() => {
     fetchOrders().then((next) => {
       if (next) setOrders(next.orders);
     });
-  };
+  }, []);
   useEffect(() => {
     if (!session.sessionId) return;
     refreshCart();
     refreshOrders();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session.sessionId]);
+  }, [refreshCart, refreshOrders, session.sessionId]);
 
   const turn = useAgentTurn(api, {
     sessionId: reachable ? session.sessionId : null,
@@ -89,7 +94,14 @@ export default function StorefrontPage() {
   const ready = reachable === true && assistant === "available" && turn.ready;
   const sideCol = (
     <div className="cart-col">
-      <CartPanel cart={cart} busy={turn.busy} onPlaced={refreshOrders} />
+      <CartPanel
+        cart={cart}
+        busy={turn.busy}
+        stablecoinAvailable={stablecoinAvailable}
+        directCheckoutAvailable={directCheckoutAvailable}
+        sessionId={session.sessionId}
+        onPlaced={refreshOrders}
+      />
       <OrdersPanel orders={orders} />
     </div>
   );

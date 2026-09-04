@@ -100,8 +100,24 @@ export interface StagedChange {
   currency?: string | null;
 }
 
+export interface StablecoinPayment {
+  payment_id: string;
+  quote_digest: string;
+  state: string;
+  amount: string;
+  currency: string;
+  asset: string;
+  network: string;
+  expires_at: string;
+  transaction_hash?: string | null;
+  order_number?: string | null;
+  last_error?: string | null;
+}
+
 /** `GET /capabilities` -- whether a model is configured for this deployment. Present
  * or absent only, never valid or invalid. */
 export interface Capabilities {
   assistant: "available" | "unconfigured";
+  stablecoin_checkout: "available" | "disabled";
+  direct_checkout: "available" | "disabled";
 }

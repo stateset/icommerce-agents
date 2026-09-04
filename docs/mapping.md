@@ -7,6 +7,18 @@ what each read and write actually does, the one place the engine's Python bindin
 read around with raw SQL, the write fallbacks the binding forces, and the pinned vendor
 commit `scripts/check.py` verifies against.
 
+`engine_backend/stablecoins.py` is an adapter-owned x402 v2 boundary rather than a
+`StorefrontBackend` method. It snapshots the session cart using exact engine totals,
+creates a digest-bound quote, calls a configured facilitator's `/verify` and `/settle`
+endpoints, and persists state through `StablecoinLedger.create`, `StablecoinLedger.get`,
+and `StablecoinLedger.transition`. The payment tables are created by
+`EngineStore._ensure_control_schema` before the embedded engine opens; later accesses
+reuse `EngineStore._control_connection`, so the WAL pin described below protects these
+short-lived Python SQLite connections too. The engine's Python binding at 1.28.5 does
+not expose its native x402 intent APIs, so this journal is not represented as an engine
+payment. Successful settlement is followed by the same governed `checkout.commit`
+command as ordinary checkout. See `docs/stablecoin-checkout.md`.
+
 ## Pinned vendor commit
 
 `vendor/commerce-agents` is a git submodule, never edited in place. Its commit is
@@ -28,12 +40,12 @@ and keeps provenance ids stable across turns.
 |---|---|
 | `search_products` | `engine_backend.search.search` over `commerce.products.list()`; every filter, `category` included, is applied in Python against this repo's own `Merchandising` custom object — the engine's catalog has no category column |
 | `get_product_details` | `commerce.products.get` / `get_variant_by_sku` + `catalog.read_merchandising` + `catalog.list_variants` |
-| `get_cart` / `add_to_cart` / `update_cart_item` / `remove_from_cart` | `commerce.carts.*` (`create` once per session, then `get_items`, `add_item`, `update_item`, `remove_item`). First creation is serialized so concurrent tools cannot split one session across two carts, and the backend defensively enforces the configured per-item cap even when a direct host caller bypasses the executor. The session→cart mapping is `EngineStorefront._cart_ids`, read by the host through the host-only `session_cart_id`; `carts.for_customer` is not used by any backend method |
+| `get_cart` / `add_to_cart` / `update_cart_item` / `remove_from_cart` | `commerce.carts.*` (`create` once per session, then `get_items`, `add_item`, `update_item`, `remove_item`). First creation is serialized in process and atomically claimed in the durable `icommerce_agent_session_carts` table across processes, and the backend defensively enforces the configured per-item cap even when a direct host caller bypasses the executor. `EngineStorefront._cart_ids` is only a read cache; `carts.for_customer` is not used by any backend method |
 | `get_orders` / `get_order` | `commerce.orders.list` / `.get` |
 | `get_preferences` | derived from `commerce.customers.get` (no preferences object in the engine) |
 | `search_policies` / `get_disclosure` | `engine_backend/content.py`'s static ACME Supply policy text (the engine has no policy/disclosure domain) |
 | `get_fulfillment_options` | `commerce.carts.get_shipping_rates` for the session's own cart; `product_ids` is unused (the engine has no per-item quote) and a session with no cart yet gets `[]` |
-| `checkout_handoff` | renders the cart; charges nothing. Completing an order is `POST /shopping/checkout` on the host, which calls the governed `checkout.commit` kernel command directly — no agent tool reaches it. See `docs/enforcement.md`. `GET /shopping/cart` and `GET /shopping/orders` are session-scoped host reads over the same `get_cart`/`get_orders` methods, for the storefront web app to render live state with no model turn. |
+| `checkout_handoff` | renders the cart; charges nothing. Completing an order uses a trusted host route: demo-only direct `POST /shopping/checkout`, or the disabled-by-default x402 stablecoin route after settlement. Both call the governed `checkout.commit` kernel command and no agent tool reaches either; JWT deployments cannot use the unpaid direct route. See `docs/enforcement.md`. `GET /shopping/cart` and `GET /shopping/orders` are session-scoped host reads over the same `get_cart`/`get_orders` methods, for the storefront web app to render live state with no model turn. |
 
 ## `EngineMerchant` (`engine_backend/merchant.py`)
 
@@ -321,9 +333,10 @@ opens from invalidating the embedded handle's WAL view.
   Reconciliation itself uses a second transactional claim (`reconciliation_required`
   → `reconciling` → `resolved`) so concurrent operators cannot persist conflicting
   lifecycle outcomes; an abandoned resolver is recoverable through the same timeout.
-- The rest of the in-memory state beside the store is per process by construction:
-  `EngineStore._bindings` and `EngineStorefront._cart_ids`. A session belongs to the
-  process that opened it.
+- Principal and session→cart mappings live in `icommerce_agent_sessions` and
+  `icommerce_agent_session_carts`; `EngineStore._bindings` and
+  `EngineStorefront._cart_ids` are caches. Conversation transcripts and upstream agent
+  session state remain per process and require sticky routing for chat.
 
 This was verified against the schema and triggers directly, not assumed:
 `PRAGMA table_info` on `products` and `product_variants` shows neither table has a

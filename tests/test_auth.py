@@ -104,7 +104,7 @@ def test_verified_customer_can_only_open_and_use_a_shopping_session(tmp_path):
     assert client.post("/merchant/session", headers=_bearer(token)).status_code == 403
 
 
-def test_authenticated_checkout_requires_a_validated_shipping_address(tmp_path):
+def test_authenticated_deployments_cannot_create_unpaid_orders(tmp_path):
     client = TestClient(create_app(str(tmp_path / "store.db"), _config()))
     token = _token(roles=["customer"], email="rowan@example.invalid")
     headers = _bearer(token)
@@ -117,8 +117,10 @@ def test_authenticated_checkout_requires_a_validated_shipping_address(tmp_path):
     )
     assert added.status_code == 200
     missing = client.post("/shopping/checkout", headers=headers)
-    assert missing.status_code == 422
-    assert missing.json()["detail"] == "shipping_address is required for authenticated checkout"
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == (
+        "direct checkout is demo-only; use a configured payment rail"
+    )
 
     checkout = client.post(
         "/shopping/checkout",
@@ -135,8 +137,34 @@ def test_authenticated_checkout_requires_a_validated_shipping_address(tmp_path):
             }
         },
     )
-    assert checkout.status_code == 200
-    assert checkout.json()["receipt"]["sealed"] is True
+    assert checkout.status_code == 404
+
+
+def test_production_profile_rejects_demo_identity(monkeypatch, tmp_path):
+    monkeypatch.setenv("ICOMMERCE_ENVIRONMENT", "production")
+    monkeypatch.setenv("ICOMMERCE_ALLOWED_ORIGINS", "https://shop.example.com")
+    monkeypatch.setenv("ICOMMERCE_METRICS_TOKEN", "m" * 32)
+    with pytest.raises(ValueError, match="ICOMMERCE_AUTH_MODE must be jwt"):
+        create_app(str(tmp_path / "production.db"))
+
+
+def test_production_profile_accepts_asymmetric_auth_and_https_origins(monkeypatch, tmp_path):
+    monkeypatch.setenv("ICOMMERCE_ENVIRONMENT", "production")
+    monkeypatch.setenv(
+        "ICOMMERCE_ALLOWED_ORIGINS",
+        "https://shop.example.com,https://merchant.example.com",
+    )
+    monkeypatch.setenv("ICOMMERCE_METRICS_TOKEN", "m" * 32)
+    app = create_app(
+        str(tmp_path / "production.db"),
+        auth_config=AuthConfig(
+            mode="jwt",
+            issuer="https://identity.example.com/",
+            audience="icommerce-host",
+            jwks_url="https://identity.example.com/.well-known/jwks.json",
+        ),
+    )
+    assert app is not None
 
 
 def test_verified_merchant_is_tenant_scoped_and_becomes_the_operator(tmp_path):

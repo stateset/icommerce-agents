@@ -3,10 +3,14 @@ import type {
   Capabilities,
   ReconciliationDetail,
   ReconciliationAssessment,
+  StablecoinPayment,
   StagedChange,
 } from "./types";
 
-export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+// Production defaults to the same-origin BFF, which reads an access token from an
+// HttpOnly cookie. Set NEXT_PUBLIC_API_URL=http://localhost:8000 for the direct local
+// demo path used by scripts and browser checks.
+export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "/api/commerce";
 
 /** `/merchant/session`, `/merchant/chat`, `/merchant/changes/{id}/approve` all line up
  * with the host's own routes under this prefix. */
@@ -114,6 +118,31 @@ export async function resolveReconciliation(
       method: "POST",
       headers: api.headers(true),
       body: JSON.stringify({ proposal_digest: proposalDigest, resolution }),
+    },
+  );
+}
+
+export async function fetchStablecoinPayments(): Promise<StablecoinPayment[] | null> {
+  const data = await api.get<{ payments: StablecoinPayment[] }>("/stablecoin-payments");
+  return data?.payments ?? null;
+}
+
+export async function reconcileStablecoinPayment(
+  paymentId: string,
+  resolution: "confirmed_settled" | "confirmed_not_settled",
+  note: string,
+  transactionHash?: string,
+): Promise<ControlResult<StablecoinPayment>> {
+  return controlRequest<StablecoinPayment>(
+    `/stablecoin-payments/${encodeURIComponent(paymentId)}/reconcile`,
+    {
+      method: "POST",
+      headers: api.headers(true),
+      body: JSON.stringify({
+        resolution,
+        note,
+        transaction_hash: transactionHash || null,
+      }),
     },
   );
 }

@@ -9,6 +9,7 @@ import {
 } from "../../lib/api";
 import type { ReconciliationDetail, StagedChange } from "../../lib/types";
 import { Evidence } from "./Evidence";
+import { StablecoinPayments } from "./StablecoinPayments";
 
 function formatValue(value: unknown): string {
   if (value === null || value === undefined) return "--";
@@ -18,9 +19,13 @@ function formatValue(value: unknown): string {
 export function ChangesPanel({
   changes,
   onRefresh,
+  stablecoinAvailable = false,
+  sessionId = null,
 }: {
   changes: Record<string, StagedChange>;
   onRefresh: () => Promise<void>;
+  stablecoinAvailable?: boolean;
+  sessionId?: string | null;
 }) {
   const [approving, setApproving] = useState<string | null>(null);
   const [approvedIds, setApprovedIds] = useState<Set<string>>(new Set());
@@ -100,6 +105,7 @@ export function ChangesPanel({
         <h2>Staged changes</h2>
         <p>Approve here, then ask the assistant to apply it.</p>
       </div>
+      <StablecoinPayments enabled={stablecoinAvailable} sessionId={sessionId} />
       {list.length === 0 ? (
         <div className="changes-empty">
           Nothing staged yet. Ask the assistant to draft a price change, a restock, or a

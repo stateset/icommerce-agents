@@ -1,7 +1,18 @@
 import { AgentApi } from "web-shared";
-import type { Capabilities, CartPayload, CheckoutResponse, OrdersPayload } from "./types";
+import type {
+  Capabilities,
+  CartPayload,
+  CheckoutResponse,
+  OrdersPayload,
+  ShippingAddress,
+  StablecoinChallenge,
+  StablecoinPayment,
+} from "./types";
 
-export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+// Production defaults to the same-origin BFF, which reads an access token from an
+// HttpOnly cookie. Set NEXT_PUBLIC_API_URL=http://localhost:8000 for the direct local
+// demo path used by scripts and browser checks.
+export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "/api/commerce";
 
 /** `AgentApi`'s prefix is the host's own route prefix -- `/shopping/session`,
  * `/shopping/chat`, `/shopping/cart/add`, `/shopping/checkout` all line up directly. */
@@ -46,7 +57,7 @@ export async function addToCart(productId: string, quantity = 1): Promise<CartPa
   return api.post<CartPayload>("/cart/add", { product_id: productId, quantity });
 }
 
-/** The only route that completes an order -- reached by this call alone, never by a tool. */
+/** The direct demo route that completes an order -- reached by the UI, never by a tool. */
 export async function checkout(): Promise<{ status: number; body: CheckoutResponse | null }> {
   try {
     const response = await fetch(`${api.base}/checkout`, {
@@ -54,6 +65,63 @@ export async function checkout(): Promise<{ status: number; body: CheckoutRespon
       headers: api.headers(),
     });
     const body = (await response.json().catch(() => null)) as CheckoutResponse | null;
+    return { status: response.status, body };
+  } catch {
+    return { status: 0, body: null };
+  }
+}
+
+export async function quoteStablecoin(
+  shippingAddress: ShippingAddress,
+  payerAddress: string,
+): Promise<{ status: number; body: StablecoinChallenge | null }> {
+  try {
+    const response = await fetch(`${api.base}/checkout/stablecoin/quote`, {
+      method: "POST",
+      headers: api.headers(true),
+      body: JSON.stringify({
+        shipping_address: shippingAddress,
+        payer_address: payerAddress,
+      }),
+    });
+    const body = (await response.json().catch(() => null)) as StablecoinChallenge | null;
+    return { status: response.status, body };
+  } catch {
+    return { status: 0, body: null };
+  }
+}
+
+export async function settleStablecoin(
+  paymentId: string,
+  quoteDigest: string,
+  paymentSignature: string,
+): Promise<{ status: number; body: StablecoinPayment | null }> {
+  try {
+    const response = await fetch(
+      `${api.base}/checkout/stablecoin/${encodeURIComponent(paymentId)}`,
+      {
+        method: "POST",
+        headers: { ...api.headers(true), "PAYMENT-SIGNATURE": paymentSignature },
+        body: JSON.stringify({ quote_digest: quoteDigest }),
+      },
+    );
+    const body = (await response.json().catch(() => null)) as StablecoinPayment | null;
+    return { status: response.status, body };
+  } catch {
+    return { status: 0, body: null };
+  }
+}
+
+export async function fetchStablecoinPayment(
+  paymentId: string,
+  sessionId: string,
+): Promise<{ status: number; body: StablecoinPayment | null }> {
+  try {
+    const response = await fetch(
+      `${api.base}/payments/${encodeURIComponent(paymentId)}`,
+      { headers: { ...api.headers(), "X-Session-Id": sessionId }, cache: "no-store" },
+    );
+    const body = (await response.json().catch(() => null)) as StablecoinPayment | null;
     return { status: response.status, body };
   } catch {
     return { status: 0, body: null };

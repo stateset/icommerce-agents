@@ -207,16 +207,22 @@ class EngineStorefront(StorefrontBackend):
     # -- Cart ---------------------------------------------------------------------
 
     async def _cart_id(self, session: ShoppingSessionContext) -> str:
-        cart_id = self._cart_ids.get(session.session_id)
+        cart_id = self._cart_ids.get(session.session_id) or self.store.session_cart_id(
+            session.session_id
+        )
         if cart_id is not None:
+            self._cart_ids[session.session_id] = cart_id
             return cart_id
 
         # Tool calls in one turn may arrive concurrently. Re-check under a separate
         # initialization lock, or both calls can create a cart and split the session's
         # lines between two engine records.
         async with self.store.serialized(f"cart-init:{session.session_id}"):
-            cart_id = self._cart_ids.get(session.session_id)
+            cart_id = self._cart_ids.get(session.session_id) or self.store.session_cart_id(
+                session.session_id
+            )
             if cart_id is not None:
+                self._cart_ids[session.session_id] = cart_id
                 return cart_id
 
             binding = self.store.binding(session.session_id)
@@ -225,7 +231,8 @@ class EngineStorefront(StorefrontBackend):
                 cart = c.carts.create(customer_id=binding.subject_id, currency="USD")
                 return cart.id
 
-            cart_id = await self.store.write(session.session_id, body)
+            candidate = await self.store.write(session.session_id, body)
+            cart_id = self.store.claim_session_cart(session.session_id, candidate)
             self._cart_ids[session.session_id] = cart_id
             return cart_id
 
@@ -276,8 +283,12 @@ class EngineStorefront(StorefrontBackend):
         customer, so ``carts.for_customer(...)[-1]`` would let two concurrent sessions
         check out each other's cart. This mapping is the only record of which cart
         belongs to which session, and it is server-held, never a request or tool
-        argument."""
-        return self._cart_ids.get(session_id)
+        argument. The durable store mapping is authoritative; ``_cart_ids`` is only a
+        process-local read cache."""
+        cart_id = self._cart_ids.get(session_id) or self.store.session_cart_id(session_id)
+        if cart_id is not None:
+            self._cart_ids[session_id] = cart_id
+        return cart_id
 
     async def cart_exact_totals(self, session: ShoppingSessionContext) -> dict[str, Any]:
         """Host-only, not part of :class:`StorefrontBackend`: the engine's own exact
@@ -394,7 +405,9 @@ class EngineStorefront(StorefrontBackend):
         # The engine has no per-item shipping quote, so ``product_ids`` is not used:
         # rates come from the session's own cart, and a session with no cart yet gets
         # an empty list.
-        cart_id = self._cart_ids.get(session.session_id)
+        cart_id = self._cart_ids.get(session.session_id) or self.store.session_cart_id(
+            session.session_id
+        )
         if cart_id is None:
             return []
 

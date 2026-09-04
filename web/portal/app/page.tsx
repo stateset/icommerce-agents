@@ -13,6 +13,7 @@ export default function PortalPage() {
     "checking",
   );
   const [changes, setChanges] = useState<Record<string, StagedChange>>({});
+  const [stablecoinAvailable, setStablecoinAvailable] = useState(false);
   const [input, setInput] = useState("");
   const transcriptRef = useRef<HTMLDivElement>(null);
 
@@ -23,7 +24,10 @@ export default function PortalPage() {
       setReachable(ok);
       if (!ok) return;
       capabilities().then((caps) => {
-        if (!cancelled) setAssistant(caps?.assistant ?? "unconfigured");
+        if (!cancelled) {
+          setAssistant(caps?.assistant ?? "unconfigured");
+          setStablecoinAvailable(caps?.stablecoin_checkout === "available");
+        }
       });
     });
     return () => {
@@ -105,7 +109,12 @@ export default function PortalPage() {
             </p>
           </div>
         </section>
-        <ChangesPanel changes={changes} onRefresh={refreshChanges} />
+        <ChangesPanel
+          changes={changes}
+          onRefresh={refreshChanges}
+          stablecoinAvailable={stablecoinAvailable}
+          sessionId={session.sessionId}
+        />
       </main>
     );
   }
@@ -177,7 +186,12 @@ export default function PortalPage() {
           </button>
         </form>
       </section>
-      <ChangesPanel changes={changes} onRefresh={refreshChanges} />
+      <ChangesPanel
+        changes={changes}
+        onRefresh={refreshChanges}
+        stablecoinAvailable={stablecoinAvailable}
+        sessionId={session.sessionId}
+      />
     </main>
   );
 }

@@ -27,6 +27,14 @@ def test_metrics_require_their_own_token_and_use_route_templates(tmp_path, monke
         'icommerce_http_requests_total{method="GET",route="/shopping/cart",status="200"} 1'
         in metrics.text
     )
+    assert (
+        'icommerce_http_request_duration_seconds_count{method="GET",route="/shopping/cart"} 1'
+        in metrics.text
+    )
+    assert (
+        "icommerce_http_request_duration_seconds_bucket"
+        '{method="GET",route="/shopping/cart",le="+Inf"} 1' in metrics.text
+    )
     assert session_id not in metrics.text
 
 

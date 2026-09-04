@@ -78,6 +78,18 @@ def test_expired_binding_is_rejected_and_removed(store):
         store.binding("expired")
 
 
+def test_file_backed_binding_survives_store_recreation(tmp_path):
+    db_path = str(tmp_path / "sessions.db")
+    first = EngineStore(db_path)
+    first.bind("durable-session", "customer-7", "customer")
+
+    second = EngineStore(db_path)
+    assert second.binding("durable-session").subject_id == "customer-7"
+    second.unbind("durable-session")
+    with pytest.raises(KeyError):
+        first.binding("durable-session")
+
+
 def test_legacy_approval_ledger_is_upgraded_without_losing_records(tmp_path):
     db_path = str(tmp_path / "store.db")
     connection = sqlite3.connect(db_path)

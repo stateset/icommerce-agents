@@ -96,9 +96,11 @@ class EngineStore:
       They survive restarts, exactly one process can claim a staged id, and different
       changes cannot mutate the same target concurrently. A crashed or ambiguous apply
       deliberately retains both its visible state and its leases for reconciliation.
-    - The rest of the in-memory state beside the store is per process by construction:
-      ``self._bindings`` here and ``EngineStorefront._cart_ids``, so a session belongs to
-      the process that opened it.
+    - Principal and session→cart bindings are durable adapter tables. File-backed
+      principal reads always consult durable state so revocation is immediately visible
+      across workers; only in-memory deployments use ``self._bindings`` as authority.
+      Agent conversation state remains per process, so chat traffic still needs sticky
+      routing until a shared transcript store is used.
     """
 
     def __init__(self, db_path: str, store_id: str = "store:acme") -> None:
@@ -257,6 +259,91 @@ class EngineStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_agent_approval_events_change "
                 "ON icommerce_agent_approval_events(change_id, event_id)"
+            )
+            # x402 settles outside the embedded engine, so its hand-off state must be
+            # durable beside the engine before the engine connection is opened.  The
+            # row is both a replay barrier and the recovery record for the dangerous
+            # interval between an on-chain settlement and ``checkout.commit``.
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS icommerce_stablecoin_payments (
+                    payment_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    customer_id TEXT NOT NULL,
+                    store_id TEXT NOT NULL,
+                    cart_id TEXT NOT NULL,
+                    cart_digest TEXT NOT NULL,
+                    quote_digest TEXT NOT NULL UNIQUE,
+                    amount TEXT NOT NULL,
+                    amount_atomic TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    asset_symbol TEXT NOT NULL,
+                    asset_address TEXT NOT NULL,
+                    asset_decimals INTEGER NOT NULL,
+                    network TEXT NOT NULL,
+                    pay_to TEXT NOT NULL,
+                    payer_address TEXT NOT NULL,
+                    shipping_address_json TEXT NOT NULL,
+                    payment_requirements_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (
+                        state IN (
+                            'quoted', 'verifying', 'verified', 'settling',
+                            'settled', 'checkout_committing', 'completed',
+                            'failed', 'expired', 'reconciliation_required'
+                        )
+                    ),
+                    expires_at TEXT NOT NULL,
+                    payment_payload_hash TEXT UNIQUE,
+                    transaction_hash TEXT UNIQUE,
+                    order_number TEXT,
+                    checkout_receipt_json TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_stablecoin_payments_session "
+                "ON icommerce_stablecoin_payments(session_id, created_at)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS icommerce_stablecoin_payment_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    payment_id TEXT NOT NULL,
+                    event TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    detail TEXT
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_stablecoin_payment_events_payment "
+                "ON icommerce_stablecoin_payment_events(payment_id, event_id)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS icommerce_agent_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    subject_id TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('customer', 'operator')),
+                    store_id TEXT NOT NULL,
+                    authenticated_subject TEXT,
+                    expires_at TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS icommerce_agent_session_carts (
+                    session_id TEXT PRIMARY KEY,
+                    cart_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES icommerce_agent_sessions(session_id)
+                        ON DELETE CASCADE
+                )
+                """
             )
             connection.commit()
         finally:
@@ -1158,15 +1245,111 @@ class EngineStore:
             expires_at=expires_at,
         )
         self._bindings[session_id] = binding
+        if self.db_path != ":memory:":
+            connection = self._control_connection()
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO icommerce_agent_sessions (
+                        session_id, subject_id, kind, store_id,
+                        authenticated_subject, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        subject_id = excluded.subject_id,
+                        kind = excluded.kind,
+                        store_id = excluded.store_id,
+                        authenticated_subject = excluded.authenticated_subject,
+                        expires_at = excluded.expires_at
+                    """,
+                    (
+                        session_id,
+                        subject_id,
+                        kind,
+                        self.store_id,
+                        authenticated_subject,
+                        expires_at.isoformat() if expires_at is not None else None,
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
         return binding
 
     def binding(self, session_id: str) -> PrincipalBinding:
-        binding = self._bindings[session_id]
+        if self.db_path != ":memory:":
+            connection = self._control_connection()
+            try:
+                row = connection.execute(
+                    "SELECT * FROM icommerce_agent_sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+            finally:
+                connection.close()
+            if row is None:
+                self._bindings.pop(session_id, None)
+                raise KeyError(session_id)
+            binding = PrincipalBinding.model_validate(dict(row))
+            self._bindings[session_id] = binding
+        else:
+            binding = self._bindings[session_id]
         if binding.expires_at is not None and binding.expires_at <= datetime.now(UTC):
-            del self._bindings[session_id]
+            self.unbind(session_id)
             raise KeyError(session_id)
         return binding
 
     def unbind(self, session_id: str) -> None:
-        """Revoke an in-process session binding; missing ids are already revoked."""
+        """Revoke a durable session binding; missing ids are already revoked."""
         self._bindings.pop(session_id, None)
+        if self.db_path != ":memory:":
+            connection = self._control_connection()
+            try:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute(
+                    "DELETE FROM icommerce_agent_sessions WHERE session_id = ?", (session_id,)
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+    def session_cart_id(self, session_id: str) -> str | None:
+        if self.db_path == ":memory:":
+            return None
+        connection = self._control_connection()
+        try:
+            row = connection.execute(
+                "SELECT cart_id FROM icommerce_agent_session_carts WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return str(row["cart_id"]) if row is not None else None
+        finally:
+            connection.close()
+
+    def claim_session_cart(self, session_id: str, cart_id: str) -> str:
+        """Install one durable cart per session and return the winning cart id.
+
+        Two workers may both create an empty candidate, but the unique session key means
+        every subsequent read/write converges on one winner before either adds a line.
+        """
+        if self.db_path == ":memory:":
+            return cart_id
+        connection = self._control_connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT OR IGNORE INTO icommerce_agent_session_carts "
+                "(session_id, cart_id, created_at) VALUES (?, ?, ?)",
+                (session_id, cart_id, self._now()),
+            )
+            row = connection.execute(
+                "SELECT cart_id FROM icommerce_agent_session_carts WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            connection.commit()
+            if row is None:
+                raise RuntimeError("session cart claim disappeared")
+            return str(row["cart_id"])
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()

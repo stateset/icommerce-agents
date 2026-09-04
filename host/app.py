@@ -3,9 +3,9 @@
 Two rules this module exists to enforce:
 
 - The model never completes an order. ``checkout`` (the agent tool) renders the cart and
-  charges nothing; ``POST /shopping/checkout`` is the only route that completes one, it
-  goes through the governed ``checkout.commit`` kernel command, and no agent tool reaches
-  it — a human click is what does.
+  charges nothing; only trusted shopping routes complete one. Direct checkout and the
+  optional x402 rail both go through the governed ``checkout.commit`` kernel command,
+  and no agent tool reaches either route.
 - Approval is the operator's, and it happens here. ``POST /merchant/changes/{id}/approve``
   is the only place ``EngineMerchant.approve`` is called, the operator comes from the
   session binding, never the request body, and an unknown change id is a 404 before that
@@ -19,15 +19,20 @@ Every other route reads it back from ``X-Session-Id``.
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import os
 import secrets
+import sqlite3
 import time
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from commerce_common.streaming import AgentEvent, to_sse
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -54,6 +59,15 @@ from engine_backend.kernel import KernelClient, approval_evidence
 from engine_backend.merchant import EngineMerchant
 from engine_backend.reconciliation import assess as assess_reconciliation
 from engine_backend.seed import seed_store
+from engine_backend.stablecoins import (
+    Facilitator,
+    FacilitatorUncertain,
+    PaymentConflict,
+    PaymentNotFound,
+    StablecoinConfig,
+    StablecoinPayments,
+    public_payment,
+)
 from engine_backend.staging import STAGED_TYPE, load_evidence
 from engine_backend.store import EngineStore
 from engine_backend.storefront import EngineStorefront
@@ -102,6 +116,21 @@ class ShippingAddressRequest(BaseModel):
 
 class CheckoutRequest(BaseModel):
     shipping_address: ShippingAddressRequest | None = None
+
+
+class StablecoinQuoteRequest(BaseModel):
+    shipping_address: ShippingAddressRequest
+    payer_address: str = Field(pattern=r"^0x[0-9a-fA-F]{40}$")
+
+
+class StablecoinSettleRequest(BaseModel):
+    quote_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class StablecoinReconciliationRequest(BaseModel):
+    resolution: Literal["confirmed_settled", "confirmed_not_settled"]
+    transaction_hash: str | None = Field(default=None, pattern=r"^0x[0-9a-fA-F]{64}$")
+    note: str = Field(min_length=8, max_length=500)
 
 
 class RefundPreviewRequest(BaseModel):
@@ -155,11 +184,53 @@ def _session_id(x_session_id: str | None) -> str:
     return x_session_id
 
 
+def _validate_production_deployment(
+    *,
+    environment: str,
+    db_path: str,
+    auth_config: AuthConfig,
+    allowed_origins: list[str],
+    metrics_token: str | None,
+) -> None:
+    """Reject configurations that are safe for a demo but unsafe on the public edge."""
+    if environment not in {"development", "test", "production"}:
+        raise ValueError("ICOMMERCE_ENVIRONMENT must be development, test, or production")
+    if environment != "production":
+        return
+    problems: list[str] = []
+    if db_path == ":memory:":
+        problems.append("a durable DEMO_DB_PATH is required")
+    if auth_config.mode != "jwt":
+        problems.append("ICOMMERCE_AUTH_MODE must be jwt")
+    elif auth_config.jwks_url is None:
+        problems.append("asymmetric ICOMMERCE_JWKS_URL authentication is required")
+    if metrics_token is None:
+        problems.append("ICOMMERCE_METRICS_TOKEN is required")
+    for origin in allowed_origins:
+        parsed = urlparse(origin)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            problems.append(f"browser origin must be an HTTPS origin: {origin!r}")
+    if not allowed_origins:
+        problems.append("at least one browser origin is required")
+    if problems:
+        raise ValueError("unsafe production configuration: " + "; ".join(problems))
+
+
 def create_app(
     db_path: str,
     auth_config: AuthConfig | None = None,
     *,
     stale_apply_seconds: int | None = None,
+    stablecoin_config: StablecoinConfig | None = None,
+    stablecoin_facilitator: Facilitator | None = None,
 ) -> FastAPI:
     """Build one deployment: one engine store (seeded), both backends, one kernel
     client bound to the host-owned policy and principal files, and both agents."""
@@ -172,6 +243,10 @@ def create_app(
     )
     merchant = EngineMerchant(store, kernel)
     authenticator = Authenticator(auth_config or AuthConfig.from_env())
+    stablecoin_config = stablecoin_config or StablecoinConfig.from_env()
+    stablecoin_payments = StablecoinPayments(
+        store, stablecoin_config, facilitator=stablecoin_facilitator
+    )
     stale_apply_seconds = (
         int(os.getenv("ICOMMERCE_STALE_APPLY_SECONDS", "900"))
         if stale_apply_seconds is None
@@ -204,7 +279,14 @@ def create_app(
     if metrics_token is not None and len(metrics_token.encode()) < 32:
         raise ValueError("metrics token must be at least 32 bytes")
 
-    app = FastAPI(title="StateSet iCommerce agents host")
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            await stablecoin_payments.aclose()
+
+    app = FastAPI(title="StateSet iCommerce agents host", lifespan=lifespan)
 
     # `web/storefront` (:3000) and `web/portal` (:3100) call this host from their own
     # origin -- there is no reverse proxy or Next.js rewrite in front of either -- so a
@@ -217,6 +299,13 @@ def create_app(
         ).split(",")
         if origin.strip()
     ]
+    _validate_production_deployment(
+        environment=os.getenv("ICOMMERCE_ENVIRONMENT", "development").strip().lower(),
+        db_path=db_path,
+        auth_config=authenticator.config,
+        allowed_origins=allowed_origins,
+        metrics_token=metrics_token,
+    )
 
     @app.middleware("http")
     async def authenticate_commerce_request(request: Request, call_next):
@@ -272,7 +361,14 @@ def create_app(
         CORSMiddleware,
         allow_origins=allowed_origins,
         allow_methods=["GET", "POST"],
-        allow_headers=["Authorization", "Content-Type", "X-Session-Id"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "PAYMENT-SIGNATURE",
+            "X-Request-Id",
+            "X-Session-Id",
+        ],
+        expose_headers=["PAYMENT-REQUIRED", "PAYMENT-RESPONSE", "X-Request-Id"],
     )
 
     @app.middleware("http")
@@ -295,7 +391,7 @@ def create_app(
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
         route = request.scope.get("route")
         route_path = getattr(route, "path", "unmatched")
-        metrics.request(request.method, route_path, response.status_code)
+        metrics.request(request.method, route_path, response.status_code, elapsed_ms / 1000)
         response.headers["X-Request-Id"] = request_id
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -364,6 +460,15 @@ def create_app(
         return MerchantSessionContext(
             session_id=session_id, merchant_id=store.store_id, operator=binding.subject_id
         )
+
+    def _require_payment_reconciler(request: Request) -> None:
+        if authenticator.config.mode == "demo":
+            return
+        identity: Identity | None = request.state.identity
+        if identity is None or not identity.permits(
+            role="merchant_admin", scope="payments:reconcile"
+        ):
+            raise HTTPException(status_code=403, detail="payment reconciliation access required")
 
     # -- Sessions -----------------------------------------------------------------
 
@@ -483,6 +588,54 @@ def create_app(
         payload["grand_total_exact"] = exact["grand_total_exact"]
         return payload
 
+    async def _cart_payment_snapshot(
+        session: ShoppingSessionContext, cart_id: str
+    ) -> dict[str, Any]:
+        cart = await storefront.get_cart(session)
+        payload = await _cart_payload(session, cart)
+        return {
+            "cart_id": cart_id,
+            "currency": payload["currency"],
+            "grand_total_exact": payload["grand_total_exact"],
+            "items": [
+                {
+                    "product_id": item["product_id"],
+                    "quantity": item["quantity"],
+                    "total_exact": item["total_exact"],
+                }
+                for item in payload["items"]
+            ],
+        }
+
+    async def _commit_cart(
+        *,
+        session_id: str,
+        cart_id: str,
+        address: CartAddress,
+        correlation_id: str,
+    ) -> dict[str, Any]:
+        def set_address(c: Any) -> None:
+            c.carts.set_shipping_address(cart_id, address)
+
+        await store.write(session_id, set_address)
+        receipt = await kernel.execute(
+            "checkout.commit",
+            {"cart_id": cart_id},
+            idempotency_key=f"checkout-{cart_id}",
+            correlation_id=correlation_id,
+        )
+        metrics.kernel_command("checkout.commit", receipt.status or "unknown")
+        if not receipt.ok:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": receipt.error_code, "error_message": receipt.error_message},
+            )
+        result = receipt.result or {}
+        return {
+            "order_number": result.get("order_number"),
+            "receipt": receipt.model_dump(mode="json"),
+        }
+
     @app.post("/shopping/cart/add")
     async def shopping_cart_add(
         request: CartAddRequest, x_session_id: str | None = Header(default=None)
@@ -545,12 +698,17 @@ def create_app(
         request: CheckoutRequest | None = None,
         x_session_id: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        """The only route that completes an order. Reached by a human click, never by
-        the model: no agent tool calls this. Governed by ``checkout.commit``.
+        """The direct, non-payment demo route that completes an order. Reached by a
+        human click, never by the model, and governed by ``checkout.commit``.
 
-        Authenticated deployments must supply a validated shipping address. Demo mode
-        uses a fixed fictional placeholder so the keyless tour can satisfy the engine's
-        checkout-readiness check without collecting personal data."""
+        This route exists only in demo mode and uses a fictional placeholder unless an
+        address is supplied. Authenticated deployments must use a configured payment
+        rail, so this endpoint can never create an unpaid production order."""
+        if authenticator.config.mode != "demo":
+            raise HTTPException(
+                status_code=404,
+                detail="direct checkout is demo-only; use a configured payment rail",
+            )
         session = _bound_shopping_context(x_session_id)
         binding = store.binding(session.session_id)
         # This session's own cart, not the customer's most recent one: every shopping
@@ -562,15 +720,8 @@ def create_app(
         customer = await store.call(lambda c: c.customers.get(binding.subject_id))
 
         supplied_address = request.shipping_address if request is not None else None
-        if authenticator.config.mode == "jwt" and supplied_address is None:
-            raise HTTPException(
-                status_code=422,
-                detail="shipping_address is required for authenticated checkout",
-            )
-
         # The fictional address is deliberately demo-only. Production JWT mode fails
-        # closed above rather than allowing an order to inherit data the shopper never
-        # supplied.
+        # closed before this route rather than creating an unpaid order.
         address = (
             CartAddress(email=customer.email, **supplied_address.model_dump())
             if supplied_address is not None
@@ -589,27 +740,282 @@ def create_app(
             )
         )
 
-        def set_address(c: Any) -> None:
-            c.carts.set_shipping_address(cart_id, address)
-
-        await store.write(session.session_id, set_address)
-        receipt = await kernel.execute(
-            "checkout.commit",
-            {"cart_id": cart_id},
-            idempotency_key=f"checkout-{cart_id}",
+        return await _commit_cart(
+            session_id=session.session_id,
+            cart_id=cart_id,
+            address=address,
             correlation_id=http_request.state.request_id,
         )
-        metrics.kernel_command("checkout.commit", receipt.status or "unknown")
-        if not receipt.ok:
-            raise HTTPException(
-                status_code=422,
-                detail={"error_code": receipt.error_code, "error_message": receipt.error_message},
+
+    @app.post("/shopping/checkout/stablecoin/quote")
+    async def stablecoin_quote(
+        request: StablecoinQuoteRequest,
+        x_session_id: str | None = Header(default=None),
+    ) -> JSONResponse:
+        """Freeze this session's cart and return a standard x402 v2 payment challenge."""
+        if not stablecoin_config.enabled:
+            raise HTTPException(status_code=404, detail="stablecoin checkout is not configured")
+        session = _bound_shopping_context(x_session_id)
+        binding = store.binding(session.session_id)
+        cart_id = storefront.session_cart_id(session.session_id)
+        if cart_id is None:
+            raise HTTPException(status_code=409, detail="no cart to check out")
+        snapshot = await _cart_payment_snapshot(session, cart_id)
+        if not snapshot["items"] or snapshot["grand_total_exact"] is None:
+            raise HTTPException(status_code=409, detail="cart is empty")
+        customer = await store.call(lambda c: c.customers.get(binding.subject_id))
+        shipping = request.shipping_address.model_dump(mode="json")
+        try:
+            quote = await stablecoin_payments.quote(
+                session_id=session.session_id,
+                customer_id=binding.subject_id,
+                store_id=binding.store_id,
+                cart_id=cart_id,
+                cart_snapshot=snapshot,
+                shipping_address=shipping,
+                payer_address=request.payer_address,
             )
-        result = receipt.result or {}
-        return {
-            "order_number": result.get("order_number"),
-            "receipt": receipt.model_dump(mode="json"),
+        except PaymentConflict as error:
+            metrics.stablecoin_payment("quote", "conflict")
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except ValueError as error:
+            metrics.stablecoin_payment("quote", "rejected")
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        # The email comes from the authenticated server-side customer record at commit
+        # time; it is intentionally absent from the public payment challenge.
+        assert customer is not None
+        encoded = base64.b64encode(
+            json.dumps(quote["payment_required"], separators=(",", ":")).encode()
+        ).decode()
+        metrics.stablecoin_payment("quote", "required")
+        body = {
+            **quote["payment_required"],
+            "paymentId": quote["payment_id"],
+            "quoteDigest": quote["quote_digest"],
+            "expiresAt": quote["expires_at"],
         }
+        return JSONResponse(
+            status_code=402,
+            content=body,
+            headers={"PAYMENT-REQUIRED": encoded},
+        )
+
+    @app.post("/shopping/checkout/stablecoin/{payment_id}")
+    async def stablecoin_checkout(
+        payment_id: str,
+        request: StablecoinSettleRequest,
+        http_request: Request,
+        x_session_id: str | None = Header(default=None),
+        payment_signature: str | None = Header(default=None, alias="PAYMENT-SIGNATURE"),
+    ) -> JSONResponse:
+        """Verify, settle, then idempotently commit the cart represented by a quote."""
+        if not stablecoin_config.enabled:
+            raise HTTPException(status_code=404, detail="stablecoin checkout is not configured")
+        session = _bound_shopping_context(x_session_id)
+        if payment_signature is None:
+            raise HTTPException(status_code=402, detail="missing PAYMENT-SIGNATURE")
+        try:
+            before = await stablecoin_payments.get(payment_id, session.session_id)
+            current_cart_id = storefront.session_cart_id(session.session_id)
+            if current_cart_id != before["cart_id"]:
+                raise PaymentConflict("quoted cart is no longer attached to this session")
+            snapshot = await _cart_payment_snapshot(session, before["cart_id"])
+            payment = await stablecoin_payments.verify_and_settle(
+                payment_id=payment_id,
+                session_id=session.session_id,
+                quote_digest=request.quote_digest,
+                payment_signature=payment_signature,
+                current_cart_snapshot=snapshot,
+            )
+        except PaymentNotFound as error:
+            raise HTTPException(status_code=404, detail="payment not found") from error
+        except ValueError as error:
+            metrics.stablecoin_payment("verify", "invalid")
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except FacilitatorUncertain:
+            payment = await stablecoin_payments.get(payment_id, session.session_id)
+            action = "settle" if payment["state"] == "reconciliation_required" else "verify"
+            metrics.stablecoin_payment(action, "unknown")
+            status = 202 if payment["state"] == "reconciliation_required" else 503
+            return JSONResponse(status_code=status, content=public_payment(payment))
+        except (PaymentConflict, sqlite3.IntegrityError) as error:
+            metrics.stablecoin_payment("settle", "rejected")
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+        if payment["state"] == "completed":
+            metrics.stablecoin_payment("checkout", "idempotent")
+            response = public_payment(payment)
+        else:
+            try:
+                payment = await stablecoin_payments.transition(
+                    payment_id,
+                    session.session_id,
+                    {"settled", "checkout_committing"},
+                    "checkout_committing",
+                )
+                address_data = json.loads(payment["shipping_address_json"])
+                customer = await store.call(lambda c: c.customers.get(payment["customer_id"]))
+                address = CartAddress(email=customer.email, **address_data)
+                checkout_result = await _commit_cart(
+                    session_id=session.session_id,
+                    cart_id=payment["cart_id"],
+                    address=address,
+                    correlation_id=http_request.state.request_id,
+                )
+                payment = await stablecoin_payments.transition(
+                    payment_id,
+                    session.session_id,
+                    {"checkout_committing"},
+                    "completed",
+                    order_number=checkout_result["order_number"],
+                    checkout_receipt_json=json.dumps(
+                        checkout_result["receipt"], sort_keys=True, separators=(",", ":")
+                    ),
+                    last_error=None,
+                )
+                response = {**public_payment(payment), **checkout_result}
+                metrics.stablecoin_payment("checkout", "completed")
+            except Exception as error:
+                await stablecoin_payments.transition(
+                    payment_id,
+                    session.session_id,
+                    {"checkout_committing"},
+                    "reconciliation_required",
+                    last_error="stablecoin settled but checkout commit did not complete",
+                )
+                metrics.stablecoin_payment("checkout", "reconciliation_required")
+                raise HTTPException(
+                    status_code=202,
+                    detail="payment settled; checkout requires reconciliation",
+                ) from error
+        settlement_evidence = {
+            "success": True,
+            "transaction": payment["transaction_hash"],
+            "network": payment["network"],
+            "payer": payment["payer_address"],
+        }
+        encoded = base64.b64encode(
+            json.dumps(settlement_evidence, separators=(",", ":")).encode()
+        ).decode()
+        return JSONResponse(content=response, headers={"PAYMENT-RESPONSE": encoded})
+
+    @app.get("/shopping/payments/{payment_id}")
+    async def stablecoin_payment_status(
+        payment_id: str,
+        x_session_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        session = _bound_shopping_context(x_session_id)
+        try:
+            payment = await stablecoin_payments.get(payment_id, session.session_id)
+        except PaymentNotFound as error:
+            raise HTTPException(status_code=404, detail="payment not found") from error
+        return public_payment(payment)
+
+    @app.get("/merchant/stablecoin-payments")
+    async def stablecoin_reconciliation_queue(
+        x_session_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Operator queue of payments that may still need settlement/order recovery."""
+        if not stablecoin_config.enabled:
+            raise HTTPException(status_code=404, detail="stablecoin checkout is not configured")
+        session = _bound_merchant_context(x_session_id)
+        payments = await stablecoin_payments.list_for_operator(session.merchant_id)
+        return {"payments": [public_payment(payment) for payment in payments]}
+
+    @app.post("/merchant/stablecoin-payments/{payment_id}/reconcile")
+    async def reconcile_stablecoin_payment(
+        payment_id: str,
+        request: StablecoinReconciliationRequest,
+        http_request: Request,
+        x_session_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Record externally verified chain truth; never infer it from a timeout."""
+        if not stablecoin_config.enabled:
+            raise HTTPException(status_code=404, detail="stablecoin checkout is not configured")
+        operator = _bound_merchant_context(x_session_id)
+        _require_payment_reconciler(http_request)
+        try:
+            payment = await stablecoin_payments.get_for_operator(payment_id, operator.merchant_id)
+            if payment["state"] == "completed":
+                return public_payment(payment)
+            if payment["state"] != "reconciliation_required":
+                raise PaymentConflict(f"payment is {payment['state']}")
+            if request.resolution == "confirmed_not_settled":
+                if payment["transaction_hash"] is not None:
+                    raise PaymentConflict(
+                        "a recorded settlement transaction cannot be marked not settled"
+                    )
+                payment = await stablecoin_payments.transition(
+                    payment_id,
+                    payment["session_id"],
+                    {"reconciliation_required"},
+                    "failed",
+                    event="operator_confirmed_not_settled",
+                    event_detail=f"{operator.operator}: {request.note}",
+                    last_error="operator confirmed that settlement did not occur",
+                )
+                metrics.stablecoin_payment("reconcile", "confirmed_not_settled")
+                return public_payment(payment)
+
+            transaction_hash = payment["transaction_hash"] or request.transaction_hash
+            if transaction_hash is None:
+                raise ValueError(
+                    "transaction_hash is required when confirming an unknown settlement"
+                )
+            payment = await stablecoin_payments.transition(
+                payment_id,
+                payment["session_id"],
+                {"reconciliation_required"},
+                "settled",
+                event="operator_confirmed_settled",
+                event_detail=f"{operator.operator}: {request.note}",
+                transaction_hash=transaction_hash.lower(),
+                last_error="operator confirmed settlement from external evidence",
+            )
+            payment = await stablecoin_payments.transition(
+                payment_id,
+                payment["session_id"],
+                {"settled"},
+                "checkout_committing",
+            )
+            address_data = json.loads(payment["shipping_address_json"])
+            customer = await store.call(lambda c: c.customers.get(payment["customer_id"]))
+            checkout_result = await _commit_cart(
+                session_id=payment["session_id"],
+                cart_id=payment["cart_id"],
+                address=CartAddress(email=customer.email, **address_data),
+                correlation_id=http_request.state.request_id,
+            )
+            payment = await stablecoin_payments.transition(
+                payment_id,
+                payment["session_id"],
+                {"checkout_committing"},
+                "completed",
+                order_number=checkout_result["order_number"],
+                checkout_receipt_json=json.dumps(
+                    checkout_result["receipt"], sort_keys=True, separators=(",", ":")
+                ),
+                last_error=None,
+            )
+            metrics.stablecoin_payment("reconcile", "completed")
+            return {**public_payment(payment), **checkout_result}
+        except PaymentNotFound as error:
+            raise HTTPException(status_code=404, detail="payment not found") from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except (PaymentConflict, sqlite3.IntegrityError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except HTTPException as error:
+            current = await stablecoin_payments.get_for_operator(payment_id, operator.merchant_id)
+            if current["state"] == "checkout_committing":
+                await stablecoin_payments.transition(
+                    payment_id,
+                    current["session_id"],
+                    {"checkout_committing"},
+                    "reconciliation_required",
+                    last_error="settlement confirmed but checkout commit did not complete",
+                )
+            raise error
 
     # -- Merchant: chat, approval ---------------------------------------------------
 
@@ -956,7 +1362,11 @@ def create_app(
         never valid or invalid, since that would require a call to the provider. Not
         session-scoped: a browser needs this before it has a session. Never echoes the
         key or the workspace id; this route never touches either value's contents."""
-        return {"assistant": "available" if anthropic_client is not None else "unconfigured"}
+        return {
+            "assistant": "available" if anthropic_client is not None else "unconfigured",
+            "stablecoin_checkout": "available" if stablecoin_config.enabled else "disabled",
+            "direct_checkout": "available" if authenticator.config.mode == "demo" else "disabled",
+        }
 
     return app
 

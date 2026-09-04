@@ -62,6 +62,7 @@ tour remains keyless. Do not expose that mode publicly. Set these variables to m
 `/shopping/*` and `/merchant/*` routes require a verified bearer token:
 
 ```bash
+export ICOMMERCE_ENVIRONMENT=production
 export ICOMMERCE_AUTH_MODE=jwt
 export ICOMMERCE_JWT_ISSUER=https://identity.example.com/
 export ICOMMERCE_JWT_AUDIENCE=icommerce-host
@@ -75,6 +76,13 @@ export ICOMMERCE_METRICS_TOKEN=replace-with-32-plus-byte-monitoring-secret
 export ICOMMERCE_STALE_APPLY_SECONDS=900
 ```
 
+`ICOMMERCE_ENVIRONMENT=production` is a fail-closed startup contract. The host refuses
+to start with demo identity, an in-memory database, HS256 authentication, missing
+metrics authentication, no browser origins, or any browser origin that is not a clean
+HTTPS origin. Leave it at the default `development` only for local work; setting the
+word `production` is an assertion that these edge controls are present, not a cosmetic
+label.
+
 Customer tokens need role `customer` or scope `shopping:use` plus an `email` claim that
 matches a provisioned engine customer. Merchant tokens need role `merchant` or scope
 `merchant:write` plus `store_id` equal to this host's store. Every later request must
@@ -85,9 +93,10 @@ and controlled private deployments, must contain at least 32 bytes, and is mutua
 exclusive with `ICOMMERCE_JWKS_URL`. The JWKS URL must use HTTPS, include a hostname,
 and contain no embedded username or password.
 
-In JWT mode, `POST /shopping/checkout` also requires a validated `shipping_address`
-object; it never substitutes the fictional demo address. The no-body form remains
-available only in demo mode so the keyless tour stays frictionless.
+`POST /shopping/checkout` is deliberately demo-only. JWT deployments receive a 404
+rather than an unpaid order; a production payment rail must collect a validated address
+and settle before it invokes `checkout.commit`. The fictional address remains available
+only in demo mode so the keyless tour stays frictionless.
 
 Every normal response carries `X-Request-Id`, `Cache-Control: no-store`,
 `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and
@@ -98,17 +107,38 @@ time, but never the bearer token, session id, or request body.
 
 `GET /metrics` is disabled with a 404 unless `ICOMMERCE_METRICS_TOKEN` is configured.
 When enabled it requires that value (at least 32 bytes) as a bearer token and exports low-cardinality
-Prometheus counters for route templates, response-policy rewrites, and governed refund
-outcomes. It never labels a metric with a session, customer, operator, change, payment,
-or request id.
+Prometheus counters for route templates, response-policy rewrites, governed kernel
+commands, and stablecoin payment outcomes. It never labels a metric with a session,
+customer, operator, change, payment, or request id.
+
+Stablecoin checkout is disabled by default and has no bundled mainnet addresses. Enable
+it only after configuring a reviewed token, recipient, x402 facilitator, and public API
+origin. The complete environment-variable list, API sequence, and recovery contract are
+in [`docs/stablecoin-checkout.md`](stablecoin-checkout.md).
 
 This authenticates the FastAPI host, not the two separately launched MCP ports. See
 `docs/mcp.md` before exposing either MCP server beyond loopback.
 
-The host keeps chat state, principal bindings, and cart-to-session mappings in process.
-Bindings expire after `ICOMMERCE_SESSION_TTL_SECONDS`, even if a client retains the id.
-Run one worker, or use sticky routing that keeps a session on the worker that created it;
-the approval ledger and target leases themselves are durable and cross-process safe.
+The host durably stores principal and cart-to-session bindings; bindings expire after
+`ICOMMERCE_SESSION_TTL_SECONDS`, even if a client retains the id. Chat transcripts and
+upstream agent session state remain in process, so run one worker or use sticky routing
+for chat requests. Checkout, payment, approval, and target-lease records are durable and
+cross-process safe.
+
+### Web authentication boundary
+
+Both Next applications default to their same-origin `/api/commerce/*` BFF. Configure
+the server-only `ICOMMERCE_API_URL` with the host origin and have your OIDC gateway set
+an HttpOnly, `Secure`, `SameSite=Lax`, path-`/` cookie named
+`__Host-icommerce_access_token` after Authorization Code + PKCE login. The BFF reads
+that cookie on the server, forwards it as a bearer token, forwards only the commerce
+protocol's small header allowlist, never returns the token to JavaScript, and rejects
+cross-site mutations. Set `ICOMMERCE_AUTH_COOKIE` only if the gateway cannot use the
+recommended `__Host-` cookie name.
+
+`NEXT_PUBLIC_API_URL=http://localhost:8000` bypasses the BFF and exists for the local
+demo and test harness only. Do not set a public host URL in an authenticated production
+web build: that would move bearer-token handling back into browser application code.
 
 The separate MCP servers remain loopback-only, principal-scoped processes rather than
 public multi-tenant services. Put an MCP-spec authorization gateway in front of them

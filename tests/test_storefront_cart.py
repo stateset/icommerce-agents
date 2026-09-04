@@ -47,6 +47,17 @@ async def test_the_cart_persists_in_the_engine(store):
     assert store.commerce.carts.get_items(engine_carts[0].id)[0].sku == "TENT-RIDGE-GRN"
 
 
+async def test_a_new_backend_recovers_the_session_cart_from_the_durable_mapping(store):
+    first = EngineStorefront(store)
+    ctx = session(store)
+    await first.add_to_cart(ctx, "TENT-RIDGE-GRN", 1)
+
+    recovered = EngineStorefront(store)
+    assert recovered.session_cart_id(ctx.session_id) == first.session_cart_id(ctx.session_id)
+    cart = await recovered.get_cart(ctx)
+    assert [(item.product_id, item.quantity) for item in cart.items] == [("TENT-RIDGE-GRN", 1)]
+
+
 async def test_concurrent_first_writes_share_one_session_cart(store):
     """The executor deliberately permits parallel tool calls in one turn. Two first
     writes must not both pass the empty cart-id cache and create separate carts."""
