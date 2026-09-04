@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sqlite3
 
@@ -53,6 +54,193 @@ async def test_an_approved_price_update_writes_and_logs(store, kernel):
     assert any(
         json.loads(entry.metadata or "{}").get("change_id") == change.change_id for entry in logs
     )
+
+
+async def test_concurrent_apply_executes_an_approved_change_once(store, kernel):
+    """Approval is single-use and the status transition surrounds the live mutation.
+    Two callers racing the same id must produce one apply and one refusal, not two
+    writes and two audit entries."""
+    from merchant_agent.changes import ChangeNotApplicable
+
+    backend = EngineMerchant(store, kernel)
+    change = await backend.stage_price_update(
+        session(), [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.00)]
+    )
+    backend.approve(change.change_id, "user:acme-operator")
+
+    results = await asyncio.gather(
+        backend.apply_change(session(), change.change_id),
+        backend.apply_change(session(), change.change_id),
+        return_exceptions=True,
+    )
+
+    assert sum(getattr(result, "status", None) is ChangeStatus.APPLIED for result in results) == 1
+    assert sum(isinstance(result, ChangeNotApplicable) for result in results) == 1
+    logs = store.commerce.activity_logs.list(subject_type="staged_change", limit=10)
+    matching = [
+        entry
+        for entry in logs
+        if json.loads(entry.metadata or "{}").get("change_id") == change.change_id
+    ]
+    assert len(matching) == 1
+
+
+async def test_approval_is_bound_to_the_operator_and_consumed(store, kernel):
+    from merchant_agent.changes import ChangeNotApplicable
+
+    backend = EngineMerchant(store, kernel)
+    change = await backend.stage_price_update(
+        session(), [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.00)]
+    )
+    backend.approve(change.change_id, "user:approver-a")
+    other = session().model_copy(update={"operator": "user:approver-b"})
+
+    with pytest.raises(ChangeNotApplicable, match="different operator"):
+        await backend.apply_change(other, change.change_id)
+    assert change.change_id in backend.approved_ids
+
+    approver = session().model_copy(update={"operator": "user:approver-a"})
+    applied = await backend.apply_change(approver, change.change_id)
+    assert applied.status is ChangeStatus.APPLIED
+    assert change.change_id not in backend.approved_ids
+
+
+async def test_a_refused_apply_consumes_its_approval(store, kernel):
+    from merchant_agent.changes import ChangeNotApplicable, GuardrailViolation
+
+    backend = EngineMerchant(store, kernel)
+    change = await backend.stage_price_update(
+        session(), [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.00)]
+    )
+    backend.approve(change.change_id, "user:acme-operator")
+    backend.config = backend.config.model_copy(update={"max_price_delta_pct": 1.0})
+
+    with pytest.raises(GuardrailViolation):
+        await backend.apply_change(session(), change.change_id)
+    assert change.change_id not in backend.approved_ids
+    assert store.approval_record(change.change_id)["state"] == "failed"
+    assert "GuardrailViolation" in store.approval_record(change.change_id)["last_error"]
+
+    backend.config = backend.config.model_copy(update={"max_price_delta_pct": 20.0})
+    with pytest.raises(ChangeNotApplicable, match="has not been approved"):
+        await backend.apply_change(session(), change.change_id)
+
+
+async def test_failure_after_mutation_starts_requires_reconciliation(store, kernel, monkeypatch):
+    from merchant_agent.changes import ChangeNotApplicable
+
+    backend = EngineMerchant(store, kernel)
+    change = await backend.stage_price_update(
+        session(), [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.00)]
+    )
+    backend.approve(change.change_id, "user:acme-operator")
+
+    async def ambiguous_failure(*_args, **_kwargs):
+        raise RuntimeError("simulated failure after mutation dispatch")
+
+    monkeypatch.setattr("engine_backend.merchant._apply_change", ambiguous_failure)
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        await backend.apply_change(session(), change.change_id)
+
+    record = store.approval_record(change.change_id)
+    assert record["state"] == "reconciliation_required"
+    assert "RuntimeError" in record["last_error"]
+    with pytest.raises(ChangeNotApplicable, match="reconciliation"):
+        backend.approve(change.change_id, "user:acme-operator")
+    with pytest.raises(ChangeNotApplicable, match="reconciliation"):
+        await backend.apply_change(session(), change.change_id)
+
+    competing = await backend.stage_price_update(
+        session(), [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=189.00)]
+    )
+    backend.approve(competing.change_id, "user:acme-operator")
+    with pytest.raises(ChangeNotApplicable, match="already being changed"):
+        await backend.apply_change(session(), competing.change_id)
+
+
+async def test_durable_approval_survives_backend_recreation(tmp_path):
+    from pathlib import Path
+
+    from engine_backend.kernel import KernelClient
+    from engine_backend.seed import seed_store
+    from engine_backend.store import EngineStore
+
+    db_path = str(tmp_path / "durable.db")
+    first_store = EngineStore(db_path)
+    seed_store(first_store.commerce)
+    first = EngineMerchant(
+        first_store,
+        KernelClient(
+            first_store, Path("config/kernel-policy.json"), Path("config/kernel-principal.json")
+        ),
+    )
+    change = await first.stage_price_update(
+        session(), [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.00)]
+    )
+    first.approve(change.change_id, "user:acme-operator")
+
+    second_store = EngineStore(db_path)
+    second = EngineMerchant(
+        second_store,
+        KernelClient(
+            second_store, Path("config/kernel-policy.json"), Path("config/kernel-principal.json")
+        ),
+    )
+    assert change.change_id in second.approved_ids
+    applied = await second.apply_change(session(), change.change_id)
+
+    assert applied.status is ChangeStatus.APPLIED
+    assert second_store.approval_record(change.change_id)["state"] == "applied"
+    assert first_store.approval_record(change.change_id)["state"] == "applied"
+
+
+async def test_stale_approved_price_change_cannot_overwrite_newer_live_state(store, kernel):
+    """The approved preview is 219→199. After another approved change makes the live
+    price 209, the old approval no longer describes the write and must be refused."""
+    from merchant_agent.changes import ChangeNotApplicable
+
+    backend = EngineMerchant(store, kernel)
+    stale = await backend.stage_price_update(
+        session(), [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.00)]
+    )
+    newer = await backend.stage_price_update(
+        session(), [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=209.00)]
+    )
+    backend.approve(stale.change_id, "user:acme-operator")
+    backend.approve(newer.change_id, "user:acme-operator")
+
+    await backend.apply_change(session(), newer.change_id)
+    with pytest.raises(ChangeNotApplicable, match="changed since this change was staged"):
+        await backend.apply_change(session(), stale.change_id)
+
+    assert store.commerce.products.get_variant_by_sku("TENT-RIDGE-TAN").price == 209.00
+    assert stale.change_id in {
+        pending.change_id for pending in await backend.get_pending_changes(session())
+    }
+
+
+async def test_concurrent_changes_for_one_target_use_the_reviewed_live_value(store, kernel):
+    """Target locking makes the fresh-state check meaningful when separately approved
+    changes race: exactly one reviewed 219-based write may win."""
+    from merchant_agent.changes import ChangeNotApplicable
+
+    backend = EngineMerchant(store, kernel)
+    changes = [
+        await backend.stage_price_update(
+            session(), [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=price)]
+        )
+        for price in (199.00, 209.00)
+    ]
+    for change in changes:
+        backend.approve(change.change_id, "user:acme-operator")
+
+    results = await asyncio.gather(
+        *(backend.apply_change(session(), change.change_id) for change in changes),
+        return_exceptions=True,
+    )
+
+    assert sum(getattr(result, "status", None) is ChangeStatus.APPLIED for result in results) == 1
+    assert sum(isinstance(result, ChangeNotApplicable) for result in results) == 1
 
 
 async def test_a_restock_of_an_existing_sku_is_not_governed(store, kernel):
@@ -233,6 +421,42 @@ async def test_an_applied_campaign_writes_a_campaign_custom_object(store, kernel
     # A campaign is not a governed command: activity-log evidence, no receipt.
     assert "activity log" in applied.guardrail_notes[-1]
     assert "receipt" not in applied.guardrail_notes[-1].lower()
+
+
+async def test_campaign_update_preserves_fields_the_draft_omits(store, kernel):
+    from merchant_agent.types import CampaignDraft
+
+    backend = EngineMerchant(store, kernel)
+    created = await backend.stage_campaign(
+        session(),
+        CampaignDraft(
+            name="Spring push",
+            objective="awareness",
+            budget=2500.0,
+            starts="2026-03-01",
+            ends="2026-03-14",
+        ),
+    )
+    backend.approve(created.change_id, "user:acme-operator")
+    await backend.apply_change(session(), created.change_id)
+    campaign = (await backend.get_campaign_performance(session()))[0]
+
+    update = await backend.stage_campaign(
+        session(),
+        CampaignDraft(
+            campaign_id=campaign.campaign_id,
+            name=campaign.name,
+            budget=3000.0,
+        ),
+    )
+    backend.approve(update.change_id, "user:acme-operator")
+    await backend.apply_change(session(), update.change_id)
+
+    updated = (await backend.get_campaign_performance(session(), campaign.campaign_id))[0]
+    assert updated.budget == 3000.0
+    assert updated.objective == "awareness"
+    assert updated.starts == "2026-03-01"
+    assert updated.ends == "2026-03-14"
 
 
 async def test_a_promotion_over_the_guardrail_cap_is_refused(store, kernel):

@@ -21,6 +21,24 @@ export interface ChangeEvidence {
   note: string;
 }
 
+export type ApplyControlState =
+  | "approved"
+  | "applying"
+  | "applied"
+  | "failed"
+  | "reconciliation_required";
+
+export interface ApplyControl {
+  change_id: string;
+  approved_by: string;
+  approved_at: string;
+  state: ApplyControlState;
+  attempt_id?: string | null;
+  claimed_at?: string | null;
+  finished_at?: string | null;
+  last_error?: string | null;
+}
+
 export interface StagedChange {
   change_id: string;
   kind: string;
@@ -34,6 +52,8 @@ export interface StagedChange {
   guardrail_notes: string[];
   /** Structured evidence for applied changes; empty until the host attaches it. */
   evidence?: ChangeEvidence[];
+  /** Durable backend approval/apply state; never inferred from browser state. */
+  apply_control?: ApplyControl | null;
   currency?: string | null;
 }
 

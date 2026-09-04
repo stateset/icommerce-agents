@@ -13,6 +13,7 @@ campaign spend/revenue with no campaign) is ``None`` with a ``note``, never a ze
 
 from __future__ import annotations
 
+from contextlib import AsyncExitStack
 from typing import Any
 
 from merchant_agent.backend import MerchantBackend
@@ -44,7 +45,7 @@ from shopping_agent.types import SearchFilters
 from stateset_embedded import Commerce
 
 from engine_backend import analysis, custom_objects, money, staging
-from engine_backend.apply import CAMPAIGN_TYPE, ApplyContext
+from engine_backend.apply import CAMPAIGN_TYPE, ApplyContext, validate_preconditions
 from engine_backend.apply import apply_change as _apply_change
 from engine_backend.catalog import CatalogRow, catalog_rows, list_variants
 from engine_backend.kernel import KernelClient
@@ -64,7 +65,6 @@ class EngineMerchant(MerchantBackend):
         self.store = store
         self.kernel = kernel
         self.config = MerchantAgentConfig()
-        self._approved: set[str] = set()
 
     # -- Host approval surface ---------------------------------------------------
 
@@ -72,11 +72,14 @@ class EngineMerchant(MerchantBackend):
         """Record that ``approved_by`` (the host's operator, never a tool argument) has
         approved ``change_id``. A preview card and a chat approval approve nothing —
         only this method, called from the host's own approval surface, does."""
-        self._approved.add(change_id)
+        try:
+            self.store.record_approval(change_id, approved_by)
+        except ValueError as error:
+            raise ChangeNotApplicable(str(error)) from error
 
     @property
     def approved_ids(self) -> set[str]:
-        return set(self._approved)
+        return self.store.approved_change_ids()
 
     # -- Performance -------------------------------------------------------------
 
@@ -419,28 +422,75 @@ class EngineMerchant(MerchantBackend):
     # -- Apply dispatch (the one place that mutates) ------------------------------
 
     async def apply_change(self, session: MerchantSessionContext, change_id: str) -> StagedChange:
-        change = await staging.load(self.store, change_id)
-        if change is None:
-            raise ChangeNotApplicable(f"no change with id {change_id!r} to apply")
-        if change.status is not ChangeStatus.STAGED:
-            raise ChangeNotApplicable(
-                f"change {change_id} is {change.status.value}, not staged — nothing to apply"
-            )
-        if change_id not in self._approved:
-            raise ChangeNotApplicable(f"change {change_id} has not been approved")
+        # Status-check + live writes + final status persistence are one logical
+        # operation. Without an outer lock, two simultaneous calls can both observe
+        # STAGED and execute the mutation before either one saves APPLIED.
+        async with self.store.serialized(f"apply:{change_id}"):
+            change = await staging.load(self.store, change_id)
+            if change is None:
+                raise ChangeNotApplicable(f"no change with id {change_id!r} to apply")
+            if change.status is not ChangeStatus.STAGED:
+                raise ChangeNotApplicable(
+                    f"change {change_id} is {change.status.value}, not staged — nothing to apply"
+                )
 
-        # Guardrails run again against the config now in force, not the one at stage time.
-        violations = check_guardrails(change.kind, change.items, self.config)
-        if violations:
-            raise GuardrailViolation(violations)
+            targets = sorted({item.target for item in change.items})
+            claim = self.store.claim_approval(change_id, session.operator, targets)
+            if claim.refusal == "missing":
+                raise ChangeNotApplicable(f"change {change_id} has not been approved")
+            if claim.refusal == "different_operator":
+                raise ChangeNotApplicable(
+                    f"change {change_id} was approved by a different operator"
+                )
+            if claim.refusal == "already_claimed":
+                raise ChangeNotApplicable(f"change {change_id} is already being applied")
+            if claim.refusal == "already_applied":
+                raise ChangeNotApplicable(f"change {change_id} approval was already consumed")
+            if claim.refusal == "reconciliation_required":
+                raise ChangeNotApplicable(
+                    f"change {change_id} requires operator reconciliation before retry"
+                )
+            if claim.refusal == "target_claimed":
+                raise ChangeNotApplicable(
+                    f"target {claim.blocked_target} is already being changed by another apply"
+                )
+            if claim.attempt_id is None:  # defensive exhaustiveness
+                raise RuntimeError(f"approval claim for {change_id} returned no attempt id")
 
-        # The five-kind write dispatch lives in engine_backend/apply.py; see its module
-        # docstring and docs/enforcement.md for the governed/ungoverned finding.
-        payload = await staging.load_change_payload(self.store, change_id)
-        ctx = ApplyContext(store=self.store, kernel=self.kernel, operator=session.operator)
-        applied, evidence = await _apply_change(ctx, change, payload)
-        await staging.save(self.store, applied, evidence=evidence)
-        return applied
+            # Different staged changes can target the same SKU. Hold target locks in
+            # stable order across the fresh-state check and writes, preventing a
+            # same-process check/write race without deadlocking multi-item changes.
+            mutation_started = False
+            try:
+                async with AsyncExitStack() as locks:
+                    for target in targets:
+                        await locks.enter_async_context(self.store.serialized(f"mutation:{target}"))
+
+                    violations = check_guardrails(change.kind, change.items, self.config)
+                    if violations:
+                        raise GuardrailViolation(violations)
+
+                    ctx = ApplyContext(
+                        store=self.store, kernel=self.kernel, operator=session.operator
+                    )
+                    payload = await staging.load_change_payload(self.store, change_id)
+                    await validate_preconditions(ctx, change, payload)
+
+                    # The five-kind write dispatch lives in engine_backend/apply.py; see
+                    # its module docstring and docs/enforcement.md for the governed finding.
+                    mutation_started = True
+                    applied, evidence = await _apply_change(ctx, change, payload)
+                    await staging.save(self.store, applied, evidence=evidence)
+                self.store.finish_approval_attempt(change_id, claim.attempt_id, outcome="applied")
+                return applied
+            except BaseException as error:
+                self.store.finish_approval_attempt(
+                    change_id,
+                    claim.attempt_id,
+                    outcome=("reconciliation_required" if mutation_started else "failed"),
+                    error=f"{type(error).__name__}: {error}",
+                )
+                raise
 
     async def discard_change(
         self,

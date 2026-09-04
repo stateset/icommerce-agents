@@ -154,3 +154,33 @@ before invoking it, and a client configured to auto-approve tool calls removes t
 guarantee outright, with nothing in this process able to detect or refuse it. The two
 paths are not equivalent, and the engine's own policy check on `payments.create_refund`
 is what still holds regardless of which one an operator used to reach it.
+
+On both paths, the backend binds approval to the approving operator in the durable
+`icommerce_agent_approvals` SQLite ledger. Applying atomically claims an `approved`
+record as `applying`, so one approval survives a restart and exactly one competing
+process can own the attempt. A successful attempt becomes `applied`; a refusal before
+mutation becomes `failed` and requires fresh approval.
+
+If an exception happens after mutation dispatch begins, the ledger records
+`reconciliation_required` and refuses both reapproval and another apply. A process crash
+leaves the equally visible `applying` state. This is deliberate: several engine calls
+cannot be wrapped in the adapter ledger's SQLite transaction, so claiming that an
+ambiguous multi-item attempt is safely retryable would risk duplicating or overwriting
+part of it. `GET /merchant/changes` exposes this control state, and the portal renders
+`approved`, `applying`, and `reconciliation required` from that durable record rather
+than from browser-local memory.
+
+The approval claim transaction also inserts one durable lease per affected target.
+Different change ids therefore cannot mutate the same SKU concurrently, even from
+separate worker processes; a successful or safely refused attempt releases its leases,
+while an ambiguous attempt retains them. Immediately before an overwrite, the adapter
+also compares the current price, listing field, campaign field, or product status with
+the `before` value the operator reviewed. If it moved after staging, the approval is
+consumed and the change stays staged with an instruction to create and approve a fresh
+diff. Additive restocks deliberately keep working across unrelated stock movement.
+
+The HTTP route records the approval in two independent places: the session state that
+Claude Commerce's executor checks before dispatch, and the operator-bound durable ledger
+checked at the StateSet mutation boundary. After a merchant turn, the host reconciles
+session marks with the ledger's remaining unspent marks, including when streaming or
+the apply attempt fails.

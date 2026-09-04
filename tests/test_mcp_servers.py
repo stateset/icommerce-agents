@@ -59,6 +59,20 @@ async def test_apply_change_refuses_without_a_prior_host_approve(store, kernel):
     assert store.commerce.products.get_variant_by_sku("TENT-RIDGE-TAN").price != 199.00
 
 
+async def test_host_approve_refuses_an_unknown_change(store):
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from mcp_servers.merchant import build_merchant_server
+
+    async with create_connected_server_and_client_session(
+        build_merchant_server(store.db_path)
+    ) as client:
+        result = await client.call_tool("host_approve", {"change_id": "chg-does-not-exist"})
+
+    assert result.isError
+    assert "no change with id" in result.content[0].text
+
+
 async def test_apply_change_succeeds_after_host_approve(store, kernel):
     from mcp.shared.memory import create_connected_server_and_client_session
 

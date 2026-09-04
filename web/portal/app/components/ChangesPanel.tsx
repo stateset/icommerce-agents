@@ -38,7 +38,13 @@ export function ChangesPanel({ changes }: { changes: Record<string, StagedChange
       ) : (
         <div className="changes-list">
           {list.map((change) => {
-            const approved = approvedIds.has(change.change_id);
+            const control = change.apply_control;
+            const controlState = control?.state;
+            const approved =
+              approvedIds.has(change.change_id) || controlState === "approved";
+            const applying = controlState === "applying";
+            const needsReconciliation = controlState === "reconciliation_required";
+            const approvalBlocked = applying || needsReconciliation;
             return (
               <div className="change-card" key={change.change_id}>
                 <div className="kind">{change.kind.replace(/_/g, " ")}</div>
@@ -56,14 +62,23 @@ export function ChangesPanel({ changes }: { changes: Record<string, StagedChange
                   ))}
                 </div>
                 <span className={`status-tag ${change.status}`}>{change.status}</span>
+                {change.status === "staged" && controlState ? (
+                  <span className={`status-tag control-${controlState}`}>
+                    {controlState.replace(/_/g, " ")}
+                  </span>
+                ) : null}
                 {change.status === "staged" ? (
                   <button
                     type="button"
                     className="approve-btn"
-                    disabled={approving === change.change_id || approved}
+                    disabled={approving === change.change_id || approved || approvalBlocked}
                     onClick={() => approve(change.change_id)}
                   >
-                    {approved
+                    {applying
+                      ? "Apply in progress"
+                      : needsReconciliation
+                        ? "Reconciliation required"
+                        : approved
                       ? "Approved -- apply it via chat"
                       : approving === change.change_id
                         ? "Approving..."
@@ -73,6 +88,14 @@ export function ChangesPanel({ changes }: { changes: Record<string, StagedChange
                 {change.status === "staged" && approved ? (
                   <p className="apply-hint">
                     Ask the assistant to apply {change.change_id} to complete the write.
+                  </p>
+                ) : null}
+                {change.status === "staged" && approvalBlocked ? (
+                  <p className={`control-note ${needsReconciliation ? "danger" : ""}`}>
+                    {needsReconciliation
+                      ? "The write outcome is ambiguous. Inspect live state and the audit log before taking another action."
+                      : "Another worker claimed this approval. Reload after the apply finishes; if it remains here after a worker failure, reconcile it before retrying."}
+                    {control?.last_error ? ` Last error: ${control.last_error}` : ""}
                   </p>
                 ) : null}
                 {change.status === "applied" ? <Evidence entries={change.evidence} /> : null}

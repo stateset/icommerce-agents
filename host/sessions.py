@@ -9,6 +9,7 @@ message list it extends in place, and the session state (``ShoppingSessionState`
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,6 +23,9 @@ class ChatSession[StateT: BaseModel]:
     session_id: str
     state: StateT
     messages: list[dict[str, Any]] = field(default_factory=list)
+    # Streaming a turn mutates both transcript and provenance state. Keep that pair
+    # ordered even when one client submits overlapping requests for the same session.
+    turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
 class SessionRegistry[StateT: BaseModel]:

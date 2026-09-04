@@ -28,7 +28,7 @@ and keeps provenance ids stable across turns.
 |---|---|
 | `search_products` | `engine_backend.search.search` over `commerce.products.list()`; every filter, `category` included, is applied in Python against this repo's own `Merchandising` custom object — the engine's catalog has no category column |
 | `get_product_details` | `commerce.products.get` / `get_variant_by_sku` + `catalog.read_merchandising` + `catalog.list_variants` |
-| `get_cart` / `add_to_cart` / `update_cart_item` / `remove_from_cart` | `commerce.carts.*` (`create` once per session, then `get_items`, `add_item`, `update_item`, `remove_item`). The session→cart mapping is `EngineStorefront._cart_ids`, read by the host through the host-only `session_cart_id`; `carts.for_customer` is not used by any backend method |
+| `get_cart` / `add_to_cart` / `update_cart_item` / `remove_from_cart` | `commerce.carts.*` (`create` once per session, then `get_items`, `add_item`, `update_item`, `remove_item`). First creation is serialized so concurrent tools cannot split one session across two carts, and the backend defensively enforces the configured per-item cap even when a direct host caller bypasses the executor. The session→cart mapping is `EngineStorefront._cart_ids`, read by the host through the host-only `session_cart_id`; `carts.for_customer` is not used by any backend method |
 | `get_orders` / `get_order` | `commerce.orders.list` / `.get` |
 | `get_preferences` | derived from `commerce.customers.get` (no preferences object in the engine) |
 | `search_policies` / `get_disclosure` | `engine_backend/content.py`'s static ACME Supply policy text (the engine has no policy/disclosure domain) |
@@ -41,14 +41,14 @@ and keeps provenance ids stable across turns.
 |---|---|
 | `get_business_snapshot` | `commerce.analytics.sales_summary` plus `get_inventory_alerts` for the low-stock count; traffic and conversion are `None` with a `note` (`customer_metrics` is not called) |
 | `query_metrics` | `commerce.analytics.revenue_by_period` / `.top_products`; an unsupported metric or segment returns a series with no points and a `note` saying why, never a defaulted zero |
-| `get_campaign_performance` | `campaign` custom objects (the engine has no campaign domain) |
+| `get_campaign_performance` | `campaign` custom objects (the engine has no campaign domain); updates merge omitted draft fields from the current record and refuse a stale reviewed field instead of replacing the whole object with `None` values |
 | `search_listings` / `get_listing` | `catalog.catalog_rows`, with one catalog scan per call; every filter and sort is applied in Python |
 | `get_inventory_alerts` | `commerce.analytics.low_stock_items` (only `kind="low_stock"`; the engine has no slow-mover analytic) |
 | `get_order_issues` | derived from `commerce.orders.list` (age vs. `fulfillment_status`) |
 | `get_pricing_context` | `catalog.catalog_rows` + `Merchandising.unit_cost` |
 | `execute_analysis_query` / `get_analysis_schema` | delegates to `engine_backend/analysis.py`'s `run_query` and `SCHEMA`: a capped, `SELECT`-only query straight through `store.readonly_sql()` (see below) — a deliberate feature, not a binding gap |
 | `stage_*` / `get_pending_changes` / `discard_change` | delegates to `engine_backend/staging.py`, which resolves the catalog rows, checks guardrails, and persists the result in its `custom_objects`-backed `StagedChange` store; no live write |
-| `apply_change` | loads, validates status/approval, re-checks guardrails, loads the change's staged payload, then delegates the write to `engine_backend/apply.py`'s `apply_change(ctx, change, payload)` — which returns the `APPLIED` copy of the change **and** the `Evidence` list the write produced. See the two tables below |
+| `apply_change` | the HTTP approval route marks both Claude Commerce's per-session executor state and the adapter's durable, operator-bound approval ledger; then apply atomically claims that approval, loads and validates status, re-checks guardrails, locks the affected targets, refuses stale price/status previews, loads the change's staged payload, and delegates the write to `engine_backend/apply.py`'s `apply_change(ctx, change, payload)` — which returns the `APPLIED` copy of the change **and** the `Evidence` list the write produced. An ambiguous post-dispatch failure is held for reconciliation rather than made retryable. See the two tables below |
 
 ### `apply.apply_change` × engine write × governed? × evidence
 
@@ -69,6 +69,16 @@ One row per write `engine_backend/apply.py`'s `apply_change` can perform:
 
 Full detail, including the exact error codes and the schema/trigger inspection behind
 the direct-SQL path, is in `docs/enforcement.md`.
+
+## Deployment prompt policy (`engine_backend/agent_config.py`)
+
+The host and live eval runner construct both roles from the same ACME-specific configs.
+They retain the pinned upstream prompts and add explicit wording for the two failures
+observed in the 2026-09-03 live eval: medical-condition shopping must name a qualified
+clinician rather than substitute manufacturer documentation, and a successful
+`stage_*` result must never be described as applied or live. The MCP servers repeat the
+same rules in their server instructions because they expose tools rather than running
+the Messages API agents themselves.
 
 ### `Evidence`: what actually backed a write
 
@@ -290,15 +300,21 @@ connection and the transient read under test.
 
 Three things about a second process are true and are *not* what the pin covers:
 
+The adapter's durable ledger is created by `EngineStore._ensure_control_schema` before
+the embedded handle opens. Later ledger operations use the short-lived connection from
+`EngineStore._control_connection`; the store's pinned connection keeps those transient
+opens from invalidating the embedded handle's WAL view.
+
 - The `"direct_sql"` lock is an `asyncio` lock, so it orders direct-SQL writes only
   within one process. Two processes writing at once are ordered by SQLite's own file
   lock and wait on the `busy_timeout` `write_sql` sets, not by that lock.
-- `EngineMerchant._approved` is an in-memory set, and it is the gate `apply_change`
-  checks before any write. Staged changes live in `custom_objects` and so are shared
-  across processes, but the host approval that authorises applying one is not: an
-  approval granted in one process does not authorise an apply in another, and does not
-  survive a restart. This is the per-process item with the most riding on it, and the one
-  a reader is most likely to assume is shared.
+- Approval and its single-use claim live in the adapter-owned
+  `icommerce_agent_approvals` table. They survive backend recreation, and a transactional
+  `approved` → `applying` compare-and-set lets only one process claim a staged id. The
+  same transaction claims every affected target in `icommerce_agent_target_leases`, so
+  different changes for one SKU cannot cross-worker race either. Process death or an
+  ambiguous post-dispatch failure deliberately retains the visible `applying` or
+  `reconciliation_required` state and its target leases for operator reconciliation.
 - The rest of the in-memory state beside the store is per process by construction:
   `EngineStore._bindings` and `EngineStorefront._cart_ids`. A session belongs to the
   process that opened it.

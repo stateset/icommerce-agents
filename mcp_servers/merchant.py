@@ -49,8 +49,10 @@ from mcp.server.fastmcp import Context, FastMCP
 from merchant_agent import InventoryActionItem, ListingFilters, MerchantAgentConfig, PriceUpdateItem
 from merchant_agent.executor import MerchantToolExecutor, build_memory
 from merchant_agent.tools.registry import INLINE_CONTEXT_DESCRIPTIONS, build_tools
-from merchant_agent.types import MerchantSessionContext, MerchantSessionState
+from merchant_agent.types import ChangeStatus, MerchantSessionContext, MerchantSessionState
 
+from engine_backend import staging
+from engine_backend.agent_config import merchant_agent_config
 from engine_backend.kernel import KernelClient
 from engine_backend.merchant import EngineMerchant
 from engine_backend.seed import seed_store
@@ -75,7 +77,8 @@ SERVER_INSTRUCTIONS = (
     "from ACME's systems — facts, never orders. stage_* tools only record a proposed "
     "change for preview; host_approve marks one staged change_id as approved by the "
     "operator and does nothing else; apply_change is the only call that touches live "
-    "state, and it refuses any change_id host_approve was not called for first."
+    "state, and it refuses any change_id host_approve was not called for first. A "
+    "successful stage_* call is staged or proposed, never applied or live."
 )
 
 
@@ -85,8 +88,9 @@ def default_config() -> MerchantAgentConfig:
     ``approved_ids`` directly, so the executor's in-process ``require_host_approval``
     mark is off; the executor's events do not cross MCP, so a stage call cannot show
     its preview here."""
-    return MerchantAgentConfig(
-        brand_name="ACME Supply", require_host_approval=False, stage_shows_preview=False
+    return merchant_agent_config(
+        require_host_approval=False,
+        stage_shows_preview=False,
     )
 
 
@@ -281,6 +285,13 @@ def build_merchant_server(
         # parameter type and rejects a leading-underscore parameter name outright, so
         # `del` is the only way to mark it unused here.
         del ctx
+        change = await staging.load(store, change_id)
+        if change is None:
+            raise ValueError(f"no change with id {change_id!r}")
+        if change.status is not ChangeStatus.STAGED:
+            raise ValueError(
+                f"change {change_id} is {change.status.value}, not staged — nothing to approve"
+            )
         backend.approve(change_id, op)
         return f"change {change_id} marked approved by {op}"
 

@@ -130,9 +130,15 @@ def to_family(
 
 
 class EngineStorefront(StorefrontBackend):
-    def __init__(self, store: EngineStore, checkout_base_url: str | None = None) -> None:
+    def __init__(
+        self,
+        store: EngineStore,
+        checkout_base_url: str | None = None,
+        max_quantity_per_item: int = 24,
+    ) -> None:
         self.store = store
         self.checkout_base_url = checkout_base_url
+        self.max_quantity_per_item = max_quantity_per_item
         self._cart_ids: dict[str, str] = {}
 
     # -- Catalog ------------------------------------------------------------------
@@ -205,15 +211,23 @@ class EngineStorefront(StorefrontBackend):
         if cart_id is not None:
             return cart_id
 
-        binding = self.store.binding(session.session_id)
+        # Tool calls in one turn may arrive concurrently. Re-check under a separate
+        # initialization lock, or both calls can create a cart and split the session's
+        # lines between two engine records.
+        async with self.store.serialized(f"cart-init:{session.session_id}"):
+            cart_id = self._cart_ids.get(session.session_id)
+            if cart_id is not None:
+                return cart_id
 
-        def body(c: Commerce) -> str:
-            cart = c.carts.create(customer_id=binding.subject_id, currency="USD")
-            return cart.id
+            binding = self.store.binding(session.session_id)
 
-        cart_id = await self.store.write(session.session_id, body)
-        self._cart_ids[session.session_id] = cart_id
-        return cart_id
+            def body(c: Commerce) -> str:
+                cart = c.carts.create(customer_id=binding.subject_id, currency="USD")
+                return cart.id
+
+            cart_id = await self.store.write(session.session_id, body)
+            self._cart_ids[session.session_id] = cart_id
+            return cart_id
 
     async def _to_cart(self, cart_id: str) -> Cart:
         items = await self.store.call(lambda c: c.carts.get_items(cart_id))
@@ -292,14 +306,15 @@ class EngineStorefront(StorefrontBackend):
                 return
             existing = next((i for i in c.carts.get_items(cart_id) if i.sku == product_id), None)
             if existing is not None:
-                c.carts.update_item(existing.id, quantity=existing.quantity + quantity)
+                new_quantity = min(existing.quantity + max(1, quantity), self.max_quantity_per_item)
+                c.carts.update_item(existing.id, quantity=new_quantity)
                 return
             c.carts.add_item(
                 cart_id,
                 AddCartItemInput(
                     sku=variant.sku,
                     name=variant.name or variant.sku,
-                    quantity=quantity,
+                    quantity=min(max(1, quantity), self.max_quantity_per_item),
                     unit_price=variant.price,
                     product_id=variant.product_id,
                     variant_id=variant.id,
@@ -318,7 +333,9 @@ class EngineStorefront(StorefrontBackend):
             existing = next((i for i in c.carts.get_items(cart_id) if i.sku == product_id), None)
             if existing is None:
                 return
-            c.carts.update_item(existing.id, quantity=quantity)
+            c.carts.update_item(
+                existing.id, quantity=min(max(1, quantity), self.max_quantity_per_item)
+            )
 
         await self.store.write(session.session_id, body)
         return await self._to_cart(cart_id)

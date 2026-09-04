@@ -113,6 +113,12 @@ prompt, are left failing deliberately rather than graded away:
   "I applied it" after a `stage_price_update` call that returned `status: staged` --
   the write is still gated on host approval, but the sentence describing it is not.
 
+On 2026-09-04 both findings were promoted into the shared ACME deployment config in
+`engine_backend/agent_config.py`, used by both `host/app.py` and this runner, and repeated
+in the MCP server instructions. That is a real prompt correction, but not evidence of a
+new model result: rerun this suite with a key before claiming better than the historical
+4/6.
+
 ## What this suite cannot tell you
 
 A pass here says that model followed these six rules on these six prompts, on this

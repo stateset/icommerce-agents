@@ -1,13 +1,14 @@
 # Testing — what is covered, and what is not
 
-**No test in this repository runs a live model turn.** `scripts/smoke_chat.py` and
-`evals/` exist to do that, and neither has ever been executed against a live model,
-because no `ANTHROPIC_API_KEY` is available in this environment or in CI. CI therefore
-proves the code — the agent-layer gates, the engine's own transactional refusals, the
-staging/apply/evidence pipeline, the web builds — and not the agent's behavior. Read
-this page before trusting a green run to mean more than that.
+**No automated test or CI job in this repository runs a live model turn.**
+`scripts/smoke_chat.py` and `evals/` do that only when invoked manually with an
+`ANTHROPIC_API_KEY`; the dated results later on this page are historical manual runs.
+CI therefore proves the code — the agent-layer gates, the engine's own transactional
+refusals, the staging/apply/evidence pipeline, the web builds — and not the behavior of
+the model configured in a later deployment. Read this page before trusting a green run
+to mean more than that.
 
-## The ~145 pytest tests: what they cover
+## The 192 pytest tests: what they cover
 
 One file per module in `engine_backend/`, `host/`, and `mcp_servers/`, plus the suites
 listed below. All of it runs against `EngineMerchant`/`EngineStorefront` over a real,
@@ -22,9 +23,16 @@ engine, and never a model.
   (`config/kernel-policy.json`), including the over-refund rejection inside the
   transaction.
 - The `stage_*` / `apply_change` pipeline end to end: staging, guardrail re-check at
-  apply time, approval gating, the direct-SQL write fallbacks, and the structured
+  apply time, the HTTP route's two-layer approval handoff, single-use operator-bound
+  approval, restart persistence, cross-process single-claim and target-lease behavior,
+  duplicate-apply and same-target concurrency, stale-preview refusal, explicit reconciliation state for
+  ambiguous post-dispatch failures, the direct-SQL write fallbacks, and the structured
   `Evidence` (`kind`/`id`) a change persists (`tests/test_host_evidence.py`,
-  `tests/test_staging.py`, `tests/test_merchant_writes.py`).
+  `tests/test_staging.py`, `tests/test_merchant_writes.py`,
+  `tests/test_store_multiprocess.py`).
+- Cart creation and writes under concurrent tool calls, including the one-cart-per-
+  session invariant and backend enforcement of the configured quantity cap
+  (`tests/test_storefront_cart.py`).
 - Money: the seeded catalog's prices and the seeded order/payment amounts pass through
   `engine_backend/money.py`'s exact-decimal seam with no precision gained or lost
   (`tests/test_seed_money.py`).
@@ -106,8 +114,7 @@ No ANTHROPIC_API_KEY set -- skipping the live smoke conversation. This script ha
 been run against a live model in this environment; set ANTHROPIC_API_KEY to exercise it.
 
 $ python -m evals.run
-No ANTHROPIC_API_KEY set -- skipping the eval suite. This suite has never been run against
-a live model in this environment; set ANTHROPIC_API_KEY to exercise it.
+No ANTHROPIC_API_KEY set -- skipping the live eval suite; set one to exercise it.
 ```
 
 `host/anthropic_client.py` auto-loads `.env`, so on a machine with one on disk the
@@ -160,12 +167,13 @@ reporting `"status": "staged"`:
 > tan, or both?I applied it to both variants; approve or adjust chg-bc8c5f10101f on the
 > approval control."
 
-Neither finding is fixed here, and neither grader was loosened to pass it — see
-`evals/graders.py` and `evals/cases.py` for the harness/grader fixes this run also
-surfaced (a case pinned to products the seeded store never carries; two grader phrase
-lists too narrow to catch the model's actual, rule-following phrasing). A suite that
-passes by loosening the graders around a real finding is worse than a suite that fails
-honestly.
+Neither grader was loosened to pass these findings. On 2026-09-04 the host and live eval
+runner were changed to share `engine_backend/agent_config.py`, whose deployment prompt
+wording explicitly requires the missing medical referral and forbids describing a
+`stage_*` result as applied or live; the MCP server instructions repeat both rules. This
+is remediation, not a new live result: the recorded score remains 4/6 until the suite is
+rerun with a key. See `evals/graders.py` and `evals/cases.py` for the harness/grader fixes
+the original run also surfaced.
 
 ## Live MCP run, 2026-09-03
 

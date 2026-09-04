@@ -123,6 +123,18 @@ def _one_shot_writer_process(db_path: str, price: str) -> None:
     _write_price(EngineStore(db_path), price)
 
 
+def _approval_claim_process(
+    db_path: str, change_id: str, ready, go, out, targets: list[str] | None = None
+) -> None:
+    from engine_backend.store import EngineStore
+
+    store = EngineStore(db_path)
+    ready.put(True)
+    go.wait()
+    claim = store.claim_approval(change_id, "user:acme-operator", targets)
+    out.put((change_id, claim.attempt_id, claim.refusal, claim.blocked_target))
+
+
 def _reader_process(db_path, ready, tick, out, *, pin: bool, disk_read: bool, log: bool):
     """A long-lived host process reading through its own engine handle.
 
@@ -234,6 +246,82 @@ def test_a_writer_process_that_exits_between_writes_leaves_no_stale_handle(tmp_p
         _stop(reader, tick)
     assert reader.exitcode == 0
     _assert_tracks(rows)
+
+
+def test_one_durable_approval_can_be_claimed_by_only_one_process(tmp_path):
+    """The approval transition is a SQLite compare-and-set, not an asyncio lock.
+    Separate worker processes racing the same approved id produce exactly one owner."""
+    from engine_backend.store import EngineStore
+
+    db_path = _seeded(tmp_path, "approval.db")
+    store = EngineStore(db_path)
+    change_id = "chg-cross-process"
+    store.record_approval(change_id, "user:acme-operator")
+
+    ready, go, out = _CTX.Queue(), _CTX.Event(), _CTX.Queue()
+    workers = [
+        _CTX.Process(
+            target=_approval_claim_process,
+            args=(db_path, change_id, ready, go, out),
+        )
+        for _ in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    for _ in workers:
+        assert ready.get(timeout=JOIN_TIMEOUT) is True
+    go.set()
+    results = [out.get(timeout=JOIN_TIMEOUT) for _ in workers]
+    for worker in workers:
+        worker.join(JOIN_TIMEOUT)
+        assert worker.exitcode == 0
+
+    attempts = [attempt_id for _, attempt_id, _, _ in results if attempt_id is not None]
+    refusals = [refusal for _, _, refusal, _ in results if refusal is not None]
+    assert len(attempts) == 1
+    assert refusals == ["already_claimed"]
+    record = store.approval_record(change_id)
+    assert record is not None
+    assert record["state"] == "applying"
+    assert record["attempt_id"] == attempts[0]
+
+
+def test_different_changes_cannot_claim_the_same_target_across_processes(tmp_path):
+    from engine_backend.store import EngineStore
+
+    db_path = _seeded(tmp_path, "target-lease.db")
+    store = EngineStore(db_path)
+    change_ids = ["chg-target-a", "chg-target-b"]
+    for change_id in change_ids:
+        store.record_approval(change_id, "user:acme-operator")
+
+    ready, go, out = _CTX.Queue(), _CTX.Event(), _CTX.Queue()
+    workers = [
+        _CTX.Process(
+            target=_approval_claim_process,
+            args=(db_path, change_id, ready, go, out, [SKU]),
+        )
+        for change_id in change_ids
+    ]
+    for worker in workers:
+        worker.start()
+    for _ in workers:
+        assert ready.get(timeout=JOIN_TIMEOUT) is True
+    go.set()
+    results = [out.get(timeout=JOIN_TIMEOUT) for _ in workers]
+    for worker in workers:
+        worker.join(JOIN_TIMEOUT)
+        assert worker.exitcode == 0
+
+    winner = next(result for result in results if result[1] is not None)
+    loser = next(result for result in results if result[2] is not None)
+    assert loser[2:] == ("target_claimed", SKU)
+    assert store.approval_record(winner[0])["state"] == "applying"
+    assert store.approval_record(loser[0])["state"] == "approved"
+
+    store.finish_approval_attempt(winner[0], winner[1], outcome="failed", error="test release")
+    retry = store.claim_approval(loser[0], "user:acme-operator", [SKU])
+    assert retry.attempt_id is not None
 
 
 def test_an_unpinned_reader_process_goes_stale_on_another_processs_writes(tmp_path):

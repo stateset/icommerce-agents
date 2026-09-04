@@ -120,6 +120,25 @@ def test_chat_routes_reject_a_missing_or_unknown_session_id_before_any_model_cal
     )
 
 
+def test_http_write_inputs_are_bounded_before_reaching_the_engine_or_model(tmp_path):
+    c = client(tmp_path)
+    shopping = {"X-Session-Id": c.post("/shopping/session").json()["session_id"]}
+    merchant = {"X-Session-Id": c.post("/merchant/session").json()["session_id"]}
+
+    for quantity in (0, -1, 25):
+        response = c.post(
+            "/shopping/cart/add",
+            json={"product_id": "TENT-RIDGE-GRN", "quantity": quantity},
+            headers=shopping,
+        )
+        assert response.status_code == 422
+    assert c.post("/shopping/chat", json={"message": ""}, headers=shopping).status_code == 422
+    assert (
+        c.post("/merchant/chat", json={"message": "x" * 20_001}, headers=merchant).status_code
+        == 422
+    )
+
+
 def test_a_session_cannot_be_used_for_the_other_role(tmp_path):
     """The binding's `kind` is what separates the two roles. A shopping session id on a
     merchant route (and the reverse) is rejected at the binding, before any backend,
@@ -214,6 +233,65 @@ def test_approving_a_change_that_is_no_longer_staged_is_refused(tmp_path):
     assert "applied" in response.json()["detail"]
 
 
+def test_http_approval_reaches_both_executor_and_backend_and_is_consumed(tmp_path, monkeypatch):
+    """Claude Commerce checks session state before dispatch; the adapter checks its
+    own operator-bound mark at the mutation boundary. The route must populate both."""
+    import asyncio
+
+    from merchant_agent.types import PriceUpdateItem
+
+    import host.app as host_app
+    from engine_backend.kernel import KernelClient
+    from engine_backend.merchant import EngineMerchant
+    from engine_backend.store import EngineStore
+
+    db_path = str(tmp_path / "store.db")
+    c = TestClient(create_app(db_path))
+    headers = {"X-Session-Id": c.post("/merchant/session").json()["session_id"]}
+
+    external_store = EngineStore(db_path)
+    backend = EngineMerchant(
+        external_store,
+        KernelClient(
+            external_store,
+            host_app.CONFIG_DIR / "kernel-policy.json",
+            host_app.CONFIG_DIR / "kernel-principal.json",
+        ),
+    )
+    operator = "user:acme-operator"
+    change = asyncio.run(
+        backend.stage_price_update(
+            host_app.MerchantSessionContext(
+                session_id="external", merchant_id="store:acme", operator=operator
+            ),
+            [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.00)],
+        )
+    )
+
+    seen = {}
+
+    async def apply_from_fake_turn(agent, messages, session, state):
+        del messages
+        seen["state"] = state
+        seen["approved_before_dispatch"] = change.change_id in state.approved_change_ids
+        seen["applied"] = await agent.backend.apply_change(session, change.change_id)
+        if False:  # keep this an async generator, matching stream_turn's contract
+            yield
+
+    monkeypatch.setattr(host_app.MerchantAgent, "stream_turn", apply_from_fake_turn)
+
+    assert (
+        c.post(f"/merchant/changes/{change.change_id}/approve", headers=headers).status_code == 200
+    )
+    assert (
+        c.post("/merchant/chat", json={"message": "apply it"}, headers=headers).status_code == 200
+    )
+
+    assert seen["approved_before_dispatch"] is True
+    assert seen["applied"].status is host_app.ChangeStatus.APPLIED
+    assert change.change_id not in seen["state"].approved_change_ids
+
+
 def test_capabilities_reports_presence_never_validity(tmp_path, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     c = client(tmp_path)
@@ -290,3 +368,33 @@ def test_merchant_changes_read_excludes_discarded_changes(tmp_path):
 
     changes = c.get("/merchant/changes", headers=headers).json()["changes"]
     assert change.change_id not in {item["change_id"] for item in changes}
+
+
+def test_merchant_changes_exposes_durable_apply_control_state(tmp_path):
+    import asyncio
+
+    from merchant_agent.types import ChangeItem, ChangeKind
+
+    from engine_backend import staging
+    from engine_backend.store import EngineStore
+
+    db_path = str(tmp_path / "store.db")
+    c = TestClient(create_app(db_path))
+    headers = {"X-Session-Id": c.post("/merchant/session").json()["session_id"]}
+    store = EngineStore(db_path)
+    change = staging.new_change(
+        ChangeKind.PRICE_UPDATE,
+        "Update price",
+        [ChangeItem(target="TENT-RIDGE-TAN", field="price", before="219.00", after="199.00")],
+        "user:acme-operator",
+    )
+    asyncio.run(staging.save(store, change))
+    assert (
+        c.post(f"/merchant/changes/{change.change_id}/approve", headers=headers).status_code == 200
+    )
+
+    records = c.get("/merchant/changes", headers=headers).json()["changes"]
+    item = next(record for record in records if record["change_id"] == change.change_id)
+    assert item["apply_control"]["state"] == "approved"
+    assert item["apply_control"]["approved_by"] == "user:acme-operator"
+    assert item["apply_control"]["approved_at"]

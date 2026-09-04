@@ -2,8 +2,8 @@
 
     python -m evals.run
 
-No ``ANTHROPIC_API_KEY`` exists on this machine or in CI, so this module has never been
-run end to end here -- see ``evals/README.md``. With no key, ``main`` prints that and
+CI has no ``ANTHROPIC_API_KEY`` and does not run this end to end; dated manual results
+are recorded in ``evals/README.md``. With no key, ``main`` prints that it skipped and
 exits 0, the same contract as ``scripts/smoke_chat.py``.
 
 ``run()`` takes its ``client`` as an argument so tests exercise it with
@@ -28,6 +28,10 @@ from shopping_agent.types import ShoppingSessionContext, ShoppingSessionState  #
 from shopping_agent_runtime import ShoppingAgent  # noqa: E402
 
 from engine_backend import SKILLS_DIR  # noqa: E402
+from engine_backend.agent_config import (  # noqa: E402
+    merchant_agent_config,
+    shopping_agent_config,
+)
 from engine_backend.kernel import KernelClient  # noqa: E402
 from engine_backend.merchant import EngineMerchant  # noqa: E402
 from engine_backend.seed import seed_store  # noqa: E402
@@ -58,12 +62,22 @@ async def _run_case(case: EvalCase, client: Any, db_path: str) -> EvalResult:
 
     if case.role == "shopping":
         customer = store.commerce.customers.get_by_email(_CUSTOMER_EMAIL)
-        agent = ShoppingAgent(backend=storefront, skills_dir=SKILLS_DIR("shopping"), client=client)
+        agent = ShoppingAgent(
+            backend=storefront,
+            skills_dir=SKILLS_DIR("shopping"),
+            config=shopping_agent_config(),
+            client=client,
+        )
         session = ShoppingSessionContext(session_id=f"eval-{case.id}", user_id=customer.id)
         store.bind(session.session_id, customer.id, "customer")
         state = ShoppingSessionState()
     elif case.role == "merchant":
-        agent = MerchantAgent(backend=merchant, skills_dir=SKILLS_DIR("merchant"), client=client)
+        agent = MerchantAgent(
+            backend=merchant,
+            skills_dir=SKILLS_DIR("merchant"),
+            config=merchant_agent_config(),
+            client=client,
+        )
         session = MerchantSessionContext(
             session_id=f"eval-{case.id}", merchant_id=store.store_id, operator=_OPERATOR_ID
         )
@@ -108,11 +122,7 @@ def run(cases: list[EvalCase], client: Any) -> list[EvalResult]:
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        print(
-            "No ANTHROPIC_API_KEY set -- skipping the eval suite. This suite has never "
-            "been run against a live model in this environment; set ANTHROPIC_API_KEY "
-            "to exercise it."
-        )
+        print("No ANTHROPIC_API_KEY set -- skipping the live eval suite; set one to exercise it.")
         return 0
 
     from host.anthropic_client import build_anthropic_client

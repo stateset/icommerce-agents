@@ -32,9 +32,9 @@ export async function capabilities(): Promise<Capabilities | null> {
   }
 }
 
-/** Staged and applied changes with their evidence -- a read, no write involved. This is
- * the artifact a keyless tour run leaves behind; fetched on load so it is visible with
- * no typing, whether or not an assistant is configured. */
+/** Staged and applied changes with evidence and durable apply-control state -- a read,
+ * no write involved. This is the artifact a keyless tour run leaves behind; fetched on
+ * load so it is visible with no typing, whether or not an assistant is configured. */
 export async function fetchChanges(): Promise<StagedChange[] | null> {
   const data = await api.get<{ changes: StagedChange[] }>("/changes");
   return data?.changes ?? null;

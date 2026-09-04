@@ -1,3 +1,5 @@
+import asyncio
+
 from shopping_agent.types import ShoppingSessionContext
 
 from engine_backend.storefront import EngineStorefront
@@ -43,6 +45,37 @@ async def test_the_cart_persists_in_the_engine(store):
     engine_carts = store.commerce.carts.list()
     assert len(engine_carts) == 1
     assert store.commerce.carts.get_items(engine_carts[0].id)[0].sku == "TENT-RIDGE-GRN"
+
+
+async def test_concurrent_first_writes_share_one_session_cart(store):
+    """The executor deliberately permits parallel tool calls in one turn. Two first
+    writes must not both pass the empty cart-id cache and create separate carts."""
+    backend = EngineStorefront(store)
+    ctx = session(store)
+
+    await asyncio.gather(
+        backend.add_to_cart(ctx, "TENT-RIDGE-GRN", 1),
+        backend.add_to_cart(ctx, "LAMP-BEACON-BLK", 1),
+    )
+
+    assert len(store.commerce.carts.list()) == 1
+    cart = await backend.get_cart(ctx)
+    assert {item.product_id for item in cart.items} == {
+        "TENT-RIDGE-GRN",
+        "LAMP-BEACON-BLK",
+    }
+
+
+async def test_backend_enforces_the_per_item_cap_defensively(store):
+    """Agent gates normally reduce the quantity before this boundary, but direct host
+    routes and future callers must not be able to bypass the invariant."""
+    backend = EngineStorefront(store, max_quantity_per_item=24)
+    ctx = session(store)
+
+    await backend.add_to_cart(ctx, "TENT-RIDGE-GRN", 20)
+    cart = await backend.add_to_cart(ctx, "TENT-RIDGE-GRN", 20)
+
+    assert cart.items[0].quantity == 24
 
 
 async def test_get_cart_reads_are_bounded_not_per_line(store):

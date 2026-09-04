@@ -311,6 +311,21 @@ button {
   color: var(--ok);
 }
 
+.status-tag + .status-tag {
+  margin-left: 6px;
+}
+
+.status-tag.control-applying {
+  background: var(--kernel-soft);
+  color: var(--kernel);
+}
+
+.status-tag.control-reconciliation_required,
+.status-tag.control-failed {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
 .approve-btn {
   width: 100%;
   border: 1px solid var(--accent);
@@ -338,6 +353,17 @@ button {
   font-size: 11px;
   color: var(--ink-soft);
   margin-top: 6px;
+}
+
+.control-note {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--ink-soft);
+  margin: 7px 0 0;
+}
+
+.control-note.danger {
+  color: var(--danger);
 }
 
 .evidence {

@@ -57,7 +57,9 @@ and Cursor) gives the operator two independent, visible decision points: one bef
 `host_approve` marks nothing but its own `change_id` — it does no write of its own — and
 `EngineMerchant.apply_change` re-checks that mark independently, so a change that
 reaches `apply_change` through some other path (skipping `host_approve`) still cannot be
-applied.
+applied. The mark is tied to the configured operator in a durable SQLite ledger. An
+atomic claim permits only one process to spend it; post-dispatch failures remain visibly
+blocked for reconciliation instead of becoming silently retryable.
 
 ## Limitation: this depends on the connecting client, not on this server
 

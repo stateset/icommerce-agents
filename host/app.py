@@ -27,6 +27,7 @@ from commerce_common.streaming import AgentEvent, to_sse
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from merchant_agent.changes import ChangeNotApplicable
 from merchant_agent.types import (
     ChangeStatus,
     MerchantSessionContext,
@@ -34,12 +35,13 @@ from merchant_agent.types import (
     StagedChange,
 )
 from merchant_agent_runtime import MerchantAgent
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from shopping_agent.types import ShoppingSessionContext, ShoppingSessionState
 from shopping_agent_runtime import ShoppingAgent
 from stateset_embedded import CartAddress
 
 from engine_backend import SKILLS_DIR
+from engine_backend.agent_config import merchant_agent_config, shopping_agent_config
 from engine_backend.custom_objects import list_payloads
 from engine_backend.kernel import KernelClient
 from engine_backend.merchant import EngineMerchant
@@ -59,12 +61,14 @@ _OPERATOR_ID = "user:acme-operator"
 
 
 class ChatTurnRequest(BaseModel):
-    message: str
+    message: str = Field(min_length=1, max_length=20_000)
 
 
 class CartAddRequest(BaseModel):
-    product_id: str
-    quantity: int = 1
+    product_id: str = Field(min_length=1, max_length=200)
+    # This direct UI route bypasses the shopping executor, so carry its default
+    # per-item quantity boundary at the HTTP edge too.
+    quantity: int = Field(default=1, ge=1, le=24)
 
 
 # ``engine_backend.apply`` records one of two evidence shapes at apply time: a sealed
@@ -109,10 +113,16 @@ def create_app(db_path: str) -> FastAPI:
 
     anthropic_client = build_anthropic_client()
     shopping_agent = ShoppingAgent(
-        backend=storefront, skills_dir=SKILLS_DIR("shopping"), client=anthropic_client
+        backend=storefront,
+        skills_dir=SKILLS_DIR("shopping"),
+        config=shopping_agent_config(),
+        client=anthropic_client,
     )
     merchant_agent = MerchantAgent(
-        backend=merchant, skills_dir=SKILLS_DIR("merchant"), client=anthropic_client
+        backend=merchant,
+        skills_dir=SKILLS_DIR("merchant"),
+        config=merchant_agent_config(),
+        client=anthropic_client,
     )
 
     shopping_sessions: SessionRegistry[ShoppingSessionState] = SessionRegistry(ShoppingSessionState)
@@ -191,11 +201,12 @@ def create_app(db_path: str) -> FastAPI:
     ) -> StreamingResponse:
         session = _bound_shopping_context(x_session_id)
         chat = shopping_sessions.require(session.session_id)
-        chat.messages.append({"role": "user", "content": request.message})
 
         async def event_stream() -> AsyncIterator[str]:
-            async for event in shopping_agent.stream_turn(chat.messages, session, chat.state):
-                yield to_sse(event)
+            async with chat.turn_lock:
+                chat.messages.append({"role": "user", "content": request.message})
+                async for event in shopping_agent.stream_turn(chat.messages, session, chat.state):
+                    yield to_sse(event)
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -332,11 +343,21 @@ def create_app(db_path: str) -> FastAPI:
     ) -> StreamingResponse:
         session = _bound_merchant_context(x_session_id)
         chat = merchant_sessions.require(session.session_id)
-        chat.messages.append({"role": "user", "content": request.message})
 
         async def event_stream() -> AsyncIterator[str]:
-            async for event in merchant_agent.stream_turn(chat.messages, session, chat.state):
-                yield to_sse(await _with_change_evidence(store, event))
+            async with chat.turn_lock:
+                chat.messages.append({"role": "user", "content": request.message})
+                try:
+                    async for event in merchant_agent.stream_turn(
+                        chat.messages, session, chat.state
+                    ):
+                        yield to_sse(await _with_change_evidence(store, event))
+                finally:
+                    # The upstream gate and the engine adapter deliberately enforce
+                    # approval independently. The backend consumes its mark on an apply
+                    # attempt; mirror that consumption into session state after every
+                    # turn so a failed attempt cannot retain a stale upstream approval.
+                    chat.state.approved_change_ids.intersection_update(merchant.approved_ids)
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -347,17 +368,29 @@ def create_app(db_path: str) -> FastAPI:
         """The operator's approval, and the only place it happens. The operator comes
         from the session binding, never from the request body."""
         session = _bound_merchant_context(x_session_id)
-        change = await load_staged_change(store, change_id)
-        if change is None:
-            raise HTTPException(status_code=404, detail=f"no change with id {change_id!r}")
-        if change.status is not ChangeStatus.STAGED:
-            # An already-applied or discarded change has nothing left to approve;
-            # accepting one would put a live change id into `approved_ids`.
-            raise HTTPException(
-                status_code=409,
-                detail=f"change {change_id} is {change.status.value}, not staged",
-            )
-        merchant.approve(change_id, session.operator)
+        chat = merchant_sessions.require(session.session_id)
+        # Serialize approval against this session's streaming turns. Otherwise a turn's
+        # final reconciliation could erase an approval issued while that turn was still
+        # in flight.
+        async with chat.turn_lock:
+            change = await load_staged_change(store, change_id)
+            if change is None:
+                raise HTTPException(status_code=404, detail=f"no change with id {change_id!r}")
+            if change.status is not ChangeStatus.STAGED:
+                # An already-applied or discarded change has nothing left to approve;
+                # accepting one would put a live change id into `approved_ids`.
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"change {change_id} is {change.status.value}, not staged",
+                )
+            # Claude Commerce's executor checks this session-owned mark before it calls
+            # the backend. The backend checks a separate operator-bound mark again at
+            # the mutation boundary; both are required for the HTTP path.
+            try:
+                merchant.approve(change_id, session.operator)
+            except ChangeNotApplicable as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            chat.state.approved_change_ids.add(change_id)
         return {"change_id": change_id, "approved_by": session.operator}
 
     @app.get("/merchant/changes")
@@ -370,6 +403,9 @@ def create_app(db_path: str) -> FastAPI:
         read: it introduces no write and calls neither ``approve`` nor ``apply_change``."""
         _bound_merchant_context(x_session_id)
         records = await store.call(lambda c: list_payloads(c, STAGED_TYPE))
+        approval_records = store.approval_records(
+            [record["change_id"] for record in records if record.get("change_id")]
+        )
         changes = []
         for record in records:
             change = StagedChange.model_validate(record)
@@ -377,6 +413,7 @@ def create_app(db_path: str) -> FastAPI:
                 continue
             item = change.model_dump(mode="json")
             item["evidence"] = record.get("evidence") or []
+            item["apply_control"] = approval_records.get(change.change_id)
             changes.append(item)
         changes.sort(key=lambda item: item["created_at"])
         return {"changes": changes}

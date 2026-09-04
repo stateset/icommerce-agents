@@ -64,6 +64,78 @@ async def apply_change(
     return updated, evidence
 
 
+async def validate_preconditions(
+    ctx: ApplyContext, change: StagedChange, payload: Any = None
+) -> None:
+    """Refuse an overwrite when its operator-reviewed ``before`` value is stale.
+
+    Guardrails are evaluated from the previewed diff. If live state changed after
+    staging, applying that old diff could exceed a percentage cap or overwrite another
+    operator's work. Restocks are intentionally excluded: they are additive, so their
+    stored before/after pair remains the quantity to add after intervening stock moves.
+    """
+    if change.kind in (ChangeKind.PRICE_UPDATE, ChangeKind.PROMOTION):
+        for item in change.items:
+            if item.field != "price":
+                continue
+            row = await resolve_variant_row(ctx.store, item.target)
+            current = None if row is None else money.exact(row.variant.price_exact)
+            expected = money.exact(item.before)
+            if current != expected:
+                raise ChangeNotApplicable(
+                    f"{item.target} price changed since this change was staged "
+                    f"({expected} → {current}); stage and approve a fresh change"
+                )
+
+    if change.kind is ChangeKind.INVENTORY_ACTION:
+        for item in change.items:
+            if item.field != "status":
+                continue
+            resolved = await resolve_product_and_merch(ctx.store, item.target)
+            current = None if resolved is None else resolved[0].status
+            if current != item.before:
+                raise ChangeNotApplicable(
+                    f"{item.target} status changed since this change was staged "
+                    f"({item.before!r} → {current!r}); stage and approve a fresh change"
+                )
+
+    if change.kind is ChangeKind.LISTING_UPDATE and change.items:
+        resolved = await resolve_product_and_merch(ctx.store, change.items[0].target)
+        if resolved is None:
+            raise ChangeNotApplicable(f"no listing with id {change.items[0].target!r}")
+        product, merch = resolved
+        merch_fields = {"brand", "category", "image_url", "long_description", "unit_cost"}
+        for item in change.items:
+            if item.field == "description":
+                current = product.description
+            elif item.field in merch_fields:
+                current = getattr(merch, item.field)
+            elif item.field in ("attributes", "specs"):
+                current = dict(getattr(merch, item.field))
+            elif item.field == "labels":
+                current = list(merch.labels)
+            else:
+                current = merch.attributes.get(item.field)
+            if current != item.before:
+                raise ChangeNotApplicable(
+                    f"{item.target} field {item.field!r} changed since this change was staged; "
+                    "stage and approve a fresh change"
+                )
+
+    if change.kind is ChangeKind.CAMPAIGN and payload and payload.get("campaign_id"):
+        current_payload = await custom_objects.read_payload(
+            ctx.store, CAMPAIGN_TYPE, object_handle=payload["campaign_id"]
+        )
+        current = Campaign.model_validate(current_payload) if current_payload else None
+        for item in change.items:
+            current_value = getattr(current, item.field, None) if current is not None else None
+            if current_value != item.before:
+                raise ChangeNotApplicable(
+                    f"campaign {payload['campaign_id']} field {item.field!r} changed since this "
+                    "change was staged; stage and approve a fresh change"
+                )
+
+
 async def _apply_write(
     ctx: ApplyContext, change: StagedChange, payload: Any
 ) -> list[tuple[str, staging.Evidence]]:
@@ -277,14 +349,23 @@ async def _apply_campaign(
     ctx: ApplyContext, change: StagedChange, payload: Any
 ) -> list[tuple[str, staging.Evidence]]:
     campaign_id = payload.get("campaign_id") or f"camp-{uuid4().hex[:8]}"
+    current_payload = await custom_objects.read_payload(
+        ctx.store, CAMPAIGN_TYPE, object_handle=campaign_id
+    )
+    current = Campaign.model_validate(current_payload) if current_payload else None
+
+    def supplied(field: str, fallback: Any) -> Any:
+        value = payload.get(field)
+        return fallback if value is None else value
+
     campaign = Campaign(
         campaign_id=campaign_id,
-        name=payload["name"],
-        status="active",
-        objective=payload.get("objective"),
-        budget=payload.get("budget") or 0.0,
-        starts=payload.get("starts"),
-        ends=payload.get("ends"),
+        name=supplied("name", current.name if current else campaign_id),
+        status=current.status if current else "active",
+        objective=supplied("objective", current.objective if current else None),
+        budget=supplied("budget", current.budget if current else 0.0),
+        starts=supplied("starts", current.starts if current else None),
+        ends=supplied("ends", current.ends if current else None),
     )
     await _record_custom_object(
         ctx, change, CAMPAIGN_TYPE, campaign_id, campaign.model_dump(mode="json")
