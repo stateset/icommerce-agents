@@ -68,10 +68,12 @@ export ICOMMERCE_JWT_ISSUER=https://identity.example.com/
 export ICOMMERCE_JWT_AUDIENCE=icommerce-host
 export ICOMMERCE_JWKS_URL=https://identity.example.com/.well-known/jwks.json
 export ICOMMERCE_ALLOWED_ORIGINS=https://shop.example.com,https://merchant.example.com
-# In-process session lifetime; default eight hours, minimum one minute.
+# Durable session lifetime; default eight hours, minimum one minute.
 export ICOMMERCE_SESSION_TTL_SECONDS=28800
+export ICOMMERCE_CHAT_LEASE_SECONDS=900
 # Enables GET /metrics; use a separate, high-entropy monitoring credential.
 export ICOMMERCE_METRICS_TOKEN=replace-with-32-plus-byte-monitoring-secret
+export ICOMMERCE_RATE_LIMIT_PER_MINUTE=120
 # Earliest an operator may declare an abandoned applying claim; default 900 seconds.
 export ICOMMERCE_STALE_APPLY_SECONDS=900
 ```
@@ -79,7 +81,9 @@ export ICOMMERCE_STALE_APPLY_SECONDS=900
 `ICOMMERCE_ENVIRONMENT=production` is a fail-closed startup contract. The host refuses
 to start with demo identity, an in-memory database, HS256 authentication, missing
 metrics authentication, no browser origins, or any browser origin that is not a clean
-HTTPS origin. Leave it at the default `development` only for local work; setting the
+HTTPS origin, or a disabled rate limit. The limiter is atomic across workers and stores
+only SHA-256 principal keys in fixed-minute buckets. Leave the environment at the
+default `development` only for local work; setting the
 word `production` is an assertion that these edge controls are present, not a cosmetic
 label.
 
@@ -119,11 +123,13 @@ in [`docs/stablecoin-checkout.md`](stablecoin-checkout.md).
 This authenticates the FastAPI host, not the two separately launched MCP ports. See
 `docs/mcp.md` before exposing either MCP server beyond loopback.
 
-The host durably stores principal and cart-to-session bindings; bindings expire after
-`ICOMMERCE_SESSION_TTL_SECONDS`, even if a client retains the id. Chat transcripts and
-upstream agent session state remain in process, so run one worker or use sticky routing
-for chat requests. Checkout, payment, approval, and target-lease records are durable and
-cross-process safe.
+The host durably stores principal/cart bindings and role-scoped chat transcript plus
+provenance state. Bindings expire after `ICOMMERCE_SESSION_TTL_SECONDS`, even if a
+client retains the id, and expired session/chat/cart data is purged automatically.
+`ICOMMERCE_CHAT_LEASE_SECONDS` defaults to 900 (allowed range 30–3600); its durable
+lease admits one turn per session across workers and makes abandoned turns recoverable.
+Checkout, payment, approval, and target-lease records are durable and cross-process
+safe as well.
 
 ### Web authentication boundary
 

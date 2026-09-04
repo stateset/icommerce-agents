@@ -73,7 +73,7 @@ engine, and never a model.
 - Request correlation and secure response headers, including rejection rather than
   reflection of malformed caller-provided request ids (`tests/test_auth.py`).
 - Explicit shopping and merchant session termination, which revokes both the principal
-  binding and its in-memory transcript/provenance state (`tests/test_host.py`).
+  binding and its durable transcript/provenance state (`tests/test_host.py`).
 - Disabled-by-default, separately authenticated Prometheus metrics with route-template
   labels and no principal/session identifiers (`tests/test_metrics.py`).
 - Stablecoin quote binding, x402 facilitator wire contracts, replay/idempotency,
@@ -81,6 +81,11 @@ engine, and never a model.
   and recovered checkout receipts (`tests/test_stablecoin_checkout.py`).
 - Durable principal/cart recovery across store instances and immediate cross-worker
   session revocation (`tests/test_store.py`, `tests/test_storefront_cart.py`).
+- Durable transcript/provenance recovery, exclusive cross-worker turn ownership,
+  abandoned-lease recovery, and expired-session privacy cleanup
+  (`tests/test_sessions.py`).
+- Atomic cross-worker request limiting with role-scoped, hashed principal buckets
+  (`tests/test_auth.py`, `tests/test_sessions.py`).
 - Online WAL-safe backup publication, integrity verification, and overwrite refusal
   (`tests/test_backup_store.py`).
 

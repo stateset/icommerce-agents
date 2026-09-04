@@ -76,7 +76,7 @@ from .anthropic_client import build_anthropic_client
 from .auth import AuthConfig, AuthenticationError, Authenticator, Identity
 from .metrics import HostMetrics
 from .response_policy import TurnResponsePolicy, replace_latest_assistant_text
-from .sessions import SessionRegistry
+from .sessions import ChatTurnBusy, SessionRegistry
 
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 
@@ -191,6 +191,7 @@ def _validate_production_deployment(
     auth_config: AuthConfig,
     allowed_origins: list[str],
     metrics_token: str | None,
+    rate_limit_per_minute: int,
 ) -> None:
     """Reject configurations that are safe for a demo but unsafe on the public edge."""
     if environment not in {"development", "test", "production"}:
@@ -206,6 +207,8 @@ def _validate_production_deployment(
         problems.append("asymmetric ICOMMERCE_JWKS_URL authentication is required")
     if metrics_token is None:
         problems.append("ICOMMERCE_METRICS_TOKEN is required")
+    if rate_limit_per_minute <= 0:
+        problems.append("ICOMMERCE_RATE_LIMIT_PER_MINUTE must be enabled")
     for origin in allowed_origins:
         parsed = urlparse(origin)
         if (
@@ -235,6 +238,7 @@ def create_app(
     """Build one deployment: one engine store (seeded), both backends, one kernel
     client bound to the host-owned policy and principal files, and both agents."""
     store = EngineStore(db_path)
+    store.cleanup_expired_sessions()
     seed_store(store.commerce)
 
     storefront = EngineStorefront(store)
@@ -257,6 +261,12 @@ def create_app(
     session_ttl_seconds = int(os.getenv("ICOMMERCE_SESSION_TTL_SECONDS", "28800"))
     if session_ttl_seconds < 60:
         raise ValueError("session TTL must be at least 60 seconds")
+    chat_lease_seconds = int(os.getenv("ICOMMERCE_CHAT_LEASE_SECONDS", "900"))
+    if not 30 <= chat_lease_seconds <= 3600:
+        raise ValueError("chat turn lease must be between 30 and 3600 seconds")
+    rate_limit_per_minute = int(os.getenv("ICOMMERCE_RATE_LIMIT_PER_MINUTE", "0"))
+    if rate_limit_per_minute < 0:
+        raise ValueError("request rate limit cannot be negative")
 
     anthropic_client = build_anthropic_client()
     shopping_agent = ShoppingAgent(
@@ -272,8 +282,12 @@ def create_app(
         client=anthropic_client,
     )
 
-    shopping_sessions: SessionRegistry[ShoppingSessionState] = SessionRegistry(ShoppingSessionState)
-    merchant_sessions: SessionRegistry[MerchantSessionState] = SessionRegistry(MerchantSessionState)
+    shopping_sessions: SessionRegistry[ShoppingSessionState] = SessionRegistry(
+        ShoppingSessionState, store, "shopping", chat_lease_seconds
+    )
+    merchant_sessions: SessionRegistry[MerchantSessionState] = SessionRegistry(
+        MerchantSessionState, store, "merchant", chat_lease_seconds
+    )
     metrics = HostMetrics()
     metrics_token = os.getenv("ICOMMERCE_METRICS_TOKEN")
     if metrics_token is not None and len(metrics_token.encode()) < 32:
@@ -305,6 +319,7 @@ def create_app(
         auth_config=authenticator.config,
         allowed_origins=allowed_origins,
         metrics_token=metrics_token,
+        rate_limit_per_minute=rate_limit_per_minute,
     )
 
     @app.middleware("http")
@@ -328,6 +343,32 @@ def create_app(
                 headers={"WWW-Authenticate": "Bearer"},
             )
         request.state.identity = identity
+        expected_kind = "customer" if path.startswith("/shopping/") else "operator"
+        if identity is not None:
+            if expected_kind == "customer" and not identity.permits(
+                role="customer", scope="shopping:use"
+            ):
+                return JSONResponse(status_code=403, content={"detail": "shopping access required"})
+            if expected_kind == "operator" and (
+                not identity.permits(role="merchant", scope="merchant:write")
+                or identity.store_id != store.store_id
+            ):
+                return JSONResponse(status_code=403, content={"detail": "merchant access required"})
+        if rate_limit_per_minute:
+            principal = identity.subject if identity is not None else "demo"
+            window_start = int(time.time() // 60) * 60
+            allowed = await asyncio.to_thread(
+                store.consume_rate_limit,
+                f"{path.split('/', 2)[1]}:{principal}",
+                rate_limit_per_minute,
+                window_start,
+            )
+            if not allowed:
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "request rate limit exceeded"},
+                    headers={"Retry-After": str(60 - int(time.time()) % 60)},
+                )
         if authenticator.config.mode == "demo" or path in (
             "/shopping/session",
             "/merchant/session",
@@ -340,20 +381,10 @@ def create_app(
             binding = store.binding(session_id)
         except KeyError:
             return JSONResponse(status_code=401, content={"detail": "unknown session"})
-        expected_kind = "customer" if path.startswith("/shopping/") else "operator"
         if binding.kind != expected_kind:
             return JSONResponse(status_code=403, content={"detail": "session role mismatch"})
         if identity is None or binding.authenticated_subject != identity.subject:
             return JSONResponse(status_code=403, content={"detail": "session subject mismatch"})
-        if expected_kind == "customer" and not identity.permits(
-            role="customer", scope="shopping:use"
-        ):
-            return JSONResponse(status_code=403, content={"detail": "shopping access required"})
-        if expected_kind == "operator" and (
-            not identity.permits(role="merchant", scope="merchant:write")
-            or identity.store_id != store.store_id
-        ):
-            return JSONResponse(status_code=403, content={"detail": "merchant access required"})
         return await call_next(request)
 
     # Added after the auth middleware so CORS wraps even an early 401/403 response.
@@ -474,6 +505,7 @@ def create_app(
 
     @app.post("/shopping/session")
     async def start_shopping_session(request: Request) -> dict[str, str]:
+        await asyncio.to_thread(store.cleanup_expired_sessions)
         identity: Identity | None = request.state.identity
         if authenticator.config.mode == "jwt":
             if identity is None or not identity.permits(role="customer", scope="shopping:use"):
@@ -507,6 +539,7 @@ def create_app(
 
     @app.post("/merchant/session")
     async def start_merchant_session(request: Request) -> dict[str, str]:
+        await asyncio.to_thread(store.cleanup_expired_sessions)
         identity: Identity | None = request.state.identity
         if authenticator.config.mode == "jwt":
             if identity is None or not identity.permits(role="merchant", scope="merchant:write"):
@@ -556,10 +589,16 @@ def create_app(
         x_session_id: str | None = Header(default=None),
     ) -> StreamingResponse:
         session = _bound_shopping_context(x_session_id)
-        chat = shopping_sessions.require(session.session_id)
+        try:
+            claimed = await shopping_sessions.claim(session.session_id)
+        except ChatTurnBusy as error:
+            raise HTTPException(
+                status_code=409, detail="another chat turn is in progress"
+            ) from error
+        chat = claimed.session
 
         async def event_stream() -> AsyncIterator[str]:
-            async with chat.turn_lock:
+            try:
                 chat.messages.append({"role": "user", "content": request.message})
                 policy = TurnResponsePolicy("shopping", request.message)
                 async for event in shopping_agent.stream_turn(chat.messages, session, chat.state):
@@ -574,6 +613,8 @@ def create_app(
                         "response policy rewrote role=shopping request_id=%s",
                         http_request.state.request_id,
                     )
+            finally:
+                await shopping_sessions.finish(claimed)
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -1026,10 +1067,17 @@ def create_app(
         x_session_id: str | None = Header(default=None),
     ) -> StreamingResponse:
         session = _bound_merchant_context(x_session_id)
-        chat = merchant_sessions.require(session.session_id)
+        try:
+            claimed = await merchant_sessions.claim(session.session_id)
+        except ChatTurnBusy as error:
+            raise HTTPException(
+                status_code=409, detail="another chat turn is in progress"
+            ) from error
+        chat = claimed.session
+        chat.state.approved_change_ids.update(merchant.approved_ids)
 
         async def event_stream() -> AsyncIterator[str]:
-            async with chat.turn_lock:
+            try:
                 chat.messages.append({"role": "user", "content": request.message})
                 policy = TurnResponsePolicy("merchant", request.message)
                 try:
@@ -1054,6 +1102,8 @@ def create_app(
                     # attempt; mirror that consumption into session state after every
                     # turn so a failed attempt cannot retain a stale upstream approval.
                     chat.state.approved_change_ids.intersection_update(merchant.approved_ids)
+            finally:
+                await merchant_sessions.finish(claimed)
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -1066,11 +1116,17 @@ def create_app(
         """The operator's approval, and the only place it happens. The operator comes
         from the session binding, never from the request body."""
         session = _bound_merchant_context(x_session_id)
-        chat = merchant_sessions.require(session.session_id)
+        try:
+            claimed = await merchant_sessions.claim(session.session_id)
+        except ChatTurnBusy as error:
+            raise HTTPException(
+                status_code=409, detail="another chat turn is in progress"
+            ) from error
+        chat = claimed.session
         # Serialize approval against this session's streaming turns. Otherwise a turn's
         # final reconciliation could erase an approval issued while that turn was still
         # in flight.
-        async with chat.turn_lock:
+        try:
             record = await staging.load_record(store, change_id)
             if record is None:
                 raise HTTPException(status_code=404, detail=f"no change with id {change_id!r}")
@@ -1093,6 +1149,8 @@ def create_app(
             except ChangeNotApplicable as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
             chat.state.approved_change_ids.add(change_id)
+        finally:
+            await merchant_sessions.finish(claimed)
         approval = store.approval_record(change_id)
         return {
             "change_id": change_id,

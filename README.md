@@ -1,7 +1,7 @@
 # StateSet iCommerce Agents
 
 [![CI](https://github.com/stateset/icommerce-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/stateset/icommerce-agents/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/release-v0.8.0-2563eb)](https://github.com/stateset/icommerce-agents/tree/v0.8.0)
+[![Release](https://img.shields.io/badge/release-v0.9.0-2563eb)](https://github.com/stateset/icommerce-agents/tree/v0.9.0)
 [![Python](https://img.shields.io/badge/python-3.12-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520.9-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-MIT-black)](LICENSE)
@@ -137,7 +137,10 @@ exception and avoids implying broader kernel coverage.
 - Same-origin storefront and portal BFFs keep production bearer tokens in secure
   HttpOnly cookies, restrict forwarded headers, and reject cross-site mutations.
 - Explicit session termination, configurable expiry, and durable principal/cart
-  bindings that survive worker changes and host restarts.
+  bindings plus transcript/provenance state that survive worker changes and host
+  restarts; expiring turn leases prevent split-brain conversations.
+- Atomic per-principal request limits shared by every host worker, with role-separated,
+  hashed buckets and production startup refusing a disabled limiter.
 - Request correlation propagated into checkout/refund kernel envelopes, secure response
   headers, restricted CORS, and logs that omit tokens, session ids, and bodies.
 - Disabled-by-default, separately authenticated Prometheus metrics with low-cardinality
@@ -208,8 +211,10 @@ export ICOMMERCE_JWT_AUDIENCE=icommerce-host
 export ICOMMERCE_JWKS_URL=https://identity.example.com/.well-known/jwks.json
 export ICOMMERCE_ALLOWED_ORIGINS=https://shop.example.com,https://merchant.example.com
 export ICOMMERCE_SESSION_TTL_SECONDS=28800
+export ICOMMERCE_CHAT_LEASE_SECONDS=900
 export ICOMMERCE_STALE_APPLY_SECONDS=900
 export ICOMMERCE_METRICS_TOKEN=replace-with-32-plus-byte-monitoring-secret
+export ICOMMERCE_RATE_LIMIT_PER_MINUTE=120
 # Server-only value used by each Next.js BFF.
 export ICOMMERCE_API_URL=https://api.example.com
 ```
@@ -226,9 +231,10 @@ and an external signing client. It never stores a payer private key. See the
 [stablecoin checkout guide](docs/stablecoin-checkout.md) for configuration, protocol,
 failure recovery, and the boundaries that remain deployment responsibilities.
 
-Principal/cart bindings, approvals, target leases, and stablecoin payments are durable
-and cross-process safe. Chat transcripts and upstream agent session state remain
-process-local, so run a single host worker or configure sticky routing for chat routes.
+Principal/cart bindings, chat transcripts and provenance, approvals, target leases, and
+stablecoin payments are durable and cross-process safe. An expiring turn lease
+admits only one worker for each session while allowing another worker to recover after
+a crash. Expired identity, cart-binding, and conversation records are purged together.
 The [installation and deployment guide](docs/install.md) documents every variable and
 trust boundary.
 

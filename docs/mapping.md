@@ -335,8 +335,9 @@ opens from invalidating the embedded handle's WAL view.
   lifecycle outcomes; an abandoned resolver is recoverable through the same timeout.
 - Principal and session→cart mappings live in `icommerce_agent_sessions` and
   `icommerce_agent_session_carts`; `EngineStore._bindings` and
-  `EngineStorefront._cart_ids` are caches. Conversation transcripts and upstream agent
-  session state remain per process and require sticky routing for chat.
+  `EngineStorefront._cart_ids` are caches. Role-scoped transcripts and upstream
+  provenance state live in `icommerce_agent_chat_sessions`; an expiring transactional
+  turn lease prevents concurrent workers from forking one conversation.
 
 This was verified against the schema and triggers directly, not assumed:
 `PRAGMA table_info` on `products` and `product_variants` shows neither table has a

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import sqlite3
 import threading
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, TypeVar
 from uuid import uuid4
 
@@ -99,8 +100,8 @@ class EngineStore:
     - Principal and session→cart bindings are durable adapter tables. File-backed
       principal reads always consult durable state so revocation is immediately visible
       across workers; only in-memory deployments use ``self._bindings`` as authority.
-      Agent conversation state remains per process, so chat traffic still needs sticky
-      routing until a shared transcript store is used.
+      Role-scoped chat transcripts and provenance state are durable too; an expiring
+      database lease admits only one turn across all workers.
     """
 
     def __init__(self, db_path: str, store_id: str = "store:acme") -> None:
@@ -112,7 +113,9 @@ class EngineStore:
         self._memory_approvals: dict[str, dict[str, Any]] = {}
         self._memory_target_leases: dict[str, tuple[str, str]] = {}
         self._memory_approval_events: list[dict[str, Any]] = []
+        self._memory_chat_leases: dict[tuple[str, str], str] = {}
         self._memory_approvals_lock = threading.Lock()
+        self._memory_chat_leases_lock = threading.Lock()
         # Create adapter-owned tables before opening the embedded engine. Opening and
         # closing Python's SQLite afterwards can invalidate the engine binding's WAL
         # view on some SQLite builds (the pin below exists for the same reason).
@@ -344,6 +347,41 @@ class EngineStore:
                         ON DELETE CASCADE
                 )
                 """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS icommerce_agent_chat_sessions (
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK (role IN ('shopping', 'merchant')),
+                    state_json TEXT NOT NULL,
+                    messages_json TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    lease_owner TEXT,
+                    lease_expires_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(session_id, role),
+                    FOREIGN KEY(session_id) REFERENCES icommerce_agent_sessions(session_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS icommerce_agent_rate_limits (
+                    key_hash TEXT NOT NULL,
+                    window_start INTEGER NOT NULL,
+                    request_count INTEGER NOT NULL,
+                    PRIMARY KEY(key_hash, window_start)
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_icommerce_agent_sessions_expires_at "
+                "ON icommerce_agent_sessions(expires_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_icommerce_agent_rate_limits_window_start "
+                "ON icommerce_agent_rate_limits(window_start)"
             )
             connection.commit()
         finally:
@@ -1311,6 +1349,35 @@ class EngineStore:
             finally:
                 connection.close()
 
+    def cleanup_expired_sessions(self) -> int:
+        """Delete expired identity/workflow state and its chat/cart children."""
+        if self.db_path == ":memory:":
+            now = datetime.now(UTC)
+            expired = [
+                session_id
+                for session_id, binding in self._bindings.items()
+                if binding.expires_at is not None and binding.expires_at <= now
+            ]
+            for session_id in expired:
+                self.unbind(session_id)
+            return len(expired)
+        connection = self._control_connection()
+        try:
+            now = datetime.now(UTC)
+            connection.execute("PRAGMA foreign_keys = ON")
+            cursor = connection.execute(
+                "DELETE FROM icommerce_agent_sessions "
+                "WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                (now.isoformat(),),
+            )
+            connection.commit()
+            for session_id, binding in list(self._bindings.items()):
+                if binding.expires_at is not None and binding.expires_at <= now:
+                    self._bindings.pop(session_id, None)
+            return cursor.rowcount
+        finally:
+            connection.close()
+
     def session_cart_id(self, session_id: str) -> str | None:
         if self.db_path == ":memory:":
             return None
@@ -1348,6 +1415,170 @@ class EngineStore:
             if row is None:
                 raise RuntimeError("session cart claim disappeared")
             return str(row["cart_id"])
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def initialize_chat_session(
+        self, session_id: str, role: str, state_json: str, messages_json: str
+    ) -> None:
+        if self.db_path == ":memory:":
+            return
+        connection = self._control_connection()
+        try:
+            connection.execute(
+                "INSERT OR IGNORE INTO icommerce_agent_chat_sessions "
+                "(session_id, role, state_json, messages_json, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, role, state_json, messages_json, self._now()),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def claim_chat_turn(
+        self, session_id: str, role: str, lease_seconds: int
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Atomically own a chat turn and return the latest durable snapshot."""
+        owner = uuid4().hex
+        if self.db_path == ":memory:":
+            key = (session_id, role)
+            with self._memory_chat_leases_lock:
+                if key in self._memory_chat_leases:
+                    return None
+                self._memory_chat_leases[key] = owner
+            return owner, {}
+        now = datetime.now(UTC)
+        expires = now + timedelta(seconds=lease_seconds)
+        connection = self._control_connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "UPDATE icommerce_agent_chat_sessions "
+                "SET lease_owner = ?, lease_expires_at = ? "
+                "WHERE session_id = ? AND role = ? "
+                "AND (lease_owner IS NULL OR lease_expires_at <= ?)",
+                (owner, expires.isoformat(), session_id, role, now.isoformat()),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return None
+            row = connection.execute(
+                "SELECT state_json, messages_json, revision "
+                "FROM icommerce_agent_chat_sessions WHERE session_id = ? AND role = ?",
+                (session_id, role),
+            ).fetchone()
+            connection.commit()
+            if row is None:
+                raise RuntimeError("claimed chat session disappeared")
+            return owner, dict(row)
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def renew_chat_turn(self, session_id: str, role: str, owner: str, lease_seconds: int) -> None:
+        if self.db_path == ":memory:":
+            with self._memory_chat_leases_lock:
+                if self._memory_chat_leases.get((session_id, role)) != owner:
+                    raise RuntimeError("chat turn lease was lost")
+            return
+        connection = self._control_connection()
+        try:
+            cursor = connection.execute(
+                "UPDATE icommerce_agent_chat_sessions SET lease_expires_at = ? "
+                "WHERE session_id = ? AND role = ? AND lease_owner = ?",
+                (
+                    (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat(),
+                    session_id,
+                    role,
+                    owner,
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise RuntimeError("chat turn lease was lost")
+            connection.commit()
+        finally:
+            connection.close()
+
+    def finish_chat_turn(
+        self,
+        session_id: str,
+        role: str,
+        owner: str,
+        state_json: str,
+        messages_json: str,
+    ) -> None:
+        if self.db_path == ":memory:":
+            with self._memory_chat_leases_lock:
+                if self._memory_chat_leases.get((session_id, role)) != owner:
+                    raise RuntimeError("chat turn lease was lost before persistence")
+                self._memory_chat_leases.pop((session_id, role), None)
+            return
+        connection = self._control_connection()
+        try:
+            cursor = connection.execute(
+                "UPDATE icommerce_agent_chat_sessions SET state_json = ?, "
+                "messages_json = ?, revision = revision + 1, lease_owner = NULL, "
+                "lease_expires_at = NULL, updated_at = ? "
+                "WHERE session_id = ? AND role = ? AND lease_owner = ?",
+                (state_json, messages_json, self._now(), session_id, role, owner),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise RuntimeError("chat turn lease was lost before persistence")
+            connection.commit()
+        finally:
+            connection.close()
+
+    def release_chat_turn(self, session_id: str, role: str, owner: str) -> None:
+        if self.db_path == ":memory:":
+            with self._memory_chat_leases_lock:
+                if self._memory_chat_leases.get((session_id, role)) == owner:
+                    self._memory_chat_leases.pop((session_id, role), None)
+            return
+        connection = self._control_connection()
+        try:
+            connection.execute(
+                "UPDATE icommerce_agent_chat_sessions "
+                "SET lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE session_id = ? AND role = ? AND lease_owner = ?",
+                (session_id, role, owner),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def consume_rate_limit(self, principal: str, limit: int, window_start: int) -> bool:
+        """Consume one fixed-minute allowance without storing a principal identifier."""
+        if limit <= 0 or self.db_path == ":memory:":
+            return True
+        key_hash = hashlib.sha256(principal.encode()).hexdigest()
+        connection = self._control_connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT INTO icommerce_agent_rate_limits "
+                "(key_hash, window_start, request_count) VALUES (?, ?, 1) "
+                "ON CONFLICT(key_hash, window_start) DO UPDATE "
+                "SET request_count = request_count + 1",
+                (key_hash, window_start),
+            )
+            count = connection.execute(
+                "SELECT request_count FROM icommerce_agent_rate_limits "
+                "WHERE key_hash = ? AND window_start = ?",
+                (key_hash, window_start),
+            ).fetchone()[0]
+            connection.execute(
+                "DELETE FROM icommerce_agent_rate_limits WHERE window_start < ?",
+                (window_start - 3600,),
+            )
+            connection.commit()
+            return count <= limit
         except BaseException:
             connection.rollback()
             raise

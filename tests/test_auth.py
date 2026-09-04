@@ -155,6 +155,7 @@ def test_production_profile_accepts_asymmetric_auth_and_https_origins(monkeypatc
         "https://shop.example.com,https://merchant.example.com",
     )
     monkeypatch.setenv("ICOMMERCE_METRICS_TOKEN", "m" * 32)
+    monkeypatch.setenv("ICOMMERCE_RATE_LIMIT_PER_MINUTE", "120")
     app = create_app(
         str(tmp_path / "production.db"),
         auth_config=AuthConfig(
@@ -165,6 +166,36 @@ def test_production_profile_accepts_asymmetric_auth_and_https_origins(monkeypatc
         ),
     )
     assert app is not None
+
+
+def test_production_profile_rejects_disabled_rate_limit(monkeypatch, tmp_path):
+    monkeypatch.setenv("ICOMMERCE_ENVIRONMENT", "production")
+    monkeypatch.setenv("ICOMMERCE_ALLOWED_ORIGINS", "https://shop.example.com")
+    monkeypatch.setenv("ICOMMERCE_METRICS_TOKEN", "m" * 32)
+    with pytest.raises(ValueError, match="ICOMMERCE_RATE_LIMIT_PER_MINUTE"):
+        create_app(
+            str(tmp_path / "production.db"),
+            auth_config=AuthConfig(
+                mode="jwt",
+                issuer="https://identity.example.com/",
+                audience="icommerce-host",
+                jwks_url="https://identity.example.com/.well-known/jwks.json",
+            ),
+        )
+
+
+def test_rate_limit_is_durable_and_scoped_by_role(monkeypatch, tmp_path):
+    monkeypatch.setenv("ICOMMERCE_RATE_LIMIT_PER_MINUTE", "2")
+    client = TestClient(create_app(str(tmp_path / "store.db")))
+    shopping = client.post("/shopping/session")
+    headers = {"X-Session-Id": shopping.json()["session_id"]}
+    assert client.get("/shopping/cart", headers=headers).status_code == 200
+    limited = client.get("/shopping/cart", headers=headers)
+    assert limited.status_code == 429
+    assert 1 <= int(limited.headers["retry-after"]) <= 60
+
+    # Merchant and shopping traffic have separate buckets even in demo mode.
+    assert client.post("/merchant/session").status_code == 200
 
 
 def test_verified_merchant_is_tenant_scoped_and_becomes_the_operator(tmp_path):
