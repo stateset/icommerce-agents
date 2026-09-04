@@ -1,25 +1,50 @@
-# stateset-icommerce-agents
+# StateSet iCommerce Agents
 
 [![CI](https://github.com/stateset/icommerce-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/stateset/icommerce-agents/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/badge/release-v0.7.1-2563eb)](https://github.com/stateset/icommerce-agents/tree/v0.7.1)
+[![Python](https://img.shields.io/badge/python-3.12-3776ab?logo=python&logoColor=white)](https://www.python.org/)
+[![Node](https://img.shields.io/badge/node-%E2%89%A520.9-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![License](https://img.shields.io/badge/license-MIT-black)](LICENSE)
 
-Anthropic's `commerce-agents` architecture — a shopping agent and a merchant agent,
-each on two paths (the Messages API host and a role MCP server) — running on the
-StateSet iCommerce embedded engine (`stateset-embedded`) instead of an in-memory demo
-backend. One fictional store, ACME Supply, one SQLite-backed engine instance, two agent
-roles.
+A production-oriented reference implementation of Anthropic's `commerce-agents`
+architecture on the StateSet iCommerce embedded engine.
 
-Upstream's guardrails sit in front of the model: fencing, provenance gates, caps,
-staged writes, host approval. They stop a misbehaving model. The engine's policy kernel
-sits underneath, refusing inside the database transaction and returning a sealed
-receipt; it stops any caller, including one that never goes through an agent. Running
-the two together is what this repo is for, and showing where the second layer stops is
-what it is for.
+It runs a shopping agent and a merchant agent through both a Messages API host and
+role-specific MCP servers. Upstream agent guardrails protect the model boundary;
+StateSet's policy kernel independently protects governed commerce transactions inside
+the engine. The repository makes that boundary visible instead of treating every audit
+record as equivalent.
 
-## What it demonstrates
+## Quick start
 
-Two merchant writes — same operator, same approval, same apply path:
+Prerequisites: Python 3.12, Node 20.9 or newer, and a system with glibc 2.34 or newer
+for the prebuilt `stateset-embedded` wheel. Older glibc versions can build the engine
+from source with Rust and maturin.
 
+```bash
+git clone --recurse-submodules https://github.com/stateset/icommerce-agents.git
+cd icommerce-agents
+./scripts/install.sh
+source .venv/bin/activate
+npm install
+python scripts/run_demo.py --web --tour
 ```
+
+Open the storefront at <http://localhost:3000> and the merchant portal at
+<http://localhost:3100>. The keyless tour creates live engine state first, including a
+completed checkout, an approval refusal, an applied price change, and an applied
+restock. The portal then renders both evidence types described below.
+
+An Anthropic key is optional for the deterministic demo and test suite. Set
+`ANTHROPIC_API_KEY` only when you want live Claude conversations or behavioral evals.
+Identity-linked keys also require `ANTHROPIC_WORKSPACE_ID`.
+
+## What this reference implementation proves
+
+The same operator approval and apply pipeline can produce two materially different
+artifacts:
+
+```text
 price update, TENT-RIDGE-TAN 219.00 -> 199.00
   evidence  kind=activity_log     id=46d07ac4-...
 
@@ -27,143 +52,208 @@ restock of a SKU with no inventory item
   evidence  kind=kernel_receipt   id=5e2eb8f8-...
 ```
 
-The restock is a governed command, so the engine seals a receipt for it. The price
-change is merchandising, which the engine does not govern, so the record is an
-activity-log entry and the agent layer's approval gate is the only thing that refused
-an unapproved apply. `web/portal` renders the two differently on purpose.
+The price update is an ungoverned merchandising mutation. Agent-layer provenance,
+guardrail, staging, and approval checks protect it, and the engine records an activity
+log. Creating the missing inventory item is a governed command. The engine evaluates
+its own policy in the transaction and returns a sealed kernel receipt. The portal
+renders these artifacts differently on purpose.
 
-`scripts/denials.py` prints three refusals end to end, no API key required: a cart
-write naming a product the model never saw (agent layer), an apply with no operator
-approval (agent layer), and a refund of 10,000.00 against a 219.00 payment — refused by
-the engine inside the transaction, `commerce.refund.exceeds_captured`, with a receipt
-id. The first two protect you from the model. The third holds against anything.
+`scripts/denials.py` demonstrates three failure points without calling a model:
 
-`python scripts/run_demo.py --web --tour` produces this contrast live, with no API key:
-it drives the checkout over the real routes, and both merchant applies go through the
-same backend the host wires up — staging and applying a merchant change have no route
-without a model. Both web apps render the result on load from `GET /shopping/orders`
-and `GET /merchant/changes`.
+1. A cart write naming a product the model never observed is blocked by provenance.
+2. A merchant apply without operator approval is blocked by the agent layer.
+3. A `10,000.00` refund against a `219.00` payment is rejected by the engine inside
+   the transaction with `commerce.refund.exceeds_captured` and a receipt id.
 
-## Layout
+The first two protect the application from a misbehaving model. The third holds for
+every caller, including one that bypasses the agent entirely.
 
-- `vendor/commerce-agents/` — the upstream repo, a git submodule, never edited.
-- `engine_backend/` — `StorefrontBackend` and `MerchantBackend` implemented over the
-  engine: `storefront.py`, `merchant.py`, `catalog.py`, `search.py`, `content.py`,
-  `listings.py` (the family/variant resolution both roles share), `analysis.py` (the
-  merchant's capped read-only `SELECT` surface), `staging.py`, `apply.py` (the five-kind
-  apply dispatch, the only place live state is mutated), `reconciliation.py` (read-only
-  comparison of ambiguous outcomes with the approved before/after state),
-  `refunds.py` (canonical digest-bound refund previews for the human operator route),
-  `custom_objects.py` (the one
-  shape this repo stores in the engine's custom objects), `money.py`, `kernel.py`,
-  `store.py`, `seed.py`. `docs/mapping.md` is the method-by-method map of what each read
-  and write actually does. `scripts/check.py` fails if a module here is named in neither
-  file.
-- `config/` — `kernel-policy.json` and `kernel-principal.json`, the host-owned files
-  the kernel checks every governed command against; never model input.
-- `host/` — the FastAPI host: one engine store, both agents, demo or verified JWT
-  identity, token-subject session binding, checkout, out-of-band merchant approval,
-  observed-state reconciliation routes, request correlation, and deterministic
-  last-mile protection for the two failures discovered by live evaluation.
-- `mcp_servers/` — `shopping.py` and `merchant.py`, the two MCP servers over the same
-  backends and gates as the host.
-- `web/storefront/` and `web/portal/` — Next.js chat UIs against the host's
-  `/shopping/*` and `/merchant/*` routes.
-- `scripts/` — `run_demo.py` (starts the host, and with `--web` the two web apps),
-  `denials.py` (three refusals, end to end), `check.py` (the drift check), `install.sh`.
-- `evals/` — six graded cases checking rules the prompts, not the code, are relied on
-  for (`docs/safety.md`'s "still asked of the model" list), each one's grader literals
-  checked against the seeded store and the real serializers by `tests/test_evals.py`;
-  run live against `claude-sonnet-5` on 2026-09-03 at 4/6 — see `evals/README.md` and
-  `docs/testing.md` for the score and the two genuine model-behavior findings.
-- `docs/` — `enforcement.md` (what is governed and what is not, and by which layer),
-  `mapping.md` (the backend method map, the pinned submodule commit, the SQL
-  fallbacks), `install.md`, `mcp.md` (connecting an MCP client and its external
-  approval boundary), `testing.md` (what the suite covers and what it does not).
-- `tests/` — one file per module above, run with `pytest`.
-- `.github/workflows/` — CI: a Python job (ruff, pytest, the drift check, the denial
-  walkthrough, the keyless tour run twice against the same db) and a Node 22 job
-  (`npm audit --audit-level=high`, the two web builds, then a headless Chromium check
-  that runs the tour against a live host and asserts the portal and storefront
-  actually render it); see its own `README.md`.
+## Architecture
 
-## Run it
+```mermaid
+flowchart LR
+    shopper[Shopper] --> storefront[Storefront]
+    operator[Merchant operator] --> portal[Merchant portal]
+    storefront --> host[FastAPI host]
+    portal --> host
+    mcpclient[MCP client] --> mcp[Shopping / merchant MCP]
 
-```bash
-python scripts/run_demo.py            # FastAPI host on :8000
-python scripts/run_demo.py --web      # also starts web/storefront (:3000) and web/portal (:3100)
-python scripts/run_demo.py --web --tour  # ...and runs scripts/tour.py against it, no API key needed
-python scripts/denials.py             # three refusals, printed end to end, no API key needed
-python scripts/smoke_chat.py          # one live conversation per role; needs ANTHROPIC_API_KEY, else skips
-python -m evals.run                   # the eval suite; needs ANTHROPIC_API_KEY, else skips
+    host --> agents[Claude commerce agents]
+    host --> trusted[Trusted checkout / approval / refund routes]
+    mcp --> agents
+    agents --> gates[Provenance, caps, staging, approval]
+    gates --> adapters[StateSet backend adapters]
+
+    trusted --> ledger[Durable approval ledger]
+    ledger --> adapters
+    trusted --> adapters
+
+    adapters --> bindings[iCommerce engine bindings]
+    adapters --> kernel[Policy kernel]
+    kernel --> bindings
+    bindings --> sqlite[(SQLite commerce state)]
 ```
 
-`docs/install.md` has the Python version, submodule, and glibc-wheel details.
-`web/storefront` and `web/portal` are Next.js 16 / React 19 and need **Node >= 20.9**
-(`nvm use 22`). A live chat turn (`/shopping/chat`, `/merchant/chat`, either web app,
-`smoke_chat.py`, or `evals/`) needs `ANTHROPIC_API_KEY` in the environment; everything
-else, including `denials.py` and the full test suite, does not. An identity-linked key
-also needs `ANTHROPIC_WORKSPACE_ID` set — without it the request fails with a 400 naming
-the `anthropic-workspace-id` header; an unlinked key ignores the variable. `docs/testing.md` is
-the honest account of what the test suite proves and what it does not — read it before
-trusting a green CI run to mean more than "the code, not the agent's behavior, is
-correct."
+The MCP merchant surface deliberately has no approval or refund tool. A model may
+stage a proposal, but only a trusted operator route can approve its exact SHA-256
+digest or issue a digest-bound refund. Apply claims approval once, leases affected
+targets across processes, rechecks the reviewed `before` state, and blocks ambiguous
+outcomes until an operator reconciles observed live state.
 
-The Messages API host buffers model-authored text until each turn completes while
-continuing to stream tool and UI events. `host/response_policy.py` then closes the two
-specific historical eval failures at the display boundary: a successful `stage_*`
-result cannot be affirmatively described as applied, and a medical/allergy request
-cannot be shown without a qualified-professional referral. If text is rewritten, the
-stored conversation copy is rewritten too, so the next turn does not inherit the false
-claim. This is a narrow deterministic backstop, not a general truth checker and not a
-claim that raw model behavior now passes the eval suite.
+## Enforcement at a glance
 
-## Where the interfaces are
+| Operation | Agent/application layer | Engine policy kernel | Evidence |
+|---|---|---|---|
+| Add or update cart | Provenance and option checks | Not governed | Cart state |
+| Checkout | Human-clicked host route | `checkout.commit` | Sealed kernel receipt |
+| Stage merchant change | Provenance and guardrails | No live mutation | Staged proposal + digest |
+| Apply price, content, promotion, or campaign change | Approval, single claim, target lease, stale-preview check | Not governed | Activity-log id |
+| Restock a new SKU | Same apply controls | `inventory.item.create` | Sealed kernel receipt |
+| Refund | Authenticated, exact-decimal, digest-bound operator route | `payments.create_refund` with required approval | Sealed success or refusal receipt |
 
-- `POST /shopping/session`, `POST /shopping/session/end`, `POST /shopping/chat`, `POST /shopping/cart/add`,
-  `POST /shopping/checkout`, `GET /shopping/cart`, `GET /shopping/orders`,
-  `POST /merchant/session`, `POST /merchant/session/end`, `POST /merchant/chat`, `POST /merchant/changes/{id}/approve`,
-  `POST /merchant/refunds/preview`, `POST /merchant/refunds`,
-  `GET|POST /merchant/changes/{id}/reconciliation`,
-  `POST /merchant/changes/{id}/reconciliation/start`, `GET /merchant/changes`,
-  `GET /capabilities`, `GET /healthz`, `GET /readyz`, authenticated opt-in `GET /metrics` — `host/app.py`. The commerce `GET` routes are
-  reads behind the same session gate as their role's other routes; `/capabilities` and
-  `/healthz` are intentionally public. `GET /shopping/cart` and
-  `GET /merchant/changes` are session-scoped,
-  while `GET /shopping/orders` is customer-scoped, so any session bound to the seeded
-  customer sees that customer's orders — and both web apps use them to render live
-  store state.
-- The MCP tool surface — 13 shopping tools, 18 merchant tools — `mcp_servers/`, wired
-  up in `docs/mcp.md`.
-- The governed kernel seam — `engine_backend/kernel.py`'s `KernelClient.execute`,
-  the only place a command reaches the engine's own policy check.
+This deployment enables five governed commands in `config/kernel-policy.json`. Only
+three have production code paths: `checkout.commit`, `inventory.item.create`, and
+`payments.create_refund`. The engine governs the transaction spine, not general
+merchandising. [The complete write-by-write account](docs/enforcement.md) names every
+exception and avoids implying broader kernel coverage.
 
-## Enforcement
+## Capabilities
 
-Every write in this repo goes through the agent layer's gates (`shopping_agent.gates`,
-`merchant_agent.gates`). Only the commands this deployment's kernel policy governs are
-*also* checked by the engine's own kernel, and no merchandising write is one of them.
+- One seeded ACME Supply store backed by a real `stateset-embedded` SQLite engine.
+- Shopping search, catalog, product detail, cart, checkout, and order-history flows.
+- Merchant analytics, listings, inventory alerts, staged changes, approval, apply,
+  and explicit reconciliation for ambiguous outcomes.
+- Human-only refund preview/apply with exact decimal amounts, canonical proposal
+  digests, idempotency, kernel approval evidence, and sealed receipts.
+- Demo identity for local use and production JWT authentication with issuer, audience,
+  expiry, role/scope, tenant, and token-subject/session binding checks.
+- Explicit session termination and configurable in-process session expiry.
+- Request correlation propagated into checkout/refund kernel envelopes, secure response
+  headers, restricted CORS, and logs that omit tokens, session ids, and bodies.
+- Disabled-by-default, separately authenticated Prometheus metrics with low-cardinality
+  route labels and no customer, operator, session, payment, or request identifiers.
+- Deterministic response backstops for two historical live-eval failure modes, without
+  hiding the raw model score or weakening the behavioral graders.
+- Next.js 16 / React 19 storefront and merchant portal, exercised in CI by Chromium
+  against a live host and real engine state.
 
-The engine governs 26 of its 474 mutations, and they are the transaction spine.
-This deployment enables five of those 26 in `config/kernel-policy.json`; one has no code
-path here and another is test-only, which `docs/enforcement.md` names rather than leaves
-implied.
-That document is the full account — which layer stops which write, what evidence comes
-back, and the reason a merchant agent editing listings and prices has its agent layer
-and nothing beneath it.
-
-The one guarantee enforced twice is approval: upstream's `require_host_approval` at the
-agent layer, and `requires_approval` on `payments.create_refund` in the kernel policy.
-The kernel's copy holds even when the agent layer is bypassed entirely.
-
-For staged merchant writes, approval is also bound to a canonical SHA-256 digest of the
-exact reviewed proposal, and the approval request must echo that displayed digest. The
-MCP server exposes no approval capability; a trusted
-operator surface must record it. Apply claims it once, leases affected targets, and
-ambiguous dispatches stay blocked until observed live state is explicitly reconciled.
-
-## Verify
+## Run modes
 
 ```bash
-ruff check . && ruff format --check . && pytest && python scripts/check.py
+# Host only on :8000
+python scripts/run_demo.py
+
+# Host plus storefront (:3000) and merchant portal (:3100)
+python scripts/run_demo.py --web
+
+# Populate and display the complete keyless evidence tour
+python scripts/run_demo.py --web --tour
+
+# Deterministic refusals; no API key
+python scripts/denials.py
+
+# One live conversation per role; skips cleanly without a key
+python scripts/smoke_chat.py
+
+# Six live behavioral cases; skips cleanly without a key
+python -m evals.run
 ```
+
+Live chat is available through `POST /shopping/chat`, `POST /merchant/chat`, either web
+application, the smoke script, or the eval runner. With no key, `/capabilities` reports
+`unconfigured` while all deterministic engine and operator flows remain usable.
+
+## HTTP and MCP interfaces
+
+The FastAPI host exposes:
+
+- Shopping: session start/end, streaming chat, cart reads/writes, checkout, and orders.
+- Merchant: session start/end, streaming chat, staged-change approval, apply state,
+  reconciliation, and governed refund preview/apply.
+- Operations: `/capabilities`, `/healthz`, `/readyz`, and authenticated opt-in
+  `/metrics`.
+
+All `/shopping/*` and `/merchant/*` commerce reads and writes share their role's
+session boundary. `GET /shopping/orders` is customer-scoped; cart and merchant-change
+reads are session-scoped. Route definitions and request models live in `host/app.py`.
+
+The separate MCP servers expose 13 shopping tools and 18 merchant tools over the same
+backends and gates. They are loopback-oriented, principal-scoped processes—not public
+multi-tenant services. See [the MCP deployment guide](docs/mcp.md) before exposing
+them through an authorization gateway.
+
+## Production configuration
+
+Local demo authentication uses seeded identities and must not be exposed publicly.
+Enable verified bearer authentication for a deployment:
+
+```bash
+export ICOMMERCE_AUTH_MODE=jwt
+export ICOMMERCE_JWT_ISSUER=https://identity.example.com/
+export ICOMMERCE_JWT_AUDIENCE=icommerce-host
+export ICOMMERCE_JWKS_URL=https://identity.example.com/.well-known/jwks.json
+export ICOMMERCE_ALLOWED_ORIGINS=https://shop.example.com,https://merchant.example.com
+export ICOMMERCE_SESSION_TTL_SECONDS=28800
+export ICOMMERCE_STALE_APPLY_SECONDS=900
+export ICOMMERCE_METRICS_TOKEN=replace-with-32-plus-byte-monitoring-secret
+```
+
+Public deployments should use asymmetric JWKS verification. The HS256 option exists
+for tests and controlled private environments, requires at least 32 bytes, and is
+mutually exclusive with JWKS. Authenticated checkout also requires a validated shipping
+address; the fictional fallback exists only in demo mode.
+
+Chat and principal bindings are currently process-local, while approval records and
+target leases are durable and cross-process safe. Run a single host worker or configure
+sticky routing for each session. The [installation and deployment guide](docs/install.md)
+documents every variable and trust boundary.
+
+## Verification
+
+```bash
+ruff check .
+ruff format --check .
+pytest
+python scripts/check.py
+python scripts/denials.py
+npm audit --audit-level=high
+npm run build --workspace web/storefront
+npm run build --workspace web/portal
+```
+
+Required CI performs those deterministic checks, runs the keyless tour twice against
+the same database, and drives a real headless browser against both built web apps. It
+does not make paid model calls. A separate protected workflow runs all six live Claude
+behavioral evals three times on a weekly schedule and on manual dispatch.
+
+The last documented raw-model run scored **4/6 on 2026-09-03**. Prompt and host
+backstops now address both observed failure modes, but that historical score is not
+rewritten without another live run. [Testing and eval evidence](docs/testing.md)
+explains exactly what green CI proves—and what it does not.
+
+## Repository map
+
+- `vendor/commerce-agents/` — pinned upstream architecture as an unmodified submodule.
+- `engine_backend/` — `agent_config.py`, `analysis.py`, `apply.py`, `catalog.py`,
+  `content.py`, `custom_objects.py`, `kernel.py`, `listings.py`, `merchant.py`,
+  `money.py`, `reconciliation.py`, `refunds.py`, `search.py`, `seed.py`, `staging.py`,
+  `store.py`, and `storefront.py` implement the StateSet adapters and durable controls.
+- `host/` — FastAPI sessions, JWT identity, streaming agents, human approval/refund
+  routes, response policy, metrics, and operational endpoints.
+- `mcp_servers/` — role-specific MCP entry points over the same adapters and gates.
+- `web/storefront/`, `web/portal/` — customer and operator applications.
+- `config/` — deployment-owned kernel policy and principal; never model input.
+- `evals/` — six structural graders for rules that still depend on model behavior.
+- `scripts/` — install, demo, denial, drift, tour, browser, and live smoke tooling.
+- `tests/` — deterministic engine, host, MCP, concurrency, security, and web coverage.
+
+## Documentation
+
+- [Install and production configuration](docs/install.md)
+- [Enforcement boundaries](docs/enforcement.md)
+- [Backend-to-engine mapping](docs/mapping.md)
+- [MCP deployment](docs/mcp.md)
+- [Testing scope and live eval record](docs/testing.md)
+- [Workflow design](.github/workflows/README.md)
+
+Released under the [MIT License](LICENSE).
