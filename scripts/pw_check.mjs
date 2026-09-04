@@ -25,7 +25,11 @@ try {
   const consoleErrors = [];
   page.on("pageerror", (err) => consoleErrors.push(String(err)));
 
-  await page.goto(PORTAL_URL, { waitUntil: "networkidle" });
+  // Both apps poll the API to keep commerce state fresh. `networkidle` therefore
+  // is not a meaningful readiness signal and can time out even when the page is
+  // fully rendered. Navigation proves the document loaded; the selectors below
+  // prove the application reached the state this smoke test actually requires.
+  await page.goto(PORTAL_URL, { waitUntil: "domcontentloaded" });
 
   // Live store state loads as soon as a session exists, with no typing -- wait for
   // the two evidence rows the tour run left behind.
@@ -66,7 +70,7 @@ try {
     const sfErrors = [];
     const sfPage = await browser.newPage();
     sfPage.on("pageerror", (err) => sfErrors.push(String(err)));
-    await sfPage.goto(STOREFRONT_URL, { waitUntil: "networkidle" });
+    await sfPage.goto(STOREFRONT_URL, { waitUntil: "domcontentloaded" });
     await sfPage
       .waitForSelector(".order-card, .orders-empty", { timeout: 15_000 })
       .catch(() => {});
