@@ -105,6 +105,35 @@ async def test_approval_is_bound_to_the_operator_and_consumed(store, kernel):
     assert change.change_id not in backend.approved_ids
 
 
+async def test_approval_is_bound_to_the_exact_proposal_digest(store, kernel):
+    from merchant_agent.changes import ChangeNotApplicable
+
+    from engine_backend import custom_objects, staging
+
+    backend = EngineMerchant(store, kernel)
+    change = await backend.stage_price_update(
+        session(), [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.00)]
+    )
+    backend.approve(change.change_id, "user:acme-operator")
+    record = await staging.load_record(store, change.change_id)
+    record["items"][0]["after"] = "1.00"
+    await store.write(
+        "test:tamper",
+        lambda commerce: custom_objects.put_payload(
+            commerce,
+            staging.STAGED_TYPE,
+            staging.STAGED_DISPLAY,
+            record,
+            object_handle=change.change_id,
+        ),
+    )
+
+    with pytest.raises(ChangeNotApplicable, match="proposal digest is invalid"):
+        await backend.apply_change(session(), change.change_id)
+    assert store.commerce.products.get_variant_by_sku("TENT-RIDGE-TAN").price == 219.00
+    assert store.approval_record(change.change_id)["state"] == "approved"
+
+
 async def test_a_refused_apply_consumes_its_approval(store, kernel):
     from merchant_agent.changes import ChangeNotApplicable, GuardrailViolation
 

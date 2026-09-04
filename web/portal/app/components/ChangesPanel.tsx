@@ -1,8 +1,13 @@
 "use client";
 
 import { useState } from "react";
-import { approveChange } from "../../lib/api";
-import type { StagedChange } from "../../lib/types";
+import {
+  approveChange,
+  fetchReconciliation,
+  resolveReconciliation,
+  startReconciliation,
+} from "../../lib/api";
+import type { ReconciliationDetail, StagedChange } from "../../lib/types";
 import { Evidence } from "./Evidence";
 
 function formatValue(value: unknown): string {
@@ -10,17 +15,82 @@ function formatValue(value: unknown): string {
   return String(value);
 }
 
-export function ChangesPanel({ changes }: { changes: Record<string, StagedChange> }) {
+export function ChangesPanel({
+  changes,
+  onRefresh,
+}: {
+  changes: Record<string, StagedChange>;
+  onRefresh: () => Promise<void>;
+}) {
   const [approving, setApproving] = useState<string | null>(null);
   const [approvedIds, setApprovedIds] = useState<Set<string>>(new Set());
+  const [reconciliations, setReconciliations] = useState<
+    Record<string, ReconciliationDetail>
+  >({});
+  const [resolving, setResolving] = useState<string | null>(null);
+  const [errors, setErrors] = useState<Record<string, string>>({});
   const list = Object.values(changes).sort((a, b) => a.created_at.localeCompare(b.created_at));
 
-  async function approve(changeId: string) {
-    setApproving(changeId);
-    const result = await approveChange(changeId);
-    setApproving(null);
-    if (result) {
-      setApprovedIds((prev) => new Set(prev).add(changeId));
+  async function approve(change: StagedChange) {
+    if (!change.proposal_digest) return;
+    setApproving(change.change_id);
+    setErrors((current) => ({ ...current, [change.change_id]: "" }));
+    try {
+      const result = await approveChange(change.change_id, change.proposal_digest);
+      if (result.ok) {
+        setApprovedIds((prev) => new Set(prev).add(change.change_id));
+        await onRefresh();
+      } else {
+        setErrors((current) => ({ ...current, [change.change_id]: result.error }));
+      }
+    } finally {
+      setApproving(null);
+    }
+  }
+
+  async function inspect(changeId: string) {
+    const result = await fetchReconciliation(changeId);
+    if (result.ok) {
+      setReconciliations((current) => ({ ...current, [changeId]: result.data }));
+      setErrors((current) => ({ ...current, [changeId]: "" }));
+    } else {
+      setErrors((current) => ({ ...current, [changeId]: result.error }));
+    }
+  }
+
+  async function recover(change: StagedChange) {
+    if (!change.proposal_digest) return;
+    setResolving(change.change_id);
+    setErrors((current) => ({ ...current, [change.change_id]: "" }));
+    try {
+      const result = await startReconciliation(change.change_id, change.proposal_digest);
+      if (result.ok) {
+        await onRefresh();
+        await inspect(change.change_id);
+      } else {
+        setErrors((current) => ({ ...current, [change.change_id]: result.error }));
+      }
+    } finally {
+      setResolving(null);
+    }
+  }
+
+  async function resolve(
+    changeId: string,
+    detail: ReconciliationDetail,
+    resolution: "confirmed_applied" | "accepted_current_state",
+  ) {
+    setResolving(changeId);
+    setErrors((current) => ({ ...current, [changeId]: "" }));
+    try {
+      const result = await resolveReconciliation(changeId, detail.proposal_digest, resolution);
+      if (result.ok) {
+        await onRefresh();
+      } else {
+        setErrors((current) => ({ ...current, [changeId]: result.error }));
+      }
+    } finally {
+      setResolving(null);
     }
   }
 
@@ -43,12 +113,24 @@ export function ChangesPanel({ changes }: { changes: Record<string, StagedChange
             const approved =
               approvedIds.has(change.change_id) || controlState === "approved";
             const applying = controlState === "applying";
+            const reconciling = controlState === "reconciling";
             const needsReconciliation = controlState === "reconciliation_required";
-            const approvalBlocked = applying || needsReconciliation;
+            const approvalBlocked = applying || reconciling || needsReconciliation;
+            const reconciliation = reconciliations[change.change_id];
+            const recoveryAvailable =
+              (applying || reconciling) &&
+              change.recovery_available_at !== null &&
+              change.recovery_available_at !== undefined &&
+              Date.parse(change.recovery_available_at) <= Date.now();
             return (
               <div className="change-card" key={change.change_id}>
                 <div className="kind">{change.kind.replace(/_/g, " ")}</div>
                 <div className="summary">{change.summary}</div>
+                {change.proposal_digest ? (
+                  <code className="proposal-digest" title={change.proposal_digest}>
+                    Reviewed proposal: {change.proposal_digest}
+                  </code>
+                ) : null}
                 <div className="items">
                   {change.items.map((item, index) => (
                     <div className="item-line" key={index}>
@@ -71,11 +153,18 @@ export function ChangesPanel({ changes }: { changes: Record<string, StagedChange
                   <button
                     type="button"
                     className="approve-btn"
-                    disabled={approving === change.change_id || approved || approvalBlocked}
-                    onClick={() => approve(change.change_id)}
+                    disabled={
+                      !change.proposal_digest ||
+                      approving === change.change_id ||
+                      approved ||
+                      approvalBlocked
+                    }
+                    onClick={() => approve(change)}
                   >
-                    {applying
-                      ? "Apply in progress"
+                    {reconciling
+                      ? "Resolution in progress"
+                      : applying
+                        ? "Apply in progress"
                       : needsReconciliation
                         ? "Reconciliation required"
                         : approved
@@ -98,7 +187,86 @@ export function ChangesPanel({ changes }: { changes: Record<string, StagedChange
                     {control?.last_error ? ` Last error: ${control.last_error}` : ""}
                   </p>
                 ) : null}
+                {needsReconciliation && !reconciliation ? (
+                  <button
+                    type="button"
+                    className="reconcile-btn"
+                    onClick={() => inspect(change.change_id)}
+                  >
+                    Inspect live state
+                  </button>
+                ) : null}
+                {applying || reconciling ? (
+                  <button
+                    type="button"
+                    className="reconcile-btn"
+                    disabled={!recoveryAvailable || resolving === change.change_id}
+                    onClick={() => recover(change)}
+                  >
+                    {recoveryAvailable
+                      ? "Recover interrupted operation"
+                      : change.recovery_available_at
+                        ? `Recovery available ${new Date(
+                            change.recovery_available_at,
+                          ).toLocaleString()}`
+                        : "Recovery time unavailable"}
+                  </button>
+                ) : null}
+                {reconciliation ? (
+                  <div className="reconciliation">
+                    <strong>Observed outcome: {reconciliation.assessment.outcome}</strong>
+                    {reconciliation.assessment.items.map((item, index) => (
+                      <div className="item-line" key={index}>
+                        <span>
+                          {item.target} · {item.field}
+                        </span>
+                        <span>
+                          {formatValue(item.observed)} · {item.state.replace(/_/g, " ")}
+                        </span>
+                      </div>
+                    ))}
+                    <details className="approval-history">
+                      <summary>Approval history</summary>
+                      {reconciliation.events.map((event, index) => (
+                        <div className="history-line" key={event.event_id ?? index}>
+                          <span>{event.event.replace(/_/g, " ")}</span>
+                          <span>
+                            {event.operator} · {new Date(event.occurred_at).toLocaleString()}
+                          </span>
+                        </div>
+                      ))}
+                    </details>
+                    <div className="reconcile-actions">
+                      <button
+                        type="button"
+                        disabled={
+                          resolving === change.change_id ||
+                          reconciliation.assessment.outcome !== "applied"
+                        }
+                        onClick={() =>
+                          resolve(change.change_id, reconciliation, "confirmed_applied")
+                        }
+                      >
+                        Confirm fully applied
+                      </button>
+                      <button
+                        type="button"
+                        disabled={resolving === change.change_id}
+                        onClick={() =>
+                          resolve(change.change_id, reconciliation, "accepted_current_state")
+                        }
+                      >
+                        Accept current state
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
                 {change.status === "applied" ? <Evidence entries={change.evidence} /> : null}
+                {errors[change.change_id] ? (
+                  <p className="control-note danger" role="alert">
+                    {errors[change.change_id]}
+                  </p>
+                ) : null}
               </div>
             );
           })}

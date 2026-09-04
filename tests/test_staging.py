@@ -1,6 +1,8 @@
+import pytest
+from merchant_agent.changes import ChangeNotApplicable
 from merchant_agent.types import ChangeItem, ChangeKind, ChangeStatus
 
-from engine_backend.staging import load, new_change, pending, save
+from engine_backend.staging import load, load_record, new_change, pending, save
 
 
 async def test_a_staged_change_round_trips(store):
@@ -16,6 +18,22 @@ async def test_a_staged_change_round_trips(store):
     assert loaded.summary == change.summary
     assert loaded.status is ChangeStatus.STAGED
     assert loaded.created_by == "user:acme-operator"
+    record = await load_record(store, change.change_id)
+    assert record["proposal_digest"].startswith("sha256:")
+
+
+async def test_a_saved_proposal_is_immutable(store):
+    change = new_change(
+        ChangeKind.PRICE_UPDATE,
+        "Drop the tan tent to 199.00",
+        [ChangeItem(target="TENT-RIDGE-TAN", field="price", before="219.00", after="199.00")],
+        "user:acme-operator",
+    )
+    await save(store, change)
+
+    altered = change.model_copy(update={"summary": "A different reviewed proposal"})
+    with pytest.raises(ChangeNotApplicable, match="proposal is immutable"):
+        await save(store, altered)
 
 
 async def test_pending_excludes_applied_and_discarded(store):

@@ -56,7 +56,7 @@ from stateset_embedded import CreateProductVariantInput
 
 from engine_backend.kernel import KernelClient
 from engine_backend.merchant import EngineMerchant
-from engine_backend.staging import load_evidence
+from engine_backend.staging import load_evidence, load_record
 from engine_backend.store import EngineStore
 from host.app import create_app
 
@@ -227,22 +227,19 @@ def _drive_tour(
         f"(POST /merchant/changes/{price_change.change_id}/approve)..."
     )
     approve_response = http.post(
-        f"/merchant/changes/{price_change.change_id}/approve", headers=merchant_headers
+        f"/merchant/changes/{price_change.change_id}/approve",
+        headers=merchant_headers,
+        json={
+            "proposal_digest": asyncio.run(load_record(store, price_change.change_id))[
+                "proposal_digest"
+            ]
+        },
     )
     if approve_response.status_code != 200:
         result.fail(f"approve did not succeed: {approve_response.text}")
         return result
-    # `approve` only ever marks an in-memory `_approved` set on the `EngineMerchant`
-    # instance it is called on -- it writes nothing to the store -- so the HTTP call
-    # above marked the host's own instance, not this script's `merchant`. This mirrors
-    # that mark locally so `merchant.apply_change` below sees it approved. FRAGILE: if
-    # `approve` (or what `apply_change` checks) ever grows a second side effect --
-    # persisting to the store, say, or checking anything beyond `_approved` -- this
-    # local call stops being an accurate stand-in and the two instances can silently
-    # desync, e.g. a change the host considers approved that this script's apply
-    # refuses, or the reverse. There is no cross-check to catch that today; the fix if
-    # it does happen is a real apply route in `host/app.py`, not another mirror call.
-    merchant.approve(price_change.change_id, OPERATOR)
+    # Approval is durable shared-store state. The separate backend instance below sees
+    # the host route's exact digest-bound ledger entry; no in-process mirroring exists.
 
     result.narrate(f"Applying {price_change.change_id}...")
     applied_price = asyncio.run(merchant.apply_change(backend_session, price_change.change_id))
@@ -277,13 +274,17 @@ def _drive_tour(
 
     result.narrate(f"Approving {restock_change.change_id}...")
     approve_restock = http.post(
-        f"/merchant/changes/{restock_change.change_id}/approve", headers=merchant_headers
+        f"/merchant/changes/{restock_change.change_id}/approve",
+        headers=merchant_headers,
+        json={
+            "proposal_digest": asyncio.run(load_record(store, restock_change.change_id))[
+                "proposal_digest"
+            ]
+        },
     )
     if approve_restock.status_code != 200:
         result.fail(f"approve did not succeed: {approve_restock.text}")
         return result
-    merchant.approve(restock_change.change_id, OPERATOR)  # see the FRAGILE note above
-
     result.narrate(f"Applying {restock_change.change_id}...")
     applied_restock = asyncio.run(merchant.apply_change(backend_session, restock_change.change_id))
     restock_evidence = asyncio.run(load_evidence(store, applied_restock.change_id))

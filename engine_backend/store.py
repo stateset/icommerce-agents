@@ -31,6 +31,7 @@ class ApprovalClaim:
             "already_applied",
             "reconciliation_required",
             "target_claimed",
+            "proposal_changed",
         ]
         | None
     ) = None
@@ -44,6 +45,7 @@ class PrincipalBinding(BaseModel):
     subject_id: str
     kind: Literal["customer", "operator"]
     store_id: str
+    authenticated_subject: str | None = None
 
 
 class EngineStore:
@@ -106,6 +108,7 @@ class EngineStore:
         self._sql = threading.local()
         self._memory_approvals: dict[str, dict[str, Any]] = {}
         self._memory_target_leases: dict[str, tuple[str, str]] = {}
+        self._memory_approval_events: list[dict[str, Any]] = []
         self._memory_approvals_lock = threading.Lock()
         # Create adapter-owned tables before opening the embedded engine. Opening and
         # closing Python's SQLite afterwards can invalidate the engine binding's WAL
@@ -135,13 +138,17 @@ class EngineStore:
                     state TEXT NOT NULL CHECK (
                         state IN (
                             'approved', 'applying', 'applied', 'failed',
-                            'reconciliation_required'
+                            'reconciliation_required', 'reconciling', 'resolved'
                         )
                     ),
                     attempt_id TEXT,
                     claimed_at TEXT,
                     finished_at TEXT,
-                    last_error TEXT
+                    last_error TEXT,
+                    proposal_digest TEXT,
+                    resolved_at TEXT,
+                    resolved_by TEXT,
+                    resolution TEXT
                 )
                 """
             )
@@ -149,7 +156,11 @@ class EngineStore:
                 "SELECT sql FROM sqlite_master WHERE type = 'table' "
                 "AND name = 'icommerce_agent_approvals'"
             ).fetchone()[0]
-            if "reconciliation_required" not in schema:
+            if (
+                "reconciliation_required" not in schema
+                or "'reconciling'" not in schema
+                or "'resolved'" not in schema
+            ):
                 # Upgrade databases created by the first durable-ledger revision. A
                 # SQLite CHECK cannot be altered in place, so rebuild transactionally.
                 connection.execute(
@@ -165,21 +176,59 @@ class EngineStore:
                         state TEXT NOT NULL CHECK (
                             state IN (
                                 'approved', 'applying', 'applied', 'failed',
-                                'reconciliation_required'
+                                'reconciliation_required', 'reconciling', 'resolved'
                             )
                         ),
                         attempt_id TEXT,
                         claimed_at TEXT,
                         finished_at TEXT,
-                        last_error TEXT
+                        last_error TEXT,
+                        proposal_digest TEXT,
+                        resolved_at TEXT,
+                        resolved_by TEXT,
+                        resolution TEXT
                     )
                     """
                 )
+                legacy_columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(icommerce_agent_approvals_legacy)"
+                    )
+                }
+                current_columns = [
+                    "change_id",
+                    "approved_by",
+                    "approved_at",
+                    "state",
+                    "attempt_id",
+                    "claimed_at",
+                    "finished_at",
+                    "last_error",
+                    "proposal_digest",
+                    "resolved_at",
+                    "resolved_by",
+                    "resolution",
+                ]
+                copied_columns = [column for column in current_columns if column in legacy_columns]
+                names = ", ".join(copied_columns)
                 connection.execute(
-                    "INSERT INTO icommerce_agent_approvals SELECT * "
-                    "FROM icommerce_agent_approvals_legacy"
+                    f"INSERT INTO icommerce_agent_approvals ({names}) "
+                    f"SELECT {names} FROM icommerce_agent_approvals_legacy"
                 )
                 connection.execute("DROP TABLE icommerce_agent_approvals_legacy")
+            approval_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(icommerce_agent_approvals)")
+            }
+            if "proposal_digest" not in approval_columns:
+                connection.execute(
+                    "ALTER TABLE icommerce_agent_approvals ADD COLUMN proposal_digest TEXT"
+                )
+            for column in ("resolved_at", "resolved_by", "resolution"):
+                if column not in approval_columns:
+                    connection.execute(
+                        f"ALTER TABLE icommerce_agent_approvals ADD COLUMN {column} TEXT"
+                    )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS icommerce_agent_target_leases (
@@ -189,6 +238,24 @@ class EngineStore:
                     claimed_at TEXT NOT NULL
                 )
                 """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS icommerce_agent_approval_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    change_id TEXT NOT NULL,
+                    event TEXT NOT NULL,
+                    operator TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    proposal_digest TEXT,
+                    attempt_id TEXT,
+                    detail TEXT
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_agent_approval_events_change "
+                "ON icommerce_agent_approval_events(change_id, event_id)"
             )
             connection.commit()
         finally:
@@ -204,7 +271,37 @@ class EngineStore:
     def _now() -> str:
         return datetime.now(UTC).isoformat()
 
-    def record_approval(self, change_id: str, approved_by: str) -> None:
+    @staticmethod
+    def _insert_approval_event(
+        connection: sqlite3.Connection,
+        *,
+        change_id: str,
+        event: str,
+        operator: str,
+        occurred_at: str,
+        proposal_digest: str | None,
+        attempt_id: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO icommerce_agent_approval_events (
+                change_id, event, operator, occurred_at,
+                proposal_digest, attempt_id, detail
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                change_id,
+                event,
+                operator,
+                occurred_at,
+                proposal_digest,
+                attempt_id,
+                detail,
+            ),
+        )
+
+    def record_approval(self, change_id: str, approved_by: str, proposal_digest: str) -> None:
         """Durably record or renew approval unless an apply is in flight or complete."""
         now = self._now()
         if self.db_path == ":memory:":
@@ -214,6 +311,8 @@ class EngineStore:
                     "applying",
                     "applied",
                     "reconciliation_required",
+                    "reconciling",
+                    "resolved",
                 ):
                     raise ValueError(f"change {change_id} is already {current['state']}")
                 self._memory_approvals[change_id] = {
@@ -225,7 +324,22 @@ class EngineStore:
                     "claimed_at": None,
                     "finished_at": None,
                     "last_error": None,
+                    "proposal_digest": proposal_digest,
+                    "resolved_at": None,
+                    "resolved_by": None,
+                    "resolution": None,
                 }
+                self._memory_approval_events.append(
+                    {
+                        "change_id": change_id,
+                        "event": "approved",
+                        "operator": approved_by,
+                        "occurred_at": now,
+                        "proposal_digest": proposal_digest,
+                        "attempt_id": None,
+                        "detail": None,
+                    }
+                )
             return
 
         connection = self._control_connection()
@@ -239,14 +353,16 @@ class EngineStore:
                 "applying",
                 "applied",
                 "reconciliation_required",
+                "reconciling",
+                "resolved",
             ):
                 raise ValueError(f"change {change_id} is already {row['state']}")
             connection.execute(
                 """
                 INSERT INTO icommerce_agent_approvals (
                     change_id, approved_by, approved_at, state,
-                    attempt_id, claimed_at, finished_at, last_error
-                ) VALUES (?, ?, ?, 'approved', NULL, NULL, NULL, NULL)
+                    attempt_id, claimed_at, finished_at, last_error, proposal_digest
+                ) VALUES (?, ?, ?, 'approved', NULL, NULL, NULL, NULL, ?)
                 ON CONFLICT(change_id) DO UPDATE SET
                     approved_by = excluded.approved_by,
                     approved_at = excluded.approved_at,
@@ -254,9 +370,21 @@ class EngineStore:
                     attempt_id = NULL,
                     claimed_at = NULL,
                     finished_at = NULL,
-                    last_error = NULL
+                    last_error = NULL,
+                    proposal_digest = excluded.proposal_digest,
+                    resolved_at = NULL,
+                    resolved_by = NULL,
+                    resolution = NULL
                 """,
-                (change_id, approved_by, now),
+                (change_id, approved_by, now, proposal_digest),
+            )
+            self._insert_approval_event(
+                connection,
+                change_id=change_id,
+                event="approved",
+                operator=approved_by,
+                occurred_at=now,
+                proposal_digest=proposal_digest,
             )
             connection.commit()
         except BaseException:
@@ -266,7 +394,11 @@ class EngineStore:
             connection.close()
 
     def claim_approval(
-        self, change_id: str, operator: str, targets: list[str] | None = None
+        self,
+        change_id: str,
+        operator: str,
+        proposal_digest: str,
+        targets: list[str] | None = None,
     ) -> ApprovalClaim:
         """Atomically move an approval from ``approved`` to ``applying``.
 
@@ -279,7 +411,7 @@ class EngineStore:
         if self.db_path == ":memory:":
             with self._memory_approvals_lock:
                 row = self._memory_approvals.get(change_id)
-                refusal = self._approval_refusal(row, operator)
+                refusal = self._approval_refusal(row, operator, proposal_digest)
                 if refusal is not None:
                     return ApprovalClaim(refusal=refusal)
                 for target in unique_targets:
@@ -288,6 +420,17 @@ class EngineStore:
                 row.update(state="applying", attempt_id=attempt_id, claimed_at=now)
                 for target in unique_targets:
                     self._memory_target_leases[target] = (change_id, attempt_id)
+                self._memory_approval_events.append(
+                    {
+                        "change_id": change_id,
+                        "event": "claimed",
+                        "operator": operator,
+                        "occurred_at": now,
+                        "proposal_digest": proposal_digest,
+                        "attempt_id": attempt_id,
+                        "detail": None,
+                    }
+                )
                 return ApprovalClaim(attempt_id=attempt_id)
 
         connection = self._control_connection()
@@ -297,7 +440,9 @@ class EngineStore:
                 "SELECT * FROM icommerce_agent_approvals WHERE change_id = ?",
                 (change_id,),
             ).fetchone()
-            refusal = self._approval_refusal(dict(row) if row is not None else None, operator)
+            refusal = self._approval_refusal(
+                dict(row) if row is not None else None, operator, proposal_digest
+            )
             if refusal is not None:
                 connection.rollback()
                 return ApprovalClaim(refusal=refusal)
@@ -329,6 +474,15 @@ class EngineStore:
             if changed != 1:  # defensive: BEGIN IMMEDIATE should make this unreachable
                 connection.rollback()
                 return ApprovalClaim(refusal="already_claimed")
+            self._insert_approval_event(
+                connection,
+                change_id=change_id,
+                event="claimed",
+                operator=operator,
+                occurred_at=now,
+                proposal_digest=proposal_digest,
+                attempt_id=attempt_id,
+            )
             connection.commit()
             return ApprovalClaim(attempt_id=attempt_id)
         except BaseException:
@@ -339,7 +493,7 @@ class EngineStore:
 
     @staticmethod
     def _approval_refusal(
-        row: dict[str, Any] | None, operator: str
+        row: dict[str, Any] | None, operator: str, proposal_digest: str
     ) -> (
         Literal[
             "missing",
@@ -348,6 +502,7 @@ class EngineStore:
             "already_applied",
             "reconciliation_required",
             "target_claimed",
+            "proposal_changed",
         ]
         | None
     ):
@@ -355,11 +510,13 @@ class EngineStore:
             return "missing"
         if row["approved_by"] != operator:
             return "different_operator"
+        if row.get("proposal_digest") != proposal_digest:
+            return "proposal_changed"
         if row["state"] == "applying":
             return "already_claimed"
-        if row["state"] == "applied":
+        if row["state"] in ("applied", "resolved"):
             return "already_applied"
-        if row["state"] == "reconciliation_required":
+        if row["state"] in ("reconciliation_required", "reconciling"):
             return "reconciliation_required"
         return None
 
@@ -380,6 +537,17 @@ class EngineStore:
                 if row is None or row.get("attempt_id") != attempt_id:
                     raise RuntimeError(f"approval attempt {attempt_id} no longer owns {change_id}")
                 row.update(state=outcome, finished_at=finished_at, last_error=safe_error)
+                self._memory_approval_events.append(
+                    {
+                        "change_id": change_id,
+                        "event": outcome,
+                        "operator": row["approved_by"],
+                        "occurred_at": finished_at,
+                        "proposal_digest": row.get("proposal_digest"),
+                        "attempt_id": attempt_id,
+                        "detail": safe_error,
+                    }
+                )
                 if outcome != "reconciliation_required":
                     for target, owner in list(self._memory_target_leases.items()):
                         if owner == (change_id, attempt_id):
@@ -405,6 +573,21 @@ class EngineStore:
                     "WHERE change_id = ? AND attempt_id = ?",
                     (change_id, attempt_id),
                 )
+            row = connection.execute(
+                "SELECT approved_by, proposal_digest FROM icommerce_agent_approvals "
+                "WHERE change_id = ?",
+                (change_id,),
+            ).fetchone()
+            self._insert_approval_event(
+                connection,
+                change_id=change_id,
+                event=outcome,
+                operator=row["approved_by"],
+                occurred_at=finished_at,
+                proposal_digest=row["proposal_digest"],
+                attempt_id=attempt_id,
+                detail=safe_error,
+            )
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -415,6 +598,366 @@ class EngineStore:
     def approval_record(self, change_id: str) -> dict[str, Any] | None:
         """Return one control-plane record for operator UI and reconciliation."""
         return self.approval_records([change_id]).get(change_id)
+
+    def approval_events(self, change_id: str) -> list[dict[str, Any]]:
+        """Return the append-only approval/apply history for one proposal."""
+        return self.approval_event_records([change_id]).get(change_id, [])
+
+    def approval_event_records(self, change_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+        """Batch-read append-only approval/apply history for the operator UI."""
+        if not change_ids:
+            return {}
+        grouped = {change_id: [] for change_id in change_ids}
+        if self.db_path == ":memory:":
+            with self._memory_approvals_lock:
+                for event in self._memory_approval_events:
+                    if event["change_id"] in grouped:
+                        grouped[event["change_id"]].append(dict(event))
+                return grouped
+        connection = self._control_connection()
+        try:
+            placeholders = ",".join("?" for _ in change_ids)
+            rows = connection.execute(
+                "SELECT * FROM icommerce_agent_approval_events "
+                f"WHERE change_id IN ({placeholders}) ORDER BY event_id",
+                tuple(change_ids),
+            )
+            for row in rows:
+                grouped[row["change_id"]].append(dict(row))
+            return grouped
+        finally:
+            connection.close()
+
+    def recover_stale_approval(
+        self,
+        change_id: str,
+        operator: str,
+        proposal_digest: str,
+        *,
+        stale_before: datetime,
+    ) -> None:
+        """Move an abandoned ``applying`` claim into explicit reconciliation.
+
+        This never retries the write and never releases its target leases. The age gate
+        prevents an operator from racing a healthy worker; after the transition, the
+        observed-state workflow decides what actually happened.
+        """
+        now = self._now()
+        stale_before_utc = stale_before.astimezone(UTC)
+        detail = "operator opened reconciliation for a stale control-plane attempt"
+        if self.db_path == ":memory:":
+            with self._memory_approvals_lock:
+                row = self._memory_approvals.get(change_id)
+                if row is None or row["state"] not in ("applying", "reconciling"):
+                    raise ValueError(f"change {change_id} has no active attempt to recover")
+                if row.get("proposal_digest") != proposal_digest:
+                    raise ValueError(f"change {change_id} proposal digest changed")
+                timestamp = (
+                    row.get("claimed_at") if row["state"] == "applying" else row.get("resolved_at")
+                )
+                if not timestamp:
+                    raise ValueError(f"change {change_id} attempt has no recovery timestamp")
+                claimed_at = datetime.fromisoformat(timestamp)
+                if claimed_at > stale_before_utc:
+                    raise ValueError(f"change {change_id} attempt is still within its lease")
+                row.update(
+                    state="reconciliation_required",
+                    finished_at=now,
+                    last_error=detail,
+                    resolved_at=None,
+                    resolved_by=None,
+                    resolution=None,
+                )
+                self._memory_approval_events.append(
+                    {
+                        "change_id": change_id,
+                        "event": "reconciliation_required",
+                        "operator": operator,
+                        "occurred_at": now,
+                        "proposal_digest": proposal_digest,
+                        "attempt_id": row.get("attempt_id"),
+                        "detail": detail,
+                    }
+                )
+            return
+
+        connection = self._control_connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM icommerce_agent_approvals WHERE change_id = ?",
+                (change_id,),
+            ).fetchone()
+            if row is None or row["state"] not in ("applying", "reconciling"):
+                raise ValueError(f"change {change_id} has no active attempt to recover")
+            if row["proposal_digest"] != proposal_digest:
+                raise ValueError(f"change {change_id} proposal digest changed")
+            timestamp = row["claimed_at"] if row["state"] == "applying" else row["resolved_at"]
+            if not timestamp:
+                raise ValueError(f"change {change_id} attempt has no recovery timestamp")
+            claimed_at = datetime.fromisoformat(timestamp)
+            if claimed_at > stale_before_utc:
+                raise ValueError(f"change {change_id} attempt is still within its lease")
+            changed = connection.execute(
+                """
+                UPDATE icommerce_agent_approvals
+                SET state = 'reconciliation_required', finished_at = ?, last_error = ?,
+                    resolved_at = NULL, resolved_by = NULL, resolution = NULL
+                WHERE change_id = ? AND state = ? AND attempt_id = ?
+                """,
+                (now, detail, change_id, row["state"], row["attempt_id"]),
+            ).rowcount
+            if changed != 1:
+                raise ValueError(f"change {change_id} apply attempt changed concurrently")
+            self._insert_approval_event(
+                connection,
+                change_id=change_id,
+                event="reconciliation_required",
+                operator=operator,
+                occurred_at=now,
+                proposal_digest=proposal_digest,
+                attempt_id=row["attempt_id"],
+                detail=detail,
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def claim_reconciliation(
+        self,
+        change_id: str,
+        operator: str,
+        proposal_digest: str,
+        resolution: Literal["confirmed_applied", "accepted_current_state"],
+    ) -> None:
+        """Atomically grant one operator ownership of a reconciliation decision."""
+        now = self._now()
+        if self.db_path == ":memory:":
+            with self._memory_approvals_lock:
+                row = self._memory_approvals.get(change_id)
+                if row is None or row["state"] != "reconciliation_required":
+                    raise ValueError(f"change {change_id} does not require reconciliation")
+                if row.get("proposal_digest") != proposal_digest:
+                    raise ValueError(f"change {change_id} proposal digest changed")
+                row.update(
+                    state="reconciling",
+                    resolved_at=now,
+                    resolved_by=operator,
+                    resolution=resolution,
+                )
+                self._memory_approval_events.append(
+                    {
+                        "change_id": change_id,
+                        "event": f"reconciliation_claimed:{resolution}",
+                        "operator": operator,
+                        "occurred_at": now,
+                        "proposal_digest": proposal_digest,
+                        "attempt_id": row.get("attempt_id"),
+                        "detail": None,
+                    }
+                )
+            return
+
+        connection = self._control_connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM icommerce_agent_approvals WHERE change_id = ?",
+                (change_id,),
+            ).fetchone()
+            if row is None or row["state"] != "reconciliation_required":
+                raise ValueError(f"change {change_id} does not require reconciliation")
+            if row["proposal_digest"] != proposal_digest:
+                raise ValueError(f"change {change_id} proposal digest changed")
+            connection.execute(
+                """
+                UPDATE icommerce_agent_approvals
+                SET state = 'reconciling', resolved_at = ?, resolved_by = ?, resolution = ?
+                WHERE change_id = ? AND state = 'reconciliation_required'
+                """,
+                (now, operator, resolution, change_id),
+            )
+            self._insert_approval_event(
+                connection,
+                change_id=change_id,
+                event=f"reconciliation_claimed:{resolution}",
+                operator=operator,
+                occurred_at=now,
+                proposal_digest=proposal_digest,
+                attempt_id=row["attempt_id"],
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def abort_reconciliation(
+        self,
+        change_id: str,
+        operator: str,
+        proposal_digest: str,
+        resolution: Literal["confirmed_applied", "accepted_current_state"],
+        error: str,
+    ) -> None:
+        """Return a normally failed metadata update to reconciliation-required."""
+        now = self._now()
+        detail = error[:1000]
+        if self.db_path == ":memory:":
+            with self._memory_approvals_lock:
+                row = self._memory_approvals.get(change_id)
+                if (
+                    row is None
+                    or row["state"] != "reconciling"
+                    or row.get("resolved_by") != operator
+                    or row.get("resolution") != resolution
+                    or row.get("proposal_digest") != proposal_digest
+                ):
+                    raise ValueError(f"change {change_id} reconciliation claim is not owned")
+                row.update(
+                    state="reconciliation_required",
+                    resolved_at=None,
+                    resolved_by=None,
+                    resolution=None,
+                    last_error=detail,
+                )
+                self._memory_approval_events.append(
+                    {
+                        "change_id": change_id,
+                        "event": "reconciliation_failed",
+                        "operator": operator,
+                        "occurred_at": now,
+                        "proposal_digest": proposal_digest,
+                        "attempt_id": row.get("attempt_id"),
+                        "detail": detail,
+                    }
+                )
+            return
+
+        connection = self._control_connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM icommerce_agent_approvals WHERE change_id = ?",
+                (change_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["state"] != "reconciling"
+                or row["resolved_by"] != operator
+                or row["resolution"] != resolution
+                or row["proposal_digest"] != proposal_digest
+            ):
+                raise ValueError(f"change {change_id} reconciliation claim is not owned")
+            connection.execute(
+                """
+                UPDATE icommerce_agent_approvals
+                SET state = 'reconciliation_required', resolved_at = NULL,
+                    resolved_by = NULL, resolution = NULL, last_error = ?
+                WHERE change_id = ? AND state = 'reconciling'
+                """,
+                (detail, change_id),
+            )
+            self._insert_approval_event(
+                connection,
+                change_id=change_id,
+                event="reconciliation_failed",
+                operator=operator,
+                occurred_at=now,
+                proposal_digest=proposal_digest,
+                attempt_id=row["attempt_id"],
+                detail=detail,
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def finish_reconciliation(
+        self,
+        change_id: str,
+        operator: str,
+        proposal_digest: str,
+        resolution: Literal["confirmed_applied", "accepted_current_state"],
+    ) -> None:
+        """Finish the reconciliation claim owned by ``operator`` and release leases."""
+        now = self._now()
+        if self.db_path == ":memory:":
+            with self._memory_approvals_lock:
+                row = self._memory_approvals.get(change_id)
+                if (
+                    row is None
+                    or row["state"] != "reconciling"
+                    or row.get("resolved_by") != operator
+                    or row.get("resolution") != resolution
+                    or row.get("proposal_digest") != proposal_digest
+                ):
+                    raise ValueError(f"change {change_id} reconciliation claim is not owned")
+                row.update(state="resolved", resolved_at=now)
+                attempt_id = row.get("attempt_id")
+                for target, owner in list(self._memory_target_leases.items()):
+                    if owner == (change_id, attempt_id):
+                        del self._memory_target_leases[target]
+                self._memory_approval_events.append(
+                    {
+                        "change_id": change_id,
+                        "event": f"reconciled:{resolution}",
+                        "operator": operator,
+                        "occurred_at": now,
+                        "proposal_digest": proposal_digest,
+                        "attempt_id": attempt_id,
+                        "detail": None,
+                    }
+                )
+            return
+
+        connection = self._control_connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM icommerce_agent_approvals WHERE change_id = ?",
+                (change_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["state"] != "reconciling"
+                or row["resolved_by"] != operator
+                or row["resolution"] != resolution
+                or row["proposal_digest"] != proposal_digest
+            ):
+                raise ValueError(f"change {change_id} reconciliation claim is not owned")
+            changed = connection.execute(
+                "UPDATE icommerce_agent_approvals SET state = 'resolved', resolved_at = ? "
+                "WHERE change_id = ? AND state = 'reconciling'",
+                (now, change_id),
+            ).rowcount
+            if changed != 1:
+                raise ValueError(f"change {change_id} reconciliation changed concurrently")
+            connection.execute(
+                "DELETE FROM icommerce_agent_target_leases WHERE change_id = ? AND attempt_id = ?",
+                (change_id, row["attempt_id"]),
+            )
+            self._insert_approval_event(
+                connection,
+                change_id=change_id,
+                event=f"reconciled:{resolution}",
+                operator=operator,
+                occurred_at=now,
+                proposal_digest=proposal_digest,
+                attempt_id=row["attempt_id"],
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def approval_records(self, change_ids: list[str]) -> dict[str, dict[str, Any]]:
         """Batch-read control state without an operator-UI N+1 query."""
@@ -596,9 +1139,20 @@ class EngineStore:
             self._sql.connection = connection
         return connection
 
-    def bind(self, session_id: str, subject_id: str, kind: str) -> PrincipalBinding:
+    def bind(
+        self,
+        session_id: str,
+        subject_id: str,
+        kind: Literal["customer", "operator"],
+        *,
+        authenticated_subject: str | None = None,
+    ) -> PrincipalBinding:
         binding = PrincipalBinding(
-            session_id=session_id, subject_id=subject_id, kind=kind, store_id=self.store_id
+            session_id=session_id,
+            subject_id=subject_id,
+            kind=kind,
+            store_id=self.store_id,
+            authenticated_subject=authenticated_subject,
         )
         self._bindings[session_id] = binding
         return binding

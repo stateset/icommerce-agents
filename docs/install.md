@@ -54,3 +54,34 @@ Running the host for a live chat turn does need
 `ANTHROPIC_API_KEY` set in the environment. An identity-linked key also needs
 `ANTHROPIC_WORKSPACE_ID` set — without it, a request with such a key fails with a 400
 naming the `anthropic-workspace-id` header; an unlinked key ignores the variable.
+
+## Production HTTP authentication
+
+The default `demo` mode uses the seeded Rowan customer and ACME operator so the local
+tour remains keyless. Do not expose that mode publicly. Set these variables to make all
+`/shopping/*` and `/merchant/*` routes require a verified bearer token:
+
+```bash
+export ICOMMERCE_AUTH_MODE=jwt
+export ICOMMERCE_JWT_ISSUER=https://identity.example.com/
+export ICOMMERCE_JWT_AUDIENCE=icommerce-host
+export ICOMMERCE_JWKS_URL=https://identity.example.com/.well-known/jwks.json
+export ICOMMERCE_ALLOWED_ORIGINS=https://shop.example.com,https://merchant.example.com
+# Earliest an operator may declare an abandoned applying claim; default 900 seconds.
+export ICOMMERCE_STALE_APPLY_SECONDS=900
+```
+
+Customer tokens need role `customer` or scope `shopping:use` plus an `email` claim that
+matches a provisioned engine customer. Merchant tokens need role `merchant` or scope
+`merchant:write` plus `store_id` equal to this host's store. Every later request must
+present both the bearer token and its `X-Session-Id`; the session is bound to the signed
+`sub`, so possession of a leaked session id alone grants nothing. Public deployments
+should use asymmetric JWKS verification. `ICOMMERCE_JWT_HS256_SECRET` exists for tests
+and controlled private deployments and is mutually exclusive with `ICOMMERCE_JWKS_URL`.
+
+This authenticates the FastAPI host, not the two separately launched MCP ports. See
+`docs/mcp.md` before exposing either MCP server beyond loopback.
+
+The host keeps chat state, principal bindings, and cart-to-session mappings in process.
+Run one worker, or use sticky routing that keeps a session on the worker that created it;
+the approval ledger and target leases themselves are durable and cross-process safe.

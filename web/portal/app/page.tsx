@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAgentTurn, useSession } from "web-shared";
 import type { AgentEvent } from "web-shared";
 import { api, capabilities, fetchChanges, healthy, UNREACHABLE } from "../lib/api";
@@ -33,20 +33,19 @@ export default function PortalPage() {
 
   const session = useSession(api);
 
+  const refreshChanges = useCallback(async () => {
+    const list = await fetchChanges();
+    if (!list) return;
+    setChanges(Object.fromEntries(list.map((change) => [change.change_id, change])));
+  }, []);
+
   // Live store state: fetched as soon as a session exists, independent of whether an
   // assistant is configured. This is the artifact the whole repo exists to show, and it
   // must be visible on first load after a keyless tour run, with no typing.
   useEffect(() => {
     if (!session.sessionId) return;
-    fetchChanges().then((list) => {
-      if (!list) return;
-      setChanges((prev) => {
-        const next = { ...prev };
-        for (const change of list) next[change.change_id] = change;
-        return next;
-      });
-    });
-  }, [session.sessionId]);
+    void refreshChanges();
+  }, [refreshChanges, session.sessionId]);
 
   const turn = useAgentTurn(api, {
     sessionId: reachable ? session.sessionId : null,
@@ -55,6 +54,9 @@ export default function PortalPage() {
       if (event.type === "change_update") {
         const change = event.data.change as StagedChange;
         setChanges((prev) => ({ ...prev, [change.change_id]: change }));
+        // Stream events carry the upstream change shape. Refresh immediately to attach
+        // the adapter's digest, durable approval state, audit history, and recovery time.
+        void refreshChanges();
       }
     },
   });
@@ -103,7 +105,7 @@ export default function PortalPage() {
             </p>
           </div>
         </section>
-        <ChangesPanel changes={changes} />
+        <ChangesPanel changes={changes} onRefresh={refreshChanges} />
       </main>
     );
   }
@@ -175,7 +177,7 @@ export default function PortalPage() {
           </button>
         </form>
       </section>
-      <ChangesPanel changes={changes} />
+      <ChangesPanel changes={changes} onRefresh={refreshChanges} />
     </main>
   );
 }

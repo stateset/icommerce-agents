@@ -321,6 +321,7 @@ button {
 }
 
 .status-tag.control-reconciliation_required,
+.status-tag.control-reconciling,
 .status-tag.control-failed {
   background: var(--danger-soft);
   color: var(--danger);
@@ -364,6 +365,79 @@ button {
 
 .control-note.danger {
   color: var(--danger);
+}
+
+.reconcile-btn {
+  width: 100%;
+  margin-top: 8px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  padding: 7px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.reconciliation {
+  margin-top: 8px;
+  border: 1px solid var(--danger-soft);
+  border-radius: 8px;
+  padding: 9px;
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+
+.proposal-digest {
+  display: block;
+  margin: 8px 0;
+  overflow-wrap: anywhere;
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.approval-history {
+  margin-top: 10px;
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+
+.approval-history summary {
+  cursor: pointer;
+}
+
+.history-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 5px;
+}
+
+.reconciliation strong {
+  display: block;
+  color: var(--ink);
+  margin-bottom: 6px;
+}
+
+.reconcile-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.reconcile-actions button {
+  flex: 1;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px;
+  background: var(--card);
+  color: var(--ink);
+  font-size: 10.5px;
+}
+
+.reconcile-actions button:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 .evidence {

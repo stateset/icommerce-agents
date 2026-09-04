@@ -1,6 +1,6 @@
 # Connecting an MCP client
 
-`mcp_servers/shopping.py` and `mcp_servers/merchant.py` expose the same 13- and 19-tool
+`mcp_servers/shopping.py` and `mcp_servers/merchant.py` expose the same 13- and 18-tool
 role surface the Messages API host uses — `search_products`,
 cart and order tools, `search_policies`, and `get_fulfillment_options` on the shopping
 side; business metrics, listings, the staged-change queue, and `apply_change` on the
@@ -45,50 +45,39 @@ at `http://127.0.0.1:8300/mcp` / `http://127.0.0.1:8301/mcp` (ports configurable
 this reference server has no authentication of its own, so that variable exists to be
 set only once an authenticating gateway is actually in front of it.
 
-## Applying a merchant change takes two separate tool calls
+## Approval is outside the model's tool surface
 
-`stage_*` tools only record a proposed change for preview. `apply_change` refuses any
-`change_id` that has not first been marked by a separate `host_approve` tool call —
-staging, approving, and applying a change are always three distinct tool calls, so a
-client that surfaces each one to its user (the default in Claude Code, Claude Desktop,
-and Cursor) gives the operator two independent, visible decision points: one before
-`host_approve` runs, a second before `apply_change` runs.
+`stage_*` tools only record a proposed change for preview. The merchant server exposes
+no approval tool. `apply_change` refuses a `change_id` until a trusted operator surface
+has recorded approval in the shared durable ledger. With the host and MCP server pointed
+at the same database, the supported flow is:
 
-`host_approve` marks nothing but its own `change_id` — it does no write of its own — and
-`EngineMerchant.apply_change` re-checks that mark independently, so a change that
-reaches `apply_change` through some other path (skipping `host_approve`) still cannot be
-applied. The mark is tied to the configured operator in a durable SQLite ledger. An
-atomic claim permits only one process to spend it; post-dispatch failures remain visibly
-blocked for reconciliation instead of becoming silently retryable.
+1. Claude stages through MCP.
+2. An operator reviews the exact diff and its SHA-256 proposal digest in the portal.
+3. The separately authenticated host route `POST /merchant/changes/{id}/approve`
+   receives that displayed digest and records approval only if it still matches the
+   immutable proposal.
+4. Claude may call `apply_change`; the backend atomically consumes that approval.
 
-## Limitation: this depends on the connecting client, not on this server
+This separation is enforced by capability design, not by hoping the model declines to
+self-approve. The ledger binds the digest and operator, permits only one process to
+spend an approval, and leases every affected target. A post-dispatch ambiguity remains
+blocked until the portal compares observed state with the approved proposal and an
+operator explicitly reconciles it.
 
-**This is weaker than the Messages API host's approval surface.** The FastAPI host's
-`POST /merchant/changes/{id}/approve` is a route only the operator's own browser session
-can reach — out-of-band by construction, entirely outside the model's or any MCP
-client's discretion. Here, `host_approve` and `apply_change` are both ordinary tools
-sitting behind whatever the connecting MCP client does with a tool call.
+## Deployment boundary
 
-**If your MCP client is configured to auto-approve tool calls** — skipping its own
-confirmation prompts — nothing in this repository detects or refuses that, and a model
-can stage, approve, and apply a merchant change unattended. That defeats the guarantee
-this staging design otherwise provides. Do not run these servers unattended, and prefer
-the Messages API host's HTTP approval route (`host/app.py`) over the MCP path for any
-deployment where an operator's own out-of-band confirmation must be guaranteed rather
-than merely conventional.
+The reference MCP processes deliberately bind only to loopback by default and carry a
+single process-level principal from the environment. They are suitable for a local
+desktop client or for a dedicated process behind an authenticating gateway; they are
+not a multi-tenant public endpoint. For remote deployment, terminate MCP authorization
+at a gateway implementing the
+[MCP authorization specification](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization),
+start a principal-scoped
+backend, and leave the unsafe off-loopback flag unset unless that boundary is actually
+present. The FastAPI host's production JWT mode authenticates its own HTTP approval
+surface; it does not silently make a separately exposed MCP port authenticated.
 
-**This also depends on the model, not only the client.** `host_approve` is an ordinary
-tool; nothing distinguishes a call the model made on its own initiative from one a human
-told it to make. A live run against `claude-sonnet-4-5` (`docs/testing.md`, "Live MCP
-run") asked only to stage a price change and "apply it," and the model found
-`host_approve` unprompted, called it, and then applied successfully — the model
-satisfied, entirely by itself, the gate that exists to require a human between staging
-and applying. A client that surfaces every tool call faithfully does not prevent this:
-a human watching two calls go by and clicking "allow" on each has approved that the
-calls happen, not that the change should apply — the model, not the operator, decided
-`host_approve` was warranted. In the same test, `claude-opus-5` declined to call
-`host_approve` itself, reasoning explicitly that doing so "would defeat the point of the
-two-step gate" — correct judgment, but judgment, not code, and not something this
-server enforces or can enforce. Treat the two-call design as raising the bar a client's
-UX and a model's own restraint must both clear, not as a guarantee this server provides
-on its own.
+The removed `host_approve` tool is documented in `docs/testing.md` as a historical live
+finding: one model correctly declined to call it and another called it unprompted. That
+variance is exactly why it is no longer a model-callable capability.

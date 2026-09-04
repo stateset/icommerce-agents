@@ -1,11 +1,35 @@
 import { AgentApi } from "web-shared";
-import type { Capabilities, StagedChange } from "./types";
+import type {
+  Capabilities,
+  ReconciliationDetail,
+  ReconciliationAssessment,
+  StagedChange,
+} from "./types";
 
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 /** `/merchant/session`, `/merchant/chat`, `/merchant/changes/{id}/approve` all line up
  * with the host's own routes under this prefix. */
 export const api = new AgentApi(API_URL, "/merchant");
+
+export type ControlResult<T> = { ok: true; data: T } | { ok: false; error: string };
+
+async function controlRequest<T>(path: string, init: RequestInit): Promise<ControlResult<T>> {
+  try {
+    const response = await fetch(`${API_URL}/merchant${path}`, init);
+    const payload = (await response.json()) as T & { detail?: unknown };
+    if (!response.ok) {
+      const detail = payload.detail;
+      return {
+        ok: false,
+        error: typeof detail === "string" ? detail : `Request failed (${response.status})`,
+      };
+    }
+    return { ok: true, data: payload };
+  } catch {
+    return { ok: false, error: UNREACHABLE };
+  }
+}
 
 export const UNREACHABLE =
   "Couldn't reach the ACME Supply API. Start it and try again.";
@@ -44,8 +68,52 @@ export async function fetchChanges(): Promise<StagedChange[] | null> {
  * host, never from this call's body. */
 export async function approveChange(
   changeId: string,
-): Promise<{ change_id: string; approved_by: string } | null> {
-  return api.post<{ change_id: string; approved_by: string }>(
+  proposalDigest: string,
+): Promise<ControlResult<{ change_id: string; approved_by: string }>> {
+  return controlRequest<{ change_id: string; approved_by: string }>(
     `/changes/${encodeURIComponent(changeId)}/approve`,
+    {
+      method: "POST",
+      headers: api.headers(true),
+      body: JSON.stringify({ proposal_digest: proposalDigest }),
+    },
+  );
+}
+
+export async function fetchReconciliation(
+  changeId: string,
+): Promise<ControlResult<ReconciliationDetail>> {
+  return controlRequest<ReconciliationDetail>(
+    `/changes/${encodeURIComponent(changeId)}/reconciliation`,
+    { headers: api.headers() },
+  );
+}
+
+export async function startReconciliation(
+  changeId: string,
+  proposalDigest: string,
+): Promise<ControlResult<{ assessment: ReconciliationAssessment }>> {
+  return controlRequest<{ assessment: ReconciliationAssessment }>(
+    `/changes/${encodeURIComponent(changeId)}/reconciliation/start`,
+    {
+      method: "POST",
+      headers: api.headers(true),
+      body: JSON.stringify({ proposal_digest: proposalDigest }),
+    },
+  );
+}
+
+export async function resolveReconciliation(
+  changeId: string,
+  proposalDigest: string,
+  resolution: "confirmed_applied" | "accepted_current_state",
+): Promise<ControlResult<{ assessment: ReconciliationAssessment }>> {
+  return controlRequest<{ assessment: ReconciliationAssessment }>(
+    `/changes/${encodeURIComponent(changeId)}/reconciliation`,
+    {
+      method: "POST",
+      headers: api.headers(true),
+      body: JSON.stringify({ proposal_digest: proposalDigest, resolution }),
+    },
   );
 }

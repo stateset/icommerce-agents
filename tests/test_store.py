@@ -64,6 +64,64 @@ def test_binding_is_server_held(store):
         store.binding("sess-unknown")
 
 
+def test_legacy_approval_ledger_is_upgraded_without_losing_records(tmp_path):
+    db_path = str(tmp_path / "store.db")
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        """
+        CREATE TABLE icommerce_agent_approvals (
+            change_id TEXT PRIMARY KEY,
+            approved_by TEXT NOT NULL,
+            approved_at TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('approved', 'applying', 'applied', 'failed')),
+            attempt_id TEXT,
+            claimed_at TEXT,
+            finished_at TEXT,
+            last_error TEXT
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO icommerce_agent_approvals VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL)",
+        ("chg-legacy", "operator:7", "2026-01-01T00:00:00+00:00", "approved"),
+    )
+    connection.commit()
+    connection.close()
+
+    store = EngineStore(db_path)
+    record = store.approval_record("chg-legacy")
+    assert record["approved_by"] == "operator:7"
+    assert record["proposal_digest"] is None
+    connection = sqlite3.connect(db_path)
+    schema = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'icommerce_agent_approvals'"
+    ).fetchone()[0]
+    connection.close()
+    assert "reconciliation_required" in schema
+    assert "reconciling" in schema
+    assert "resolved" in schema
+
+
+def test_reconciliation_has_a_single_owner_and_normal_failures_are_retryable(store):
+    digest = "sha256:" + "a" * 64
+    store.record_approval("chg-1", "operator:1", digest)
+    claim = store.claim_approval("chg-1", "operator:1", digest, ["sku:1"])
+    store.finish_approval_attempt(
+        "chg-1", claim.attempt_id, outcome="reconciliation_required", error="ambiguous"
+    )
+
+    store.claim_reconciliation("chg-1", "operator:1", digest, "accepted_current_state")
+    with pytest.raises(ValueError, match="does not require reconciliation"):
+        store.claim_reconciliation("chg-1", "operator:2", digest, "confirmed_applied")
+
+    store.abort_reconciliation(
+        "chg-1", "operator:1", digest, "accepted_current_state", "metadata write failed"
+    )
+    assert store.approval_record("chg-1")["state"] == "reconciliation_required"
+    store.claim_reconciliation("chg-1", "operator:2", digest, "confirmed_applied")
+    assert store.approval_record("chg-1")["resolved_by"] == "operator:2"
+
+
 def test_readonly_sql_refuses_memory(store):
     with pytest.raises(RuntimeError):
         store.readonly_sql()

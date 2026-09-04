@@ -26,7 +26,9 @@ export type ApplyControlState =
   | "applying"
   | "applied"
   | "failed"
-  | "reconciliation_required";
+  | "reconciliation_required"
+  | "reconciling"
+  | "resolved";
 
 export interface ApplyControl {
   change_id: string;
@@ -37,6 +39,44 @@ export interface ApplyControl {
   claimed_at?: string | null;
   finished_at?: string | null;
   last_error?: string | null;
+  proposal_digest?: string | null;
+  resolved_at?: string | null;
+  resolved_by?: string | null;
+  resolution?: string | null;
+}
+
+export interface ApprovalEvent {
+  event_id?: number;
+  change_id: string;
+  event: string;
+  operator: string;
+  occurred_at: string;
+  proposal_digest?: string | null;
+  attempt_id?: string | null;
+  detail?: string | null;
+}
+
+export interface ReconciliationItem {
+  target: string;
+  field: string;
+  before?: unknown;
+  intended_after?: unknown;
+  observed?: unknown;
+  state: "matches_before" | "matches_after" | "diverged" | "indeterminate";
+}
+
+export interface ReconciliationAssessment {
+  change_id: string;
+  outcome: "not_applied" | "applied" | "partial_or_diverged" | "indeterminate";
+  items: ReconciliationItem[];
+}
+
+export interface ReconciliationDetail {
+  change: StagedChange;
+  proposal_digest: string;
+  control: ApplyControl;
+  assessment: ReconciliationAssessment;
+  events: ApprovalEvent[];
 }
 
 export interface StagedChange {
@@ -54,6 +94,9 @@ export interface StagedChange {
   evidence?: ChangeEvidence[];
   /** Durable backend approval/apply state; never inferred from browser state. */
   apply_control?: ApplyControl | null;
+  proposal_digest?: string | null;
+  approval_events?: ApprovalEvent[];
+  recovery_available_at?: string | null;
   currency?: string | null;
 }
 

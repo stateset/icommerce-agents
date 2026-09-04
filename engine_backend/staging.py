@@ -9,6 +9,8 @@ staged change is approved -- so every function here ends at ``save``, not at a m
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import uuid4
@@ -50,6 +52,18 @@ STAGED_DISPLAY = "Staged change"
 # change has no draft at all).
 _UNSET: Any = object()
 
+_LIFECYCLE_FIELDS = {
+    "status",
+    "applied_at",
+    "applied_by",
+    "discarded_at",
+    "discarded_by",
+    "discarded_by_kind",
+    # Apply appends evidence notes here after the live write. They are audit output,
+    # not part of the operator-reviewed mutation.
+    "guardrail_notes",
+}
+
 
 class Evidence(BaseModel):
     """What actually backed one write inside an applied change: a sealed kernel
@@ -62,6 +76,28 @@ class Evidence(BaseModel):
     kind: Literal["kernel_receipt", "activity_log"]
     id: str
     note: str
+
+
+def proposal_digest(change: StagedChange, payload: Any) -> str:
+    """Hash the exact semantic proposal an operator reviews.
+
+    Lifecycle and audit-output fields may change after approval; every field that can
+    influence the live mutation, including the promotion/campaign payload, is bound.
+    Canonical JSON makes the digest stable across processes and Python restarts.
+    """
+    proposal = {
+        key: value
+        for key, value in change.model_dump(mode="json").items()
+        if key not in _LIFECYCLE_FIELDS
+    }
+    document = {"change": proposal, "payload": payload}
+    encoded = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def ensure_types(commerce: Commerce) -> None:
@@ -92,6 +128,16 @@ async def save(
     record = change.model_dump(mode="json")
     record["evidence"] = [item.model_dump() for item in evidence or []]
     record["payload"] = stored_payload if payload is _UNSET else payload
+    candidate_digest = proposal_digest(change, record["payload"])
+    if existing is not None:
+        stored_digest = existing.get("proposal_digest") or proposal_digest(
+            StagedChange.model_validate(existing), stored_payload
+        )
+        if candidate_digest != stored_digest:
+            raise ChangeNotApplicable(
+                f"change {change.change_id} proposal is immutable; stage a fresh change"
+            )
+    record["proposal_digest"] = candidate_digest
     await write_payload(
         store,
         STAGED_TYPE,
@@ -107,6 +153,11 @@ async def load(store: EngineStore, change_id: str) -> StagedChange | None:
     if record is None:
         return None
     return StagedChange.model_validate(record)
+
+
+async def load_record(store: EngineStore, change_id: str) -> dict[str, Any] | None:
+    """Load one complete persisted proposal snapshot for approval or apply."""
+    return await read_payload(store, STAGED_TYPE, object_handle=change_id)
 
 
 async def load_evidence(store: EngineStore, change_id: str) -> list[Evidence]:

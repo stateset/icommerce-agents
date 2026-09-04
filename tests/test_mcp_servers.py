@@ -18,6 +18,7 @@ async def test_the_merchant_server_exposes_apply_change(tmp_path):
     server = build_merchant_server(str(tmp_path / "store.db"))
     names = {tool.name for tool in await server.list_tools()}
     assert "apply_change" in names
+    assert "host_approve" not in names
 
 
 def test_servers_build_without_a_model_api_key(tmp_path, monkeypatch):
@@ -44,7 +45,7 @@ async def _stage_a_price_change(store, kernel) -> str:
     return change.change_id
 
 
-async def test_apply_change_refuses_without_a_prior_host_approve(store, kernel):
+async def test_apply_change_refuses_without_out_of_band_approval(store, kernel):
     from mcp.shared.memory import create_connected_server_and_client_session
 
     from mcp_servers.merchant import build_merchant_server
@@ -59,32 +60,19 @@ async def test_apply_change_refuses_without_a_prior_host_approve(store, kernel):
     assert store.commerce.products.get_variant_by_sku("TENT-RIDGE-TAN").price != 199.00
 
 
-async def test_host_approve_refuses_an_unknown_change(store):
-    from mcp.shared.memory import create_connected_server_and_client_session
-
-    from mcp_servers.merchant import build_merchant_server
-
-    async with create_connected_server_and_client_session(
-        build_merchant_server(store.db_path)
-    ) as client:
-        result = await client.call_tool("host_approve", {"change_id": "chg-does-not-exist"})
-
-    assert result.isError
-    assert "no change with id" in result.content[0].text
-
-
-async def test_apply_change_succeeds_after_host_approve(store, kernel):
+async def test_apply_change_succeeds_after_out_of_band_approval(store, kernel):
     from mcp.shared.memory import create_connected_server_and_client_session
 
     from mcp_servers.merchant import build_merchant_server
 
     change_id = await _stage_a_price_change(store, kernel)
+    from engine_backend.merchant import EngineMerchant
+
+    EngineMerchant(store, kernel).approve(change_id, "user:acme-operator")
     async with create_connected_server_and_client_session(
         build_merchant_server(store.db_path)
     ) as client:
         await client.call_tool("get_pending_changes", {})
-        approved = await client.call_tool("host_approve", {"change_id": change_id})
-        assert not approved.isError
         applied = await client.call_tool("apply_change", {"change_id": change_id})
         assert not applied.isError
 

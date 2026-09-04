@@ -8,4 +8,6 @@ mcp<2
 -e ./vendor/commerce-agents/shopping-agent/runtime-messages-api
 -e ./vendor/commerce-agents/merchant-agent/core
 -e ./vendor/commerce-agents/merchant-agent/runtime-messages-api
+# Explicit runtime dependency of the host's opt-in production bearer-token verifier.
+PyJWT[crypto]>=2.10,<3
 -e .

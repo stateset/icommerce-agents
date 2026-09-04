@@ -315,6 +315,11 @@ opens from invalidating the embedded handle's WAL view.
   different changes for one SKU cannot cross-worker race either. Process death or an
   ambiguous post-dispatch failure deliberately retains the visible `applying` or
   `reconciliation_required` state and its target leases for operator reconciliation.
+  A timeout-protected operator action transitions an abandoned `applying` claim into
+  reconciliation without retrying it or releasing those leases.
+  Reconciliation itself uses a second transactional claim (`reconciliation_required`
+  → `reconciling` → `resolved`) so concurrent operators cannot persist conflicting
+  lifecycle outcomes; an abandoned resolver is recoverable through the same timeout.
 - The rest of the in-memory state beside the store is per process by construction:
   `EngineStore._bindings` and `EngineStorefront._cart_ids`. A session belongs to the
   process that opened it.

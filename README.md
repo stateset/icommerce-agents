@@ -51,15 +51,18 @@ and `GET /merchant/changes`.
   engine: `storefront.py`, `merchant.py`, `catalog.py`, `search.py`, `content.py`,
   `listings.py` (the family/variant resolution both roles share), `analysis.py` (the
   merchant's capped read-only `SELECT` surface), `staging.py`, `apply.py` (the five-kind
-  apply dispatch, the only place live state is mutated), `custom_objects.py` (the one
+  apply dispatch, the only place live state is mutated), `reconciliation.py` (read-only
+  comparison of ambiguous outcomes with the approved before/after state),
+  `custom_objects.py` (the one
   shape this repo stores in the engine's custom objects), `money.py`, `kernel.py`,
   `store.py`, `seed.py`. `docs/mapping.md` is the method-by-method map of what each read
   and write actually does. `scripts/check.py` fails if a module here is named in neither
   file.
 - `config/` — `kernel-policy.json` and `kernel-principal.json`, the host-owned files
   the kernel checks every governed command against; never model input.
-- `host/` — the FastAPI host: one engine store, both agents, session binding, the
-  checkout route, and the merchant approval route.
+- `host/` — the FastAPI host: one engine store, both agents, demo or verified JWT
+  identity, token-subject session binding, checkout, out-of-band merchant approval,
+  and observed-state reconciliation routes.
 - `mcp_servers/` — `shopping.py` and `merchant.py`, the two MCP servers over the same
   backends and gates as the host.
 - `web/storefront/` and `web/portal/` — Next.js chat UIs against the host's
@@ -73,8 +76,8 @@ and `GET /merchant/changes`.
   `docs/testing.md` for the score and the two genuine model-behavior findings.
 - `docs/` — `enforcement.md` (what is governed and what is not, and by which layer),
   `mapping.md` (the backend method map, the pinned submodule commit, the SQL
-  fallbacks), `install.md`, `mcp.md` (connecting an MCP client, and its weaker
-  approval guarantee), `testing.md` (what the suite covers and what it does not).
+  fallbacks), `install.md`, `mcp.md` (connecting an MCP client and its external
+  approval boundary), `testing.md` (what the suite covers and what it does not).
 - `tests/` — one file per module above, run with `pytest`.
 - `.github/workflows/` — CI: a Python job (ruff, pytest, the drift check, the denial
   walkthrough, the keyless tour run twice against the same db) and a Node 22 job
@@ -109,13 +112,16 @@ correct."
 - `POST /shopping/session`, `POST /shopping/chat`, `POST /shopping/cart/add`,
   `POST /shopping/checkout`, `GET /shopping/cart`, `GET /shopping/orders`,
   `POST /merchant/session`, `POST /merchant/chat`, `POST /merchant/changes/{id}/approve`,
-  `GET /merchant/changes`, `GET /capabilities`, `GET /healthz` — `host/app.py`. The `GET`
-  routes are reads (`GET /capabilities` excepted) behind the same 401 gate as every
-  other route — `GET /shopping/cart` and `GET /merchant/changes` are session-scoped,
+  `GET|POST /merchant/changes/{id}/reconciliation`,
+  `POST /merchant/changes/{id}/reconciliation/start`, `GET /merchant/changes`,
+  `GET /capabilities`, `GET /healthz`, `GET /readyz` — `host/app.py`. The commerce `GET` routes are
+  reads behind the same session gate as their role's other routes; `/capabilities` and
+  `/healthz` are intentionally public. `GET /shopping/cart` and
+  `GET /merchant/changes` are session-scoped,
   while `GET /shopping/orders` is customer-scoped, so any session bound to the seeded
   customer sees that customer's orders — and both web apps use them to render live
   store state.
-- The MCP tool surface — 13 shopping tools, 19 merchant tools — `mcp_servers/`, wired
+- The MCP tool surface — 13 shopping tools, 18 merchant tools — `mcp_servers/`, wired
   up in `docs/mcp.md`.
 - The governed kernel seam — `engine_backend/kernel.py`'s `KernelClient.execute`,
   the only place a command reaches the engine's own policy check.
@@ -136,6 +142,12 @@ and nothing beneath it.
 The one guarantee enforced twice is approval: upstream's `require_host_approval` at the
 agent layer, and `requires_approval` on `payments.create_refund` in the kernel policy.
 The kernel's copy holds even when the agent layer is bypassed entirely.
+
+For staged merchant writes, approval is also bound to a canonical SHA-256 digest of the
+exact reviewed proposal, and the approval request must echo that displayed digest. The
+MCP server exposes no approval capability; a trusted
+operator surface must record it. Apply claims it once, leases affected targets, and
+ambiguous dispatches stay blocked until observed live state is explicitly reconciled.
 
 ## Verify
 

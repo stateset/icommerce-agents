@@ -1,6 +1,6 @@
 """Drift check: exits non-zero when the code and the documentation about it disagree.
 
-Four checks:
+Six checks:
 
 1. Neither engine backend (`EngineStorefront`, `EngineMerchant`) has an unimplemented
    abstract method left over -- `__abstractmethods__` must be empty on both.
@@ -16,6 +16,8 @@ Four checks:
    is check 3's drift class one level up: a module added without a line about it
    anywhere is how `custom_objects.py` and `listings.py` reached a release candidate
    undocumented.
+6. Every external GitHub Action is pinned to a full immutable commit SHA rather than a
+   moving tag.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ ROOT = Path(__file__).resolve().parent.parent
 MAPPING = ROOT / "docs" / "mapping.md"
 README = ROOT / "README.md"
 ENGINE_BACKEND = ROOT / "engine_backend"
+WORKFLOWS = ROOT / ".github" / "workflows"
 
 SUBMODULE_COMMIT_RE = re.compile(r"submodule-commit:\s*([0-9a-f]{40})")
 
@@ -169,12 +172,35 @@ def check_modules_documented() -> list[str]:
     return problems
 
 
+def check_actions_pinned() -> list[str]:
+    """Refuse mutable action tags in the repository's supply-chain execution path."""
+    problems = []
+    uses_line = re.compile(r"^\s*-\s+uses:\s+([^#\s]+)")
+    full_sha = re.compile(r"^[0-9a-f]{40}$")
+    for path in sorted((*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml"))):
+        for line_number, line in enumerate(path.read_text().splitlines(), start=1):
+            match = uses_line.match(line)
+            if match is None:
+                continue
+            action = match.group(1)
+            if action.startswith("./") or action.startswith("docker://"):
+                continue
+            _, separator, revision = action.rpartition("@")
+            if not separator or full_sha.fullmatch(revision) is None:
+                problems.append(
+                    f"{path.relative_to(ROOT)}:{line_number} external action {action!r} "
+                    "is not pinned to a full commit SHA"
+                )
+    return problems
+
+
 def main() -> int:
     problems: list[str] = []
     problems += check_no_abstract_methods()
     problems += check_submodule_commit()
     problems += check_sql_paths_documented()
     problems += check_modules_documented()
+    problems += check_actions_pinned()
 
     if problems:
         print("scripts/check.py found drift:")

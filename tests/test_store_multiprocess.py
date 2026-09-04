@@ -131,7 +131,7 @@ def _approval_claim_process(
     store = EngineStore(db_path)
     ready.put(True)
     go.wait()
-    claim = store.claim_approval(change_id, "user:acme-operator", targets)
+    claim = store.claim_approval(change_id, "user:acme-operator", f"digest:{change_id}", targets)
     out.put((change_id, claim.attempt_id, claim.refusal, claim.blocked_target))
 
 
@@ -256,7 +256,7 @@ def test_one_durable_approval_can_be_claimed_by_only_one_process(tmp_path):
     db_path = _seeded(tmp_path, "approval.db")
     store = EngineStore(db_path)
     change_id = "chg-cross-process"
-    store.record_approval(change_id, "user:acme-operator")
+    store.record_approval(change_id, "user:acme-operator", f"digest:{change_id}")
 
     ready, go, out = _CTX.Queue(), _CTX.Event(), _CTX.Queue()
     workers = [
@@ -293,7 +293,7 @@ def test_different_changes_cannot_claim_the_same_target_across_processes(tmp_pat
     store = EngineStore(db_path)
     change_ids = ["chg-target-a", "chg-target-b"]
     for change_id in change_ids:
-        store.record_approval(change_id, "user:acme-operator")
+        store.record_approval(change_id, "user:acme-operator", f"digest:{change_id}")
 
     ready, go, out = _CTX.Queue(), _CTX.Event(), _CTX.Queue()
     workers = [
@@ -320,7 +320,7 @@ def test_different_changes_cannot_claim_the_same_target_across_processes(tmp_pat
     assert store.approval_record(loser[0])["state"] == "approved"
 
     store.finish_approval_attempt(winner[0], winner[1], outcome="failed", error="test release")
-    retry = store.claim_approval(loser[0], "user:acme-operator", [SKU])
+    retry = store.claim_approval(loser[0], "user:acme-operator", f"digest:{loser[0]}", [SKU])
     assert retry.attempt_id is not None
 
 

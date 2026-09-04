@@ -142,20 +142,18 @@ because it opens a connection. `docs/mapping.md` has the mechanism, the measurem
 why the symptom appears on some Python SQLite builds and not others. Anything that
 weakens the pin makes this workaround unsound again, whatever the schema says.
 
-## The MCP path's approval is weaker than the HTTP host's
+## One approval boundary for both runtime paths
 
-`docs/mcp.md` covers this in full; it is not restated here beyond the one sentence that
-matters for this document's claim. The FastAPI host's `POST /merchant/changes/{id}/approve`
-is a route only the operator's own browser session can reach — out-of-band by
-construction, with the operator identity read from the session binding, never a request
-body field. The MCP path's `host_approve` tool has no such separation: it is an ordinary
-tool call, so its guarantee rests entirely on the connecting client prompting a human
-before invoking it, and a client configured to auto-approve tool calls removes that
-guarantee outright, with nothing in this process able to detect or refuse it. The two
-paths are not equivalent, and the engine's own policy check on `payments.create_refund`
-is what still holds regardless of which one an operator used to reach it.
+The FastAPI host's `POST /merchant/changes/{id}/approve` is an out-of-band operator
+route; the merchant MCP server exposes no approval tool. An MCP-staged proposal can be
+approved only through that trusted host route (or an equivalent external integration)
+against the shared database. A model therefore cannot satisfy its own approval gate,
+even when its MCP client auto-approves every available tool call. `docs/mcp.md` covers
+the deployment boundary and the historical finding that caused the old tool to be
+removed.
 
-On both paths, the backend binds approval to the approving operator in the durable
+The operator surface must echo the SHA-256 digest displayed with the reviewed diff; the
+host rejects a mismatch. The backend then binds that digest and the approving operator in the durable
 `icommerce_agent_approvals` SQLite ledger. Applying atomically claims an `approved`
 record as `applying`, so one approval survives a restart and exactly one competing
 process can own the attempt. A successful attempt becomes `applied`; a refusal before
@@ -163,12 +161,22 @@ mutation becomes `failed` and requires fresh approval.
 
 If an exception happens after mutation dispatch begins, the ledger records
 `reconciliation_required` and refuses both reapproval and another apply. A process crash
-leaves the equally visible `applying` state. This is deliberate: several engine calls
+leaves the equally visible `applying` state. After the configured lease window (15
+minutes by default), an operator can move that abandoned claim—not retry it—into
+`reconciliation_required`; the transition is itself an audit event and retains every
+target lease. This is deliberate: several engine calls
 cannot be wrapped in the adapter ledger's SQLite transaction, so claiming that an
 ambiguous multi-item attempt is safely retryable would risk duplicating or overwriting
 part of it. `GET /merchant/changes` exposes this control state, and the portal renders
-`approved`, `applying`, and `reconciliation required` from that durable record rather
-than from browser-local memory.
+`approved`, `applying`, `reconciliation required`, and `resolved` from that durable
+record rather than from browser-local memory.
+
+Resolution is single-owner too. The ledger first moves
+`reconciliation_required → reconciling`; only that operator may update the staged
+lifecycle record and finish `reconciling → resolved`. A normal metadata failure returns
+the claim to `reconciliation_required`. A resolver crash leaves `reconciling` visible
+and recoverable after the same lease window, preventing two operators from recording
+conflicting conclusions.
 
 The approval claim transaction also inserts one durable lease per affected target.
 Different change ids therefore cannot mutate the same SKU concurrently, even from

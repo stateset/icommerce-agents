@@ -18,17 +18,21 @@ Every other route reads it back from ``X-Session-Id``.
 
 from __future__ import annotations
 
+import asyncio
+import os
 import secrets
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from commerce_common.streaming import AgentEvent, to_sse
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from merchant_agent.changes import ChangeNotApplicable
 from merchant_agent.types import (
+    ActorKind,
     ChangeStatus,
     MerchantSessionContext,
     MerchantSessionState,
@@ -40,18 +44,19 @@ from shopping_agent.types import ShoppingSessionContext, ShoppingSessionState
 from shopping_agent_runtime import ShoppingAgent
 from stateset_embedded import CartAddress
 
-from engine_backend import SKILLS_DIR
+from engine_backend import SKILLS_DIR, staging
 from engine_backend.agent_config import merchant_agent_config, shopping_agent_config
 from engine_backend.custom_objects import list_payloads
 from engine_backend.kernel import KernelClient
 from engine_backend.merchant import EngineMerchant
+from engine_backend.reconciliation import assess as assess_reconciliation
 from engine_backend.seed import seed_store
 from engine_backend.staging import STAGED_TYPE, load_evidence
-from engine_backend.staging import load as load_staged_change
 from engine_backend.store import EngineStore
 from engine_backend.storefront import EngineStorefront
 
 from .anthropic_client import build_anthropic_client
+from .auth import AuthConfig, AuthenticationError, Authenticator, Identity
 from .sessions import SessionRegistry
 
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
@@ -69,6 +74,19 @@ class CartAddRequest(BaseModel):
     # This direct UI route bypasses the shopping executor, so carry its default
     # per-item quantity boundary at the HTTP edge too.
     quantity: int = Field(default=1, ge=1, le=24)
+
+
+class ReconciliationRequest(BaseModel):
+    proposal_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    resolution: Literal["confirmed_applied", "accepted_current_state"]
+
+
+class ApprovalRequest(BaseModel):
+    proposal_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class ReconciliationStartRequest(BaseModel):
+    proposal_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
 
 # ``engine_backend.apply`` records one of two evidence shapes at apply time: a sealed
@@ -99,7 +117,12 @@ def _session_id(x_session_id: str | None) -> str:
     return x_session_id
 
 
-def create_app(db_path: str) -> FastAPI:
+def create_app(
+    db_path: str,
+    auth_config: AuthConfig | None = None,
+    *,
+    stale_apply_seconds: int | None = None,
+) -> FastAPI:
     """Build one deployment: one engine store (seeded), both backends, one kernel
     client bound to the host-owned policy and principal files, and both agents."""
     store = EngineStore(db_path)
@@ -110,6 +133,14 @@ def create_app(db_path: str) -> FastAPI:
         store, CONFIG_DIR / "kernel-policy.json", CONFIG_DIR / "kernel-principal.json"
     )
     merchant = EngineMerchant(store, kernel)
+    authenticator = Authenticator(auth_config or AuthConfig.from_env())
+    stale_apply_seconds = (
+        int(os.getenv("ICOMMERCE_STALE_APPLY_SECONDS", "900"))
+        if stale_apply_seconds is None
+        else stale_apply_seconds
+    )
+    if stale_apply_seconds < 1:
+        raise ValueError("stale apply recovery threshold must be at least one second")
 
     anthropic_client = build_anthropic_client()
     shopping_agent = ShoppingAgent(
@@ -132,18 +163,71 @@ def create_app(db_path: str) -> FastAPI:
 
     # `web/storefront` (:3000) and `web/portal` (:3100) call this host from their own
     # origin -- there is no reverse proxy or Next.js rewrite in front of either -- so a
-    # browser refuses to expose any response to their JS without this. No credentials
-    # cross this boundary (identity is the unguessable `X-Session-Id` the host mints,
-    # never a cookie), so an explicit, narrow origin list costs nothing. These two
-    # hardcoded localhost origins are a demo convenience for this fixed local
-    # deployment, not a pattern to carry into one with real origins or authentication
-    # -- a deployed host needs its actual origin(s) configured, and `allow_credentials`
-    # reconsidered the moment identity moves off `X-Session-Id`.
+    # browser refuses to expose any response to their JS without this. Production
+    # origins are configured explicitly; there is deliberately no wildcard fallback.
+    allowed_origins = [
+        origin.strip()
+        for origin in os.getenv(
+            "ICOMMERCE_ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:3100"
+        ).split(",")
+        if origin.strip()
+    ]
+
+    @app.middleware("http")
+    async def authenticate_commerce_request(request: Request, call_next):
+        """Verify identity before any commerce route can reach an agent or engine.
+
+        In JWT mode a session id is only a workflow handle, never a bearer credential:
+        subsequent requests must present the same signed subject that created it.
+        """
+        path = request.url.path
+        if request.method == "OPTIONS" or not path.startswith(("/shopping/", "/merchant/")):
+            return await call_next(request)
+        try:
+            identity = await asyncio.to_thread(
+                authenticator.authenticate, request.headers.get("Authorization")
+            )
+        except AuthenticationError as error:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": str(error)},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        request.state.identity = identity
+        if authenticator.config.mode == "demo" or path in (
+            "/shopping/session",
+            "/merchant/session",
+        ):
+            return await call_next(request)
+        session_id = request.headers.get("X-Session-Id")
+        if not session_id:
+            return JSONResponse(status_code=401, content={"detail": "missing X-Session-Id"})
+        try:
+            binding = store.binding(session_id)
+        except KeyError:
+            return JSONResponse(status_code=401, content={"detail": "unknown session"})
+        expected_kind = "customer" if path.startswith("/shopping/") else "operator"
+        if binding.kind != expected_kind:
+            return JSONResponse(status_code=403, content={"detail": "session role mismatch"})
+        if identity is None or binding.authenticated_subject != identity.subject:
+            return JSONResponse(status_code=403, content={"detail": "session subject mismatch"})
+        if expected_kind == "customer" and not identity.permits(
+            role="customer", scope="shopping:use"
+        ):
+            return JSONResponse(status_code=403, content={"detail": "shopping access required"})
+        if expected_kind == "operator" and (
+            not identity.permits(role="merchant", scope="merchant:write")
+            or identity.store_id != store.store_id
+        ):
+            return JSONResponse(status_code=403, content={"detail": "merchant access required"})
+        return await call_next(request)
+
+    # Added after the auth middleware so CORS wraps even an early 401/403 response.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000", "http://localhost:3100"],
+        allow_origins=allowed_origins,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "X-Session-Id"],
+        allow_headers=["Authorization", "Content-Type", "X-Session-Id"],
     )
 
     # -- Health -----------------------------------------------------------------
@@ -151,6 +235,15 @@ def create_app(db_path: str) -> FastAPI:
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/readyz")
+    async def readyz() -> dict[str, str]:
+        """Prove the engine can answer a read, rather than only that Python is alive."""
+        try:
+            await store.call(lambda commerce: commerce.products.count())
+        except Exception as error:
+            raise HTTPException(status_code=503, detail="engine store is unavailable") from error
+        return {"status": "ready"}
 
     # -- Bindings -----------------------------------------------------------------
 
@@ -179,17 +272,57 @@ def create_app(db_path: str) -> FastAPI:
     # -- Sessions -----------------------------------------------------------------
 
     @app.post("/shopping/session")
-    async def start_shopping_session() -> dict[str, str]:
-        customer = await store.call(lambda c: c.customers.get_by_email(_ROWAN_EMAIL))
+    async def start_shopping_session(request: Request) -> dict[str, str]:
+        identity: Identity | None = request.state.identity
+        if authenticator.config.mode == "jwt":
+            if identity is None or not identity.permits(role="customer", scope="shopping:use"):
+                raise HTTPException(status_code=403, detail="shopping access required")
+            if not identity.email:
+                raise HTTPException(status_code=403, detail="customer email claim required")
+            customer = await store.call(
+                lambda c: next(
+                    (
+                        item
+                        for item in c.customers.list()
+                        if item.email and item.email.casefold() == identity.email.casefold()
+                    ),
+                    None,
+                )
+            )
+            if customer is None:
+                raise HTTPException(status_code=403, detail="customer is not provisioned")
+        else:
+            customer = await store.call(lambda c: c.customers.get_by_email(_ROWAN_EMAIL))
         session_id = secrets.token_urlsafe(24)
-        store.bind(session_id, customer.id, "customer")
+        store.bind(
+            session_id,
+            customer.id,
+            "customer",
+            authenticated_subject=identity.subject if identity else None,
+        )
         shopping_sessions.start(session_id)
         return {"session_id": session_id}
 
     @app.post("/merchant/session")
-    async def start_merchant_session() -> dict[str, str]:
+    async def start_merchant_session(request: Request) -> dict[str, str]:
+        identity: Identity | None = request.state.identity
+        if authenticator.config.mode == "jwt":
+            if identity is None or not identity.permits(role="merchant", scope="merchant:write"):
+                raise HTTPException(status_code=403, detail="merchant access required")
+            if identity.store_id != store.store_id:
+                raise HTTPException(
+                    status_code=403, detail="token is not authorized for this store"
+                )
+            operator = identity.subject
+        else:
+            operator = _OPERATOR_ID
         session_id = secrets.token_urlsafe(24)
-        store.bind(session_id, _OPERATOR_ID, "operator")
+        store.bind(
+            session_id,
+            operator,
+            "operator",
+            authenticated_subject=identity.subject if identity else None,
+        )
         merchant_sessions.start(session_id)
         return {"session_id": session_id}
 
@@ -363,7 +496,9 @@ def create_app(db_path: str) -> FastAPI:
 
     @app.post("/merchant/changes/{change_id}/approve")
     async def merchant_approve_change(
-        change_id: str, x_session_id: str | None = Header(default=None)
+        change_id: str,
+        request: ApprovalRequest,
+        x_session_id: str | None = Header(default=None),
     ) -> dict[str, Any]:
         """The operator's approval, and the only place it happens. The operator comes
         from the session binding, never from the request body."""
@@ -373,9 +508,10 @@ def create_app(db_path: str) -> FastAPI:
         # final reconciliation could erase an approval issued while that turn was still
         # in flight.
         async with chat.turn_lock:
-            change = await load_staged_change(store, change_id)
-            if change is None:
+            record = await staging.load_record(store, change_id)
+            if record is None:
                 raise HTTPException(status_code=404, detail=f"no change with id {change_id!r}")
+            change = StagedChange.model_validate(record)
             if change.status is not ChangeStatus.STAGED:
                 # An already-applied or discarded change has nothing left to approve;
                 # accepting one would put a live change id into `approved_ids`.
@@ -383,6 +519,9 @@ def create_app(db_path: str) -> FastAPI:
                     status_code=409,
                     detail=f"change {change_id} is {change.status.value}, not staged",
                 )
+            digest = staging.proposal_digest(change, record.get("payload"))
+            if digest != record.get("proposal_digest") or digest != request.proposal_digest:
+                raise HTTPException(status_code=409, detail="proposal digest changed")
             # Claude Commerce's executor checks this session-owned mark before it calls
             # the backend. The backend checks a separate operator-bound mark again at
             # the mutation boundary; both are required for the HTTP path.
@@ -391,7 +530,152 @@ def create_app(db_path: str) -> FastAPI:
             except ChangeNotApplicable as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
             chat.state.approved_change_ids.add(change_id)
-        return {"change_id": change_id, "approved_by": session.operator}
+        approval = store.approval_record(change_id)
+        return {
+            "change_id": change_id,
+            "approved_by": session.operator,
+            "proposal_digest": approval["proposal_digest"],
+        }
+
+    @app.get("/merchant/changes/{change_id}/reconciliation")
+    async def merchant_reconciliation_read(
+        change_id: str, x_session_id: str | None = Header(default=None)
+    ) -> dict[str, Any]:
+        _bound_merchant_context(x_session_id)
+        record = await staging.load_record(store, change_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"no change with id {change_id!r}")
+        control = store.approval_record(change_id)
+        if control is None or control["state"] != "reconciliation_required":
+            raise HTTPException(
+                status_code=409,
+                detail=f"change {change_id} does not require reconciliation",
+            )
+        change = StagedChange.model_validate(record)
+        assessment = await assess_reconciliation(store, change, record.get("payload"))
+        return {
+            "change": change.model_dump(mode="json"),
+            "proposal_digest": record["proposal_digest"],
+            "control": control,
+            "assessment": assessment.model_dump(mode="json"),
+            "events": store.approval_events(change_id),
+        }
+
+    @app.post("/merchant/changes/{change_id}/reconciliation/start")
+    async def merchant_reconciliation_start(
+        change_id: str,
+        request: ReconciliationStartRequest,
+        x_session_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        session = _bound_merchant_context(x_session_id)
+        record = await staging.load_record(store, change_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"no change with id {change_id!r}")
+        change = StagedChange.model_validate(record)
+        digest = staging.proposal_digest(change, record.get("payload"))
+        if digest != record.get("proposal_digest") or digest != request.proposal_digest:
+            raise HTTPException(status_code=409, detail="proposal digest changed")
+        try:
+            store.recover_stale_approval(
+                change_id,
+                session.operator,
+                digest,
+                stale_before=datetime.now(UTC) - timedelta(seconds=stale_apply_seconds),
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {
+            "change_id": change_id,
+            "state": "reconciliation_required",
+            "assessment": (
+                await assess_reconciliation(store, change, record.get("payload"))
+            ).model_dump(mode="json"),
+        }
+
+    @app.post("/merchant/changes/{change_id}/reconciliation")
+    async def merchant_reconciliation_resolve(
+        change_id: str,
+        request: ReconciliationRequest,
+        x_session_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        session = _bound_merchant_context(x_session_id)
+        record = await staging.load_record(store, change_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"no change with id {change_id!r}")
+        change = StagedChange.model_validate(record)
+        digest = staging.proposal_digest(change, record.get("payload"))
+        if digest != record.get("proposal_digest") or digest != request.proposal_digest:
+            raise HTTPException(status_code=409, detail="proposal digest changed")
+        control = store.approval_record(change_id)
+        if control is None or control["state"] != "reconciliation_required":
+            raise HTTPException(
+                status_code=409,
+                detail=f"change {change_id} does not require reconciliation",
+            )
+        try:
+            store.claim_reconciliation(
+                change_id,
+                session.operator,
+                digest,
+                request.resolution,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        try:
+            # Assess only after winning the durable reconciliation claim. This avoids
+            # persisting a conclusion another operator computed before losing the race.
+            assessment = await assess_reconciliation(store, change, record.get("payload"))
+            if request.resolution == "confirmed_applied":
+                if assessment.outcome != "applied":
+                    raise HTTPException(
+                        status_code=409,
+                        detail="live state does not fully match the approved proposal",
+                    )
+                resolved = change.model_copy(
+                    update={
+                        "status": ChangeStatus.APPLIED,
+                        "applied_at": datetime.now(UTC),
+                        "applied_by": session.operator,
+                        "guardrail_notes": [
+                            *change.guardrail_notes,
+                            "operator reconciled live state as fully applied",
+                        ],
+                    }
+                )
+            else:
+                resolved = change.model_copy(
+                    update={
+                        "status": ChangeStatus.DISCARDED,
+                        "discarded_at": datetime.now(UTC),
+                        "discarded_by": session.operator,
+                        "discarded_by_kind": ActorKind.OPERATOR,
+                        "guardrail_notes": [
+                            *change.guardrail_notes,
+                            "operator accepted current live state after ambiguous apply",
+                        ],
+                    }
+                )
+            await staging.save(store, resolved)
+        except Exception as error:
+            store.abort_reconciliation(
+                change_id,
+                session.operator,
+                digest,
+                request.resolution,
+                str(error),
+            )
+            raise
+        store.finish_reconciliation(
+            change_id,
+            session.operator,
+            digest,
+            request.resolution,
+        )
+        return {
+            "change_id": change_id,
+            "resolution": request.resolution,
+            "assessment": assessment.model_dump(mode="json"),
+        }
 
     @app.get("/merchant/changes")
     async def merchant_changes_read(
@@ -406,14 +690,41 @@ def create_app(db_path: str) -> FastAPI:
         approval_records = store.approval_records(
             [record["change_id"] for record in records if record.get("change_id")]
         )
+        approval_events = store.approval_event_records(
+            [record["change_id"] for record in records if record.get("change_id")]
+        )
         changes = []
         for record in records:
             change = StagedChange.model_validate(record)
-            if change.status not in (ChangeStatus.STAGED, ChangeStatus.APPLIED):
+            control = approval_records.get(change.change_id)
+            operationally_active = control and control["state"] in (
+                "applying",
+                "reconciliation_required",
+                "reconciling",
+            )
+            if (
+                change.status not in (ChangeStatus.STAGED, ChangeStatus.APPLIED)
+                and not operationally_active
+            ):
                 continue
             item = change.model_dump(mode="json")
             item["evidence"] = record.get("evidence") or []
-            item["apply_control"] = approval_records.get(change.change_id)
+            item["proposal_digest"] = record.get("proposal_digest")
+            item["apply_control"] = control
+            control = item["apply_control"]
+            item["recovery_available_at"] = None
+            if control and control["state"] in ("applying", "reconciling"):
+                recovery_started_at = (
+                    control.get("claimed_at")
+                    if control["state"] == "applying"
+                    else control.get("resolved_at")
+                )
+                if recovery_started_at:
+                    item["recovery_available_at"] = (
+                        datetime.fromisoformat(recovery_started_at)
+                        + timedelta(seconds=stale_apply_seconds)
+                    ).isoformat()
+            item["approval_events"] = approval_events.get(change.change_id, [])
             changes.append(item)
         changes.sort(key=lambda item: item["created_at"])
         return {"changes": changes}

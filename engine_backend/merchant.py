@@ -72,8 +72,25 @@ class EngineMerchant(MerchantBackend):
         """Record that ``approved_by`` (the host's operator, never a tool argument) has
         approved ``change_id``. A preview card and a chat approval approve nothing —
         only this method, called from the host's own approval surface, does."""
+        record = custom_objects.find_object(
+            self.store.commerce, staging.STAGED_TYPE, object_handle=change_id
+        )
+        if record is None:
+            raise ChangeNotApplicable(f"no change with id {change_id!r} to approve")
+        persisted = custom_objects.payload_of(record)
+        change = StagedChange.model_validate(persisted)
+        if change.status is not ChangeStatus.STAGED:
+            raise ChangeNotApplicable(
+                f"change {change_id} is {change.status.value}, not staged — nothing to approve"
+            )
+        digest = staging.proposal_digest(change, persisted.get("payload"))
+        stored_digest = persisted.get("proposal_digest") or digest
+        if digest != stored_digest:
+            raise ChangeNotApplicable(
+                f"change {change_id} proposal digest is invalid; stage a fresh change"
+            )
         try:
-            self.store.record_approval(change_id, approved_by)
+            self.store.record_approval(change_id, approved_by, digest)
         except ValueError as error:
             raise ChangeNotApplicable(str(error)) from error
 
@@ -426,16 +443,24 @@ class EngineMerchant(MerchantBackend):
         # operation. Without an outer lock, two simultaneous calls can both observe
         # STAGED and execute the mutation before either one saves APPLIED.
         async with self.store.serialized(f"apply:{change_id}"):
-            change = await staging.load(self.store, change_id)
-            if change is None:
+            record = await staging.load_record(self.store, change_id)
+            if record is None:
                 raise ChangeNotApplicable(f"no change with id {change_id!r} to apply")
+            change = StagedChange.model_validate(record)
             if change.status is not ChangeStatus.STAGED:
                 raise ChangeNotApplicable(
                     f"change {change_id} is {change.status.value}, not staged — nothing to apply"
                 )
 
+            payload = record.get("payload")
+            digest = staging.proposal_digest(change, payload)
+            stored_digest = record.get("proposal_digest") or digest
+            if digest != stored_digest:
+                raise ChangeNotApplicable(
+                    f"change {change_id} proposal digest is invalid; stage a fresh change"
+                )
             targets = sorted({item.target for item in change.items})
-            claim = self.store.claim_approval(change_id, session.operator, targets)
+            claim = self.store.claim_approval(change_id, session.operator, digest, targets)
             if claim.refusal == "missing":
                 raise ChangeNotApplicable(f"change {change_id} has not been approved")
             if claim.refusal == "different_operator":
@@ -453,6 +478,11 @@ class EngineMerchant(MerchantBackend):
             if claim.refusal == "target_claimed":
                 raise ChangeNotApplicable(
                     f"target {claim.blocked_target} is already being changed by another apply"
+                )
+            if claim.refusal == "proposal_changed":
+                raise ChangeNotApplicable(
+                    f"change {change_id} no longer matches the approved proposal; "
+                    "stage and approve a fresh change"
                 )
             if claim.attempt_id is None:  # defensive exhaustiveness
                 raise RuntimeError(f"approval claim for {change_id} returned no attempt id")
@@ -473,7 +503,6 @@ class EngineMerchant(MerchantBackend):
                     ctx = ApplyContext(
                         store=self.store, kernel=self.kernel, operator=session.operator
                     )
-                    payload = await staging.load_change_payload(self.store, change_id)
                     await validate_preconditions(ctx, change, payload)
 
                     # The five-kind write dispatch lives in engine_backend/apply.py; see

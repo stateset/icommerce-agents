@@ -3,11 +3,15 @@
 `ci.yml` runs on push to `master` and on every pull request. Two independent jobs;
 `web` never blocks `python` — neither has a `needs:` on the other.
 
+The workflow has read-only repository permissions, cancels superseded runs on the same
+ref, disables persisted checkout credentials, and pins every GitHub-authored action to
+an immutable full commit SHA (the adjacent comment records the reviewed release tag).
+
 ## `python`
 
 Checks out the repo with `submodules: recursive` (`vendor/commerce-agents` is a git
-submodule), installs `requirements-dev.txt`, and runs, in order: `ruff check .`,
-`ruff format --check .`, `pytest`, `scripts/check.py` (the drift check between code
+submodule), installs `requirements-dev.txt`, and runs, in order: `pip check`,
+`ruff check .`, `ruff format --check .`, `pytest`, `scripts/check.py` (the drift check between code
 and documentation), `scripts/denials.py` (the three end-to-end refusals: a cart
 write blocked for lack of provenance, an apply blocked for lack of approval, and an
 over-refund the engine itself rejects inside the transaction), and `scripts/tour.py`
@@ -44,7 +48,8 @@ matching the Next 16 / React 19 the workspace builds on (Next 16 requires Node >
 
 After both builds, this job also installs Python 3.12 and `requirements-dev.txt`,
 starts the host with no `ANTHROPIC_API_KEY` (`/capabilities` reports `unconfigured`),
-runs `scripts/tour.py` against it over HTTP so the store has state, starts both built
+waits for `/readyz` to prove the engine can answer, runs `scripts/tour.py` against it
+over HTTP so the store has state, starts both built
 web apps against that host, and runs `scripts/pw_check.mjs` (`@playwright/test`,
 headless Chromium, no API key) to assert the portal's DOM actually holds a
 `.evidence.kernel` row and a `.evidence.log` row — visibly distinct by class and label

@@ -4,6 +4,16 @@ from fastapi.testclient import TestClient
 
 from host.app import create_app
 
+FAKE_PROPOSAL = {"proposal_digest": "sha256:" + "0" * 64}
+
+
+def _approval_json(store, change_id):
+    import asyncio
+
+    from engine_backend.staging import load_record
+
+    return {"proposal_digest": asyncio.run(load_record(store, change_id))["proposal_digest"]}
+
 
 def client(tmp_path):
     return TestClient(create_app(str(tmp_path / "store.db")))
@@ -26,6 +36,12 @@ def _order_skus(tmp_path, order_number):
 
 def test_health(tmp_path):
     assert client(tmp_path).get("/healthz").json()["status"] == "ok"
+
+
+def test_readiness_proves_the_engine_can_answer(tmp_path):
+    response = client(tmp_path).get("/readyz")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
 
 
 def test_a_session_binds_identity_server_side(tmp_path):
@@ -52,7 +68,11 @@ def test_checkout_completes_the_cart_through_the_engine(tmp_path):
 def test_approving_a_change_requires_a_known_id(tmp_path):
     c = client(tmp_path)
     session_id = c.post("/merchant/session").json()["session_id"]
-    response = c.post("/merchant/changes/chg-nope/approve", headers={"X-Session-Id": session_id})
+    response = c.post(
+        "/merchant/changes/chg-nope/approve",
+        headers={"X-Session-Id": session_id},
+        json=FAKE_PROPOSAL,
+    )
     assert response.status_code == 404
 
 
@@ -90,6 +110,7 @@ def test_routes_reject_a_missing_or_unknown_session_id(tmp_path):
         c.post(
             "/merchant/changes/chg-nope/approve",
             headers={"X-Session-Id": "not-a-real-session"},
+            json=FAKE_PROPOSAL,
         ).status_code
         == 401
     )
@@ -149,7 +170,12 @@ def test_a_session_cannot_be_used_for_the_other_role(tmp_path):
 
     # A shopping session on the merchant routes.
     assert c.post("/merchant/chat", json={"message": "hi"}, headers=shopping).status_code == 401
-    assert c.post("/merchant/changes/chg-nope/approve", headers=shopping).status_code == 401
+    assert (
+        c.post(
+            "/merchant/changes/chg-nope/approve", headers=shopping, json=FAKE_PROPOSAL
+        ).status_code
+        == 401
+    )
 
     # A merchant session on the shopping routes.
     assert c.post("/shopping/chat", json={"message": "hi"}, headers=merchant).status_code == 401
@@ -225,10 +251,11 @@ def test_approving_a_change_that_is_no_longer_staged_is_refused(tmp_path):
     )
     asyncio.run(staging.save(store, change))
     approve = f"/merchant/changes/{change.change_id}/approve"
-    assert c.post(approve, headers=headers).status_code == 200
+    approval = _approval_json(store, change.change_id)
+    assert c.post(approve, headers=headers, json=approval).status_code == 200
 
     asyncio.run(staging.save(store, change.model_copy(update={"status": ChangeStatus.APPLIED})))
-    response = c.post(approve, headers=headers)
+    response = c.post(approve, headers=headers, json=approval)
     assert response.status_code == 409
     assert "applied" in response.json()["detail"]
 
@@ -281,7 +308,12 @@ def test_http_approval_reaches_both_executor_and_backend_and_is_consumed(tmp_pat
     monkeypatch.setattr(host_app.MerchantAgent, "stream_turn", apply_from_fake_turn)
 
     assert (
-        c.post(f"/merchant/changes/{change.change_id}/approve", headers=headers).status_code == 200
+        c.post(
+            f"/merchant/changes/{change.change_id}/approve",
+            headers=headers,
+            json=_approval_json(external_store, change.change_id),
+        ).status_code
+        == 200
     )
     assert (
         c.post("/merchant/chat", json={"message": "apply it"}, headers=headers).status_code == 200
@@ -389,8 +421,19 @@ def test_merchant_changes_exposes_durable_apply_control_state(tmp_path):
         "user:acme-operator",
     )
     asyncio.run(staging.save(store, change))
+    mismatch = c.post(
+        f"/merchant/changes/{change.change_id}/approve",
+        headers=headers,
+        json=FAKE_PROPOSAL,
+    )
+    assert mismatch.status_code == 409
     assert (
-        c.post(f"/merchant/changes/{change.change_id}/approve", headers=headers).status_code == 200
+        c.post(
+            f"/merchant/changes/{change.change_id}/approve",
+            headers=headers,
+            json=_approval_json(store, change.change_id),
+        ).status_code
+        == 200
     )
 
     records = c.get("/merchant/changes", headers=headers).json()["changes"]
@@ -398,3 +441,274 @@ def test_merchant_changes_exposes_durable_apply_control_state(tmp_path):
     assert item["apply_control"]["state"] == "approved"
     assert item["apply_control"]["approved_by"] == "user:acme-operator"
     assert item["apply_control"]["approved_at"]
+
+
+def test_operator_can_reconcile_an_ambiguous_apply_from_observed_state(tmp_path):
+    import asyncio
+    from pathlib import Path
+
+    from merchant_agent.types import ChangeStatus, MerchantSessionContext, PriceUpdateItem
+
+    from engine_backend.kernel import KernelClient
+    from engine_backend.merchant import EngineMerchant
+    from engine_backend.staging import load, load_record
+    from engine_backend.store import EngineStore
+
+    db_path = str(tmp_path / "store.db")
+    client = TestClient(create_app(db_path))
+    headers = {"X-Session-Id": client.post("/merchant/session").json()["session_id"]}
+    store = EngineStore(db_path)
+    backend = EngineMerchant(
+        store,
+        KernelClient(
+            store, Path("config/kernel-policy.json"), Path("config/kernel-principal.json")
+        ),
+    )
+    session = MerchantSessionContext(
+        session_id="outside", merchant_id="acme", operator="user:acme-operator"
+    )
+    change = asyncio.run(
+        backend.stage_price_update(
+            session, [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.00)]
+        )
+    )
+    backend.approve(change.change_id, session.operator)
+    record = asyncio.run(load_record(store, change.change_id))
+    digest = record["proposal_digest"]
+    claim = store.claim_approval(change.change_id, session.operator, digest, ["TENT-RIDGE-TAN"])
+    asyncio.run(
+        store.write_sql(
+            "UPDATE product_variants SET price = ?, version = version + 1 WHERE sku = ?",
+            ("199.00", "TENT-RIDGE-TAN"),
+        )
+    )
+    store.finish_approval_attempt(
+        change.change_id,
+        claim.attempt_id,
+        outcome="reconciliation_required",
+        error="simulated response loss",
+    )
+
+    detail = client.get(f"/merchant/changes/{change.change_id}/reconciliation", headers=headers)
+    assert detail.status_code == 200
+    assert detail.json()["assessment"]["outcome"] == "applied"
+    assert [event["event"] for event in detail.json()["events"]] == [
+        "approved",
+        "claimed",
+        "reconciliation_required",
+    ]
+
+    resolved = client.post(
+        f"/merchant/changes/{change.change_id}/reconciliation",
+        headers=headers,
+        json={"proposal_digest": digest, "resolution": "confirmed_applied"},
+    )
+    assert resolved.status_code == 200
+    assert asyncio.run(load(store, change.change_id)).status is ChangeStatus.APPLIED
+    control = store.approval_record(change.change_id)
+    assert control["state"] == "resolved"
+    assert control["resolution"] == "confirmed_applied"
+    assert store.approval_events(change.change_id)[-1]["event"] == ("reconciled:confirmed_applied")
+
+
+def test_reconciliation_cannot_confirm_a_write_that_did_not_land(tmp_path):
+    import asyncio
+    from pathlib import Path
+
+    from merchant_agent.types import MerchantSessionContext, PriceUpdateItem
+
+    from engine_backend.kernel import KernelClient
+    from engine_backend.merchant import EngineMerchant
+    from engine_backend.staging import load_record
+    from engine_backend.store import EngineStore
+
+    db_path = str(tmp_path / "store.db")
+    client = TestClient(create_app(db_path))
+    headers = {"X-Session-Id": client.post("/merchant/session").json()["session_id"]}
+    store = EngineStore(db_path)
+    backend = EngineMerchant(
+        store,
+        KernelClient(
+            store, Path("config/kernel-policy.json"), Path("config/kernel-principal.json")
+        ),
+    )
+    session = MerchantSessionContext(
+        session_id="outside", merchant_id="acme", operator="user:acme-operator"
+    )
+    change = asyncio.run(
+        backend.stage_price_update(
+            session, [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.00)]
+        )
+    )
+    backend.approve(change.change_id, session.operator)
+    digest = asyncio.run(load_record(store, change.change_id))["proposal_digest"]
+    claim = store.claim_approval(change.change_id, session.operator, digest, ["TENT-RIDGE-TAN"])
+    store.finish_approval_attempt(
+        change.change_id,
+        claim.attempt_id,
+        outcome="reconciliation_required",
+        error="simulated failure before write",
+    )
+
+    refused = client.post(
+        f"/merchant/changes/{change.change_id}/reconciliation",
+        headers=headers,
+        json={"proposal_digest": digest, "resolution": "confirmed_applied"},
+    )
+    assert refused.status_code == 409
+    accepted = client.post(
+        f"/merchant/changes/{change.change_id}/reconciliation",
+        headers=headers,
+        json={"proposal_digest": digest, "resolution": "accepted_current_state"},
+    )
+    assert accepted.status_code == 200
+    control = store.approval_record(change.change_id)
+    assert control["state"] == "resolved"
+    assert control["resolution"] == "accepted_current_state"
+
+
+def test_operator_can_recover_a_stale_applying_claim_without_retrying_it(tmp_path):
+    import asyncio
+    from pathlib import Path
+
+    from merchant_agent.types import MerchantSessionContext, PriceUpdateItem
+
+    from engine_backend.kernel import KernelClient
+    from engine_backend.merchant import EngineMerchant
+    from engine_backend.staging import load_record
+    from engine_backend.store import EngineStore
+
+    db_path = str(tmp_path / "store.db")
+    c = TestClient(create_app(db_path, stale_apply_seconds=1))
+    headers = {"X-Session-Id": c.post("/merchant/session").json()["session_id"]}
+    store = EngineStore(db_path)
+    backend = EngineMerchant(
+        store,
+        KernelClient(
+            store, Path("config/kernel-policy.json"), Path("config/kernel-principal.json")
+        ),
+    )
+    session = MerchantSessionContext(
+        session_id="outside", merchant_id="store:acme", operator="user:acme-operator"
+    )
+    change = asyncio.run(
+        backend.stage_price_update(
+            session, [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.00)]
+        )
+    )
+    backend.approve(change.change_id, session.operator)
+    digest = asyncio.run(load_record(store, change.change_id))["proposal_digest"]
+    claim = store.claim_approval(change.change_id, session.operator, digest, ["TENT-RIDGE-TAN"])
+    assert claim.attempt_id
+
+    endpoint = f"/merchant/changes/{change.change_id}/reconciliation/start"
+    too_soon = c.post(endpoint, headers=headers, json={"proposal_digest": digest})
+    assert too_soon.status_code == 409
+    assert "still within its lease" in too_soon.json()["detail"]
+
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "UPDATE icommerce_agent_approvals SET claimed_at = ? WHERE change_id = ?",
+        ("2000-01-01T00:00:00+00:00", change.change_id),
+    )
+    connection.commit()
+    connection.close()
+
+    recovered = c.post(endpoint, headers=headers, json={"proposal_digest": digest})
+    assert recovered.status_code == 200
+    assert recovered.json()["assessment"]["outcome"] == "not_applied"
+    assert store.approval_record(change.change_id)["state"] == "reconciliation_required"
+    connection = sqlite3.connect(db_path)
+    lease = connection.execute(
+        "SELECT change_id FROM icommerce_agent_target_leases WHERE target = ?",
+        ("TENT-RIDGE-TAN",),
+    ).fetchone()
+    connection.close()
+    assert lease == (change.change_id,)
+    assert store.approval_events(change.change_id)[-1]["event"] == "reconciliation_required"
+
+
+def test_discarded_lifecycle_remains_visible_while_reconciliation_is_in_flight(tmp_path):
+    import asyncio
+    from pathlib import Path
+
+    from merchant_agent.types import (
+        ActorKind,
+        ChangeStatus,
+        MerchantSessionContext,
+        PriceUpdateItem,
+    )
+
+    from engine_backend import staging
+    from engine_backend.kernel import KernelClient
+    from engine_backend.merchant import EngineMerchant
+    from engine_backend.store import EngineStore
+
+    db_path = str(tmp_path / "store.db")
+    c = TestClient(create_app(db_path))
+    headers = {"X-Session-Id": c.post("/merchant/session").json()["session_id"]}
+    store = EngineStore(db_path)
+    backend = EngineMerchant(
+        store,
+        KernelClient(
+            store, Path("config/kernel-policy.json"), Path("config/kernel-principal.json")
+        ),
+    )
+    session = MerchantSessionContext(
+        session_id="outside", merchant_id="store:acme", operator="user:acme-operator"
+    )
+    change = asyncio.run(
+        backend.stage_price_update(
+            session, [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199.00)]
+        )
+    )
+    backend.approve(change.change_id, session.operator)
+    record = asyncio.run(staging.load_record(store, change.change_id))
+    digest = record["proposal_digest"]
+    claim = store.claim_approval(change.change_id, session.operator, digest, ["TENT-RIDGE-TAN"])
+    store.finish_approval_attempt(
+        change.change_id,
+        claim.attempt_id,
+        outcome="reconciliation_required",
+        error="ambiguous",
+    )
+    store.claim_reconciliation(change.change_id, session.operator, digest, "accepted_current_state")
+    asyncio.run(
+        staging.save(
+            store,
+            change.model_copy(
+                update={
+                    "status": ChangeStatus.DISCARDED,
+                    "discarded_by": session.operator,
+                    "discarded_by_kind": ActorKind.OPERATOR,
+                }
+            ),
+        )
+    )
+
+    records = c.get("/merchant/changes", headers=headers).json()["changes"]
+    visible = next(item for item in records if item["change_id"] == change.change_id)
+    assert visible["status"] == "discarded"
+    assert visible["apply_control"]["state"] == "reconciling"
+    assert visible["recovery_available_at"]
+
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "UPDATE icommerce_agent_approvals SET resolved_at = ? WHERE change_id = ?",
+        ("2000-01-01T00:00:00+00:00", change.change_id),
+    )
+    connection.commit()
+    connection.close()
+    started = c.post(
+        f"/merchant/changes/{change.change_id}/reconciliation/start",
+        headers=headers,
+        json={"proposal_digest": digest},
+    )
+    assert started.status_code == 200
+    resolved = c.post(
+        f"/merchant/changes/{change.change_id}/reconciliation",
+        headers=headers,
+        json={"proposal_digest": digest, "resolution": "accepted_current_state"},
+    )
+    assert resolved.status_code == 200
+    assert store.approval_record(change.change_id)["state"] == "resolved"

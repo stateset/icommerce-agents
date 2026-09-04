@@ -8,7 +8,7 @@ refusals, the staging/apply/evidence pipeline, the web builds — and not the be
 the model configured in a later deployment. Read this page before trusting a green run
 to mean more than that.
 
-## The 192 pytest tests: what they cover
+## The pytest suite: what it covers
 
 One file per module in `engine_backend/`, `host/`, and `mcp_servers/`, plus the suites
 listed below. All of it runs against `EngineMerchant`/`EngineStorefront` over a real,
@@ -25,8 +25,11 @@ engine, and never a model.
 - The `stage_*` / `apply_change` pipeline end to end: staging, guardrail re-check at
   apply time, the HTTP route's two-layer approval handoff, single-use operator-bound
   approval, restart persistence, cross-process single-claim and target-lease behavior,
-  duplicate-apply and same-target concurrency, stale-preview refusal, explicit reconciliation state for
-  ambiguous post-dispatch failures, the direct-SQL write fallbacks, and the structured
+  duplicate-apply and same-target concurrency, immutable proposal-digest verification,
+  stale-preview refusal, observed-state reconciliation for ambiguous post-dispatch
+  failures, timeout-protected recovery of a crashed worker's `applying` claim, the
+  single-owner reconciliation claim and its failure recovery, the append-only approval
+  event history, the direct-SQL write fallbacks, and the structured
   `Evidence` (`kind`/`id`) a change persists (`tests/test_host_evidence.py`,
   `tests/test_staging.py`, `tests/test_merchant_writes.py`,
   `tests/test_store_multiprocess.py`).
@@ -50,6 +53,8 @@ engine, and never a model.
   client that never calls the expected tool — confirming the check actually fails when
   it should, rather than passing vacuously.
 - The Next.js builds for `web/storefront` and `web/portal` (`tests/test_web_build.py`).
+- The opt-in production JWT boundary: issuer, audience, expiry, roles/scopes, store
+  tenancy, customer provisioning, and token-subject/session binding (`tests/test_auth.py`).
 
 ## `scripts/tour.py`: a keyless end-to-end check, not a substitute for a live eval
 
@@ -176,6 +181,12 @@ rerun with a key. See `evals/graders.py` and `evals/cases.py` for the harness/gr
 the original run also surfaced.
 
 ## Live MCP run, 2026-09-03
+
+**Historical surface, retained as the evidence for a fixed design flaw.** This run used
+the then-present `host_approve` MCP tool. That tool has since been removed: the current
+18-tool merchant surface cannot record approval, and an operator must use the separate
+host route or an equivalent trusted integration. The transcript below is intentionally
+not rewritten as though the old result happened on today's interface.
 
 The two MCP servers (`docs/mcp.md`) had never been driven by a model before this: all
 prior live runs exercised the Messages API host, not `mcp_servers/shopping.py` or
