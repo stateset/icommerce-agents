@@ -48,6 +48,19 @@ def test_jwt_mode_fails_closed_when_verifier_configuration_is_incomplete(tmp_pat
             str(tmp_path / "other.db"),
             _config(jwks_url="https://identity.example.test/jwks.json"),
         )
+    with pytest.raises(ValueError, match="HTTPS"):
+        create_app(
+            str(tmp_path / "insecure.db"),
+            _config(hs256_secret=None, jwks_url="http://identity.example.test/jwks.json"),
+        )
+    with pytest.raises(ValueError, match="32 bytes"):
+        create_app(str(tmp_path / "weak.db"), _config(hs256_secret="too-short"))
+
+
+def test_host_rejects_unreasonably_short_session_ttl(tmp_path, monkeypatch):
+    monkeypatch.setenv("ICOMMERCE_SESSION_TTL_SECONDS", "59")
+    with pytest.raises(ValueError, match="session TTL"):
+        create_app(str(tmp_path / "store.db"))
 
 
 def test_jwt_mode_rejects_missing_expired_and_wrong_audience_tokens(tmp_path):
@@ -66,6 +79,20 @@ def test_jwt_mode_rejects_missing_expired_and_wrong_audience_tokens(tmp_path):
     assert client.post("/shopping/session", headers=_bearer(wrong_audience)).status_code == 401
 
 
+def test_host_adds_correlation_and_security_headers_without_reflecting_bad_ids(tmp_path):
+    client = TestClient(create_app(str(tmp_path / "store.db")))
+    response = client.get("/healthz", headers={"X-Request-Id": "release:check-7"})
+    assert response.headers["x-request-id"] == "release:check-7"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["x-frame-options"] == "DENY"
+
+    invalid = client.get("/healthz", headers={"X-Request-Id": "not valid value"})
+    assert invalid.headers["x-request-id"] != "not valid value"
+    assert len(invalid.headers["x-request-id"]) == 32
+
+
 def test_verified_customer_can_only_open_and_use_a_shopping_session(tmp_path):
     client = TestClient(create_app(str(tmp_path / "store.db"), _config()))
     token = _token(roles=["customer"], email="rowan@example.invalid")
@@ -75,6 +102,41 @@ def test_verified_customer_can_only_open_and_use_a_shopping_session(tmp_path):
     headers["X-Session-Id"] = opened.json()["session_id"]
     assert client.get("/shopping/cart", headers=headers).status_code == 200
     assert client.post("/merchant/session", headers=_bearer(token)).status_code == 403
+
+
+def test_authenticated_checkout_requires_a_validated_shipping_address(tmp_path):
+    client = TestClient(create_app(str(tmp_path / "store.db"), _config()))
+    token = _token(roles=["customer"], email="rowan@example.invalid")
+    headers = _bearer(token)
+    session_id = client.post("/shopping/session", headers=headers).json()["session_id"]
+    headers["X-Session-Id"] = session_id
+    added = client.post(
+        "/shopping/cart/add",
+        headers=headers,
+        json={"product_id": "TENT-RIDGE-GRN", "quantity": 1},
+    )
+    assert added.status_code == 200
+    missing = client.post("/shopping/checkout", headers=headers)
+    assert missing.status_code == 422
+    assert missing.json()["detail"] == "shipping_address is required for authenticated checkout"
+
+    checkout = client.post(
+        "/shopping/checkout",
+        headers=headers,
+        json={
+            "shipping_address": {
+                "first_name": "Rowan",
+                "last_name": "Quinn",
+                "line1": "42 Cedar Street",
+                "city": "Vancouver",
+                "state": "BC",
+                "postal_code": "V6B 1A1",
+                "country": "CA",
+            }
+        },
+    )
+    assert checkout.status_code == 200
+    assert checkout.json()["receipt"]["sealed"] is True
 
 
 def test_verified_merchant_is_tenant_scoped_and_becomes_the_operator(tmp_path):

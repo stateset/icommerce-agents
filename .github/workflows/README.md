@@ -7,6 +7,13 @@ The workflow has read-only repository permissions, cancels superseded runs on th
 ref, disables persisted checkout credentials, and pins every GitHub-authored action to
 an immutable full commit SHA (the adjacent comment records the reviewed release tag).
 
+`live-evals.yml` is intentionally separate from deterministic CI. It runs weekly and
+on manual dispatch through the protected `live-evals` GitHub environment, requires an
+`ANTHROPIC_API_KEY`, and executes all six behavioral cases three times. Its preflight
+fails if the secret is absent, so a skipped no-key run cannot look like evidence that a
+model passed. Configure `ANTHROPIC_WORKSPACE_ID` in the same environment when the key is
+identity-linked. These runs are billable and may vary as hosted model behavior changes.
+
 ## `python`
 
 Checks out the repo with `submodules: recursive` (`vendor/commerce-agents` is a git
@@ -58,13 +65,13 @@ its unreachable-API fallback. Building this check found that the host had no COR
 middleware, so neither web app could read a response from it in a real browser at all;
 `host/app.py` now allows `localhost:3000`/`:3100`.
 
-## What CI does not cover
+## What required CI does not cover
 
-No job exercises a live model turn or runs an eval suite — both need `ANTHROPIC_API_KEY`,
-and CI has none. `pytest`, `scripts/check.py`, `scripts/denials.py`, and
+The required push/pull-request jobs do not exercise a live model turn; they have no
+`ANTHROPIC_API_KEY`. `pytest`, `scripts/check.py`, `scripts/denials.py`, and
 `scripts/tour.py` all run against the deterministic engine and agent layers without ever
 calling out to a model, so a green run proves the agent-layer gates, the engine's own
 transactional refusals, the storefront/portal builds, and (via the headless check) that
 both web apps render live engine state correctly — not that a live model chooses the
-right tool calls. See `docs/testing.md` for the full account of what the suite does and
-does not prove.
+right tool calls. The separate `live-evals.yml` workflow supplies that non-deterministic
+signal. See `docs/testing.md` for the full account of what each suite proves.

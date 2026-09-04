@@ -94,6 +94,19 @@ def test_a_session_response_carries_no_identifying_field(tmp_path):
     assert not identifying & set(merchant_body)
 
 
+def test_session_end_revokes_the_binding_and_role_state(tmp_path):
+    c = TestClient(create_app(str(tmp_path / "store.db")))
+    shopping = {"X-Session-Id": c.post("/shopping/session").json()["session_id"]}
+    merchant = {"X-Session-Id": c.post("/merchant/session").json()["session_id"]}
+
+    assert c.post("/shopping/session/end", headers=shopping).json() == {"status": "ended"}
+    assert c.get("/shopping/cart", headers=shopping).status_code == 401
+    assert c.post("/shopping/session/end", headers=shopping).status_code == 401
+
+    assert c.post("/merchant/session/end", headers=merchant).json() == {"status": "ended"}
+    assert c.get("/merchant/changes", headers=merchant).status_code == 401
+
+
 def test_routes_reject_a_missing_or_unknown_session_id(tmp_path):
     c = client(tmp_path)
     assert c.post("/shopping/cart/add", json={"product_id": "x", "quantity": 1}).status_code == 401

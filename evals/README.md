@@ -3,9 +3,11 @@
 **Run live against `claude-sonnet-5` on 2026-09-03: 4/6.** The two still-failing cases
 are genuine model-behavior findings, left failing deliberately -- see "Live run,
 2026-09-03" below and `docs/testing.md`. No `ANTHROPIC_API_KEY` exists on this machine or
-in CI by default, so day-to-day test and CI runs still exercise only hand-built
-transcripts and the no-key skip path; the live run above was a one-off with a key set
-locally.
+in required pull-request CI by default, so day-to-day tests still exercise only
+hand-built transcripts and the no-key skip path. The separate protected `Live Claude
+evals` workflow runs weekly and on manual dispatch when its environment secret is
+configured; the dated result above remains the last recorded run until a newer result
+is documented.
 
 ## Why this exists
 

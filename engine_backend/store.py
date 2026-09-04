@@ -46,6 +46,7 @@ class PrincipalBinding(BaseModel):
     kind: Literal["customer", "operator"]
     store_id: str
     authenticated_subject: str | None = None
+    expires_at: datetime | None = None
 
 
 class EngineStore:
@@ -1146,6 +1147,7 @@ class EngineStore:
         kind: Literal["customer", "operator"],
         *,
         authenticated_subject: str | None = None,
+        expires_at: datetime | None = None,
     ) -> PrincipalBinding:
         binding = PrincipalBinding(
             session_id=session_id,
@@ -1153,9 +1155,18 @@ class EngineStore:
             kind=kind,
             store_id=self.store_id,
             authenticated_subject=authenticated_subject,
+            expires_at=expires_at,
         )
         self._bindings[session_id] = binding
         return binding
 
     def binding(self, session_id: str) -> PrincipalBinding:
-        return self._bindings[session_id]
+        binding = self._bindings[session_id]
+        if binding.expires_at is not None and binding.expires_at <= datetime.now(UTC):
+            del self._bindings[session_id]
+            raise KeyError(session_id)
+        return binding
+
+    def unbind(self, session_id: str) -> None:
+        """Revoke an in-process session binding; missing ids are already revoked."""
+        self._bindings.pop(session_id, None)

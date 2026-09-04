@@ -59,27 +59,28 @@ enabled commands one at a time:
 |---|---|---|
 | `inventory.item.create` | `engine_backend/apply.py` (restock of a SKU with no inventory item) | **Yes** — an applied, approved staged change reaches it |
 | `checkout.commit` | `host/app.py`'s `POST /shopping/checkout` | **Yes** — a human click on the host route |
-| `payments.create_refund` | `scripts/denials.py`, `tests/test_kernel.py` | No — script and test only |
+| `payments.create_refund` | `host/app.py`'s digest-bound operator refund routes; also `scripts/denials.py` and `tests/test_kernel.py` | **Yes** — an authenticated human operator, never an agent tool |
 | `payments.create` | `tests/test_kernel.py` | No — test only |
 | `products.create` | nowhere | No — no code path issues it as a kernel command at all |
 
-The bottom three are the honest part of this section. There is no host route and no
-agent tool in this repo that issues a refund: `host/app.py` has no refund endpoint, and
-no `MerchantBackend`/`StorefrontBackend` method calls `payments.create_refund`. Nothing
-issues `payments.create` outside `tests/test_kernel.py`, which uses it as the simplest
+The bottom two are the honest part of this section. No agent tool issues a refund, but
+the host now provides a human-only preview/apply pair: preview canonicalizes the exact
+payment and amount into a SHA-256 digest, and apply requires the authenticated operator
+to echo that digest before `payments.create_refund` runs. Nothing issues
+`payments.create` outside `tests/test_kernel.py`, which uses it as the simplest
 governed command to assert a sealed receipt against. And nothing issues `products.create`
 as a kernel command at all — `engine_backend/seed.py` creates the seeded catalog through
 `commerce.products.create` on the binding, which is an ungoverned write like every other
 binding call in this repo, and does not pass through the policy.
 
-So two of the five grants are policy with no code path behind them, and a third is
-exercised only by a script and a test. They are kept in `config/kernel-policy.json`
+So one of the five grants has no code path behind it and another is exercised only by a
+test. They are kept in `config/kernel-policy.json`
 because the policy file is this deployment's declared subset of the engine's governed
 set, and the point this document exists to make is precisely the gap between what the
 engine governs and what a chat turn can reach — a policy trimmed to only the reachable
-commands would state the smaller claim by hiding the larger one. Do not infer a refund
-flow, a payment flow, or a product-creation flow from their presence in the policy or in
-the denial demo: this repo shows those commands are governed, not that they are reachable.
+commands would state the smaller claim by hiding the larger one. Do not infer a general
+payment or product-creation flow from their presence in the policy: the refund workflow
+is deliberately narrower and remains outside Claude's capability surface.
 `tests/test_kernel.py` fails if a command in the policy is not accounted for in this
 table, so a grant added later cannot go undisclosed.
 
@@ -107,7 +108,7 @@ this stack stops an unreviewed merchandising write.
 | Apply a listing content update | same as above | none — `write_merchandising` custom object; direct SQL for `description` | activity-log id |
 | Apply a promotion | same as above | none — direct SQL price update(s) + `promotion` custom object | activity-log id |
 | Apply a campaign | same as above | none — `campaign` custom object | activity-log id |
-| Refund | (issued only as a governed command — no tool in this repo issues a refund directly) | `payments.create_refund` (`requires_approval: true` in policy) | sealed kernel receipt, or an `agent-layer: blocked` outcome if attempted without approval evidence |
+| Refund | authenticated human operator route; exact payment/amount preview bound to an echoed SHA-256 digest; no agent or MCP tool can issue it | `payments.create_refund` (`requires_approval: true` in policy) | sealed kernel receipt, including sealed transactional refusals such as `commerce.refund.exceeds_captured` |
 
 A "sealed kernel receipt" means `Receipt.sealed is True` and `Receipt.status ==
 "succeeded"` — parsed from the engine's own JSON, not synthesized locally
@@ -116,6 +117,10 @@ A "sealed kernel receipt" means `Receipt.sealed is True` and `Receipt.status ==
 nothing about whether the engine itself checked it — because for these writes, it did
 not. A `blocked` outcome is `ToolOutcome.blocked` naming the gate that held the call;
 the engine is never reached.
+
+Host-issued checkout and refund commands also carry the validated `X-Request-Id` as
+their kernel-envelope `correlation_id`. That joins request logs to the engine command
+without putting a session id, bearer token, customer id, or request body into logs.
 
 ## Two things the binding does not expose, and why the workaround is sound
 

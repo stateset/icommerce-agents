@@ -3,6 +3,7 @@ import os
 import sqlite3
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -62,6 +63,19 @@ def test_binding_is_server_held(store):
     assert store.binding("sess-1").subject_id == "cust-9"
     with pytest.raises(KeyError):
         store.binding("sess-unknown")
+
+
+def test_expired_binding_is_rejected_and_removed(store):
+    store.bind(
+        "expired",
+        "cust-9",
+        "customer",
+        expires_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    with pytest.raises(KeyError):
+        store.binding("expired")
+    with pytest.raises(KeyError):
+        store.binding("expired")
 
 
 def test_legacy_approval_ledger_is_upgraded_without_losing_records(tmp_path):

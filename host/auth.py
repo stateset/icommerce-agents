@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import jwt
 
@@ -73,7 +74,17 @@ class Authenticator:
         if bool(config.jwks_url) == bool(config.hs256_secret):
             raise ValueError("JWT auth requires exactly one of JWKS URL or HS256 secret")
         if config.jwks_url:
+            parsed = urlparse(config.jwks_url)
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+            ):
+                raise ValueError("JWT JWKS URL must be an HTTPS URL without userinfo")
             self._jwks = jwt.PyJWKClient(config.jwks_url)
+        elif config.hs256_secret is not None and len(config.hs256_secret.encode()) < 32:
+            raise ValueError("JWT HS256 secret must be at least 32 bytes")
 
     def authenticate(self, authorization: str | None) -> Identity | None:
         if self.config.mode == "demo":

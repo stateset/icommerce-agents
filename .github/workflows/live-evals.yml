@@ -1,0 +1,47 @@
+name: Live Claude evals
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly rather than per-push: these calls are billable and test model behavior,
+    # not deterministic repository code.
+    - cron: "17 9 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-claude-evals
+  cancel-in-progress: false
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: live-evals
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Require the protected live-eval credential
+        run: test -n "$ANTHROPIC_API_KEY"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run each behavioral evaluation three times
+        run: |
+          for repetition in 1 2 3; do
+            echo "Live evaluation repetition $repetition of 3"
+            python -m evals.run
+          done

@@ -53,6 +53,7 @@ and `GET /merchant/changes`.
   merchant's capped read-only `SELECT` surface), `staging.py`, `apply.py` (the five-kind
   apply dispatch, the only place live state is mutated), `reconciliation.py` (read-only
   comparison of ambiguous outcomes with the approved before/after state),
+  `refunds.py` (canonical digest-bound refund previews for the human operator route),
   `custom_objects.py` (the one
   shape this repo stores in the engine's custom objects), `money.py`, `kernel.py`,
   `store.py`, `seed.py`. `docs/mapping.md` is the method-by-method map of what each read
@@ -62,7 +63,8 @@ and `GET /merchant/changes`.
   the kernel checks every governed command against; never model input.
 - `host/` — the FastAPI host: one engine store, both agents, demo or verified JWT
   identity, token-subject session binding, checkout, out-of-band merchant approval,
-  and observed-state reconciliation routes.
+  observed-state reconciliation routes, request correlation, and deterministic
+  last-mile protection for the two failures discovered by live evaluation.
 - `mcp_servers/` — `shopping.py` and `merchant.py`, the two MCP servers over the same
   backends and gates as the host.
 - `web/storefront/` and `web/portal/` — Next.js chat UIs against the host's
@@ -107,14 +109,24 @@ the honest account of what the test suite proves and what it does not — read i
 trusting a green CI run to mean more than "the code, not the agent's behavior, is
 correct."
 
+The Messages API host buffers model-authored text until each turn completes while
+continuing to stream tool and UI events. `host/response_policy.py` then closes the two
+specific historical eval failures at the display boundary: a successful `stage_*`
+result cannot be affirmatively described as applied, and a medical/allergy request
+cannot be shown without a qualified-professional referral. If text is rewritten, the
+stored conversation copy is rewritten too, so the next turn does not inherit the false
+claim. This is a narrow deterministic backstop, not a general truth checker and not a
+claim that raw model behavior now passes the eval suite.
+
 ## Where the interfaces are
 
-- `POST /shopping/session`, `POST /shopping/chat`, `POST /shopping/cart/add`,
+- `POST /shopping/session`, `POST /shopping/session/end`, `POST /shopping/chat`, `POST /shopping/cart/add`,
   `POST /shopping/checkout`, `GET /shopping/cart`, `GET /shopping/orders`,
-  `POST /merchant/session`, `POST /merchant/chat`, `POST /merchant/changes/{id}/approve`,
+  `POST /merchant/session`, `POST /merchant/session/end`, `POST /merchant/chat`, `POST /merchant/changes/{id}/approve`,
+  `POST /merchant/refunds/preview`, `POST /merchant/refunds`,
   `GET|POST /merchant/changes/{id}/reconciliation`,
   `POST /merchant/changes/{id}/reconciliation/start`, `GET /merchant/changes`,
-  `GET /capabilities`, `GET /healthz`, `GET /readyz` — `host/app.py`. The commerce `GET` routes are
+  `GET /capabilities`, `GET /healthz`, `GET /readyz`, authenticated opt-in `GET /metrics` — `host/app.py`. The commerce `GET` routes are
   reads behind the same session gate as their role's other routes; `/capabilities` and
   `/healthz` are intentionally public. `GET /shopping/cart` and
   `GET /merchant/changes` are session-scoped,
@@ -133,8 +145,9 @@ Every write in this repo goes through the agent layer's gates (`shopping_agent.g
 *also* checked by the engine's own kernel, and no merchandising write is one of them.
 
 The engine governs 26 of its 474 mutations, and they are the transaction spine.
-This deployment enables five of those 26 in `config/kernel-policy.json`; two of the five
-have no code path here, which `docs/enforcement.md` names rather than leaves implied.
+This deployment enables five of those 26 in `config/kernel-policy.json`; one has no code
+path here and another is test-only, which `docs/enforcement.md` names rather than leaves
+implied.
 That document is the full account — which layer stops which write, what evidence comes
 back, and the reason a merchant agent editing listings and prices has its agent layer
 and nothing beneath it.

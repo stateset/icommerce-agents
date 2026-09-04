@@ -71,6 +71,43 @@ async def test_a_non_kernel_exception_propagates_rather_than_becoming_a_receipt(
         )
 
 
+async def test_request_trace_fields_are_carried_into_the_kernel_envelope(
+    kernel, store, monkeypatch
+):
+    captured = {}
+
+    async def capture(_session_key, body):
+        class CommerceStub:
+            def execute_kernel_command(self, command_json, _policy_json):
+                captured.update(json.loads(command_json))
+                return json.dumps(
+                    {
+                        "receipt_id": "receipt-trace",
+                        "command_id": captured["command_id"],
+                        "command_type": captured["command_type"],
+                        "status": "succeeded",
+                        "idempotency_key": captured["idempotency_key"],
+                        "sealed": True,
+                    }
+                )
+
+        return body(CommerceStub())
+
+    monkeypatch.setattr(store, "write", capture)
+    receipt = await kernel.execute(
+        "payments.create",
+        {"amount": "1.00", "currency": "USD", "payment_method": "credit_card"},
+        idempotency_key="trace-payment-1",
+        correlation_id="request-123",
+        causation_id="change-456",
+        trace_id="trace-789",
+    )
+    assert receipt.ok
+    assert captured["correlation_id"] == "request-123"
+    assert captured["causation_id"] == "change-456"
+    assert captured["trace_id"] == "trace-789"
+
+
 async def test_an_over_refund_is_refused_even_with_approval(kernel, store):
     payment = store.commerce.payments.list()[0]
     receipt = await kernel.execute(

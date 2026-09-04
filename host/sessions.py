@@ -53,3 +53,7 @@ class SessionRegistry[StateT: BaseModel]:
             # cart-only session that never started a chat turn. Give it one lazily
             # rather than 401ing a caller who only ever used the direct routes.
             return self.start(session_id)
+
+    def discard(self, session_id: str) -> None:
+        """Forget chat transcript and provenance state when its binding is revoked."""
+        self._sessions.pop(session_id, None)

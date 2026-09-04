@@ -1,12 +1,20 @@
 # Testing — what is covered, and what is not
 
-**No automated test or CI job in this repository runs a live model turn.**
-`scripts/smoke_chat.py` and `evals/` do that only when invoked manually with an
-`ANTHROPIC_API_KEY`; the dated results later on this page are historical manual runs.
-CI therefore proves the code — the agent-layer gates, the engine's own transactional
-refusals, the staging/apply/evidence pipeline, the web builds — and not the behavior of
-the model configured in a later deployment. Read this page before trusting a green run
-to mean more than that.
+**The required pull-request CI does not run a live model turn.** `scripts/smoke_chat.py`
+and local `evals/` runs need an `ANTHROPIC_API_KEY`; the separate scheduled/manual live
+workflow is a behavioral signal, not a deterministic merge gate. Required CI therefore
+proves the code — the agent-layer gates, the engine's transactional refusals, the
+staging/apply/evidence pipeline, and the web builds — rather than the behavior of the
+model configured in a later deployment. Read this page before trusting one green run to
+mean more than that.
+
+The deterministic pull-request workflow still makes no paid model calls. A separate
+`Live Claude evals` workflow runs the six cases three times each on a weekly schedule
+and on manual dispatch when the protected `live-evals` environment has an
+`ANTHROPIC_API_KEY`. A missing credential fails its preflight rather than producing a
+misleading green skip. This workflow measures raw agent behavior; the HTTP host's
+last-mile response policy is tested separately and must not be used to grade away an
+underlying model regression.
 
 ## The pytest suite: what it covers
 
@@ -22,6 +30,9 @@ engine, and never a model.
 - The engine-layer kernel check on the five commands this deployment governs
   (`config/kernel-policy.json`), including the over-refund rejection inside the
   transaction.
+- The human-only refund workflow: exact-decimal preview, store/payment/amount proposal
+  digest, tamper rejection, authenticated merchant-session boundary, successful sealed
+  receipt, and the engine's sealed over-refund refusal (`tests/test_refunds.py`).
 - The `stage_*` / `apply_change` pipeline end to end: staging, guardrail re-check at
   apply time, the HTTP route's two-layer approval handoff, single-use operator-bound
   approval, restart persistence, cross-process single-claim and target-lease behavior,
@@ -55,6 +66,16 @@ engine, and never a model.
 - The Next.js builds for `web/storefront` and `web/portal` (`tests/test_web_build.py`).
 - The opt-in production JWT boundary: issuer, audience, expiry, roles/scopes, store
   tenancy, customer provisioning, and token-subject/session binding (`tests/test_auth.py`).
+- The last-mile host response boundary: affirmative claims that a merely staged change
+  was applied are replaced before display, medical/allergy turns receive a qualified
+  referral when the model omitted one, and rewritten text replaces the stored assistant
+  copy used by later turns (`tests/test_response_policy.py`).
+- Request correlation and secure response headers, including rejection rather than
+  reflection of malformed caller-provided request ids (`tests/test_auth.py`).
+- Explicit shopping and merchant session termination, which revokes both the principal
+  binding and its in-memory transcript/provenance state (`tests/test_host.py`).
+- Disabled-by-default, separately authenticated Prometheus metrics with route-template
+  labels and no principal/session identifiers (`tests/test_metrics.py`).
 
 ## `scripts/tour.py`: a keyless end-to-end check, not a substitute for a live eval
 

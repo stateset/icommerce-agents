@@ -19,17 +19,20 @@ Every other route reads it back from ``X-Session-Id``.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import secrets
+import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
 
 from commerce_common.streaming import AgentEvent, to_sse
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from merchant_agent.changes import ChangeNotApplicable
 from merchant_agent.types import (
     ActorKind,
@@ -44,10 +47,10 @@ from shopping_agent.types import ShoppingSessionContext, ShoppingSessionState
 from shopping_agent_runtime import ShoppingAgent
 from stateset_embedded import CartAddress
 
-from engine_backend import SKILLS_DIR, staging
+from engine_backend import SKILLS_DIR, refunds, staging
 from engine_backend.agent_config import merchant_agent_config, shopping_agent_config
 from engine_backend.custom_objects import list_payloads
-from engine_backend.kernel import KernelClient
+from engine_backend.kernel import KernelClient, approval_evidence
 from engine_backend.merchant import EngineMerchant
 from engine_backend.reconciliation import assess as assess_reconciliation
 from engine_backend.seed import seed_store
@@ -57,12 +60,20 @@ from engine_backend.storefront import EngineStorefront
 
 from .anthropic_client import build_anthropic_client
 from .auth import AuthConfig, AuthenticationError, Authenticator, Identity
+from .metrics import HostMetrics
+from .response_policy import TurnResponsePolicy, replace_latest_assistant_text
 from .sessions import SessionRegistry
 
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 
 _ROWAN_EMAIL = "rowan@example.invalid"
 _OPERATOR_ID = "user:acme-operator"
+_REQUEST_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-")
+logger = logging.getLogger(__name__)
+
+
+def _valid_request_id(value: str) -> bool:
+    return 1 <= len(value) <= 128 and all(char in _REQUEST_ID_CHARS for char in value)
 
 
 class ChatTurnRequest(BaseModel):
@@ -74,6 +85,33 @@ class CartAddRequest(BaseModel):
     # This direct UI route bypasses the shopping executor, so carry its default
     # per-item quantity boundary at the HTTP edge too.
     quantity: int = Field(default=1, ge=1, le=24)
+
+
+class ShippingAddressRequest(BaseModel):
+    first_name: str = Field(min_length=1, max_length=100)
+    last_name: str = Field(min_length=1, max_length=100)
+    company: str | None = Field(default=None, max_length=200)
+    line1: str = Field(min_length=1, max_length=200)
+    line2: str | None = Field(default=None, max_length=200)
+    city: str = Field(min_length=1, max_length=120)
+    state: str = Field(min_length=1, max_length=120)
+    postal_code: str = Field(min_length=1, max_length=32)
+    country: str = Field(pattern=r"^[A-Z]{2}$")
+    phone: str | None = Field(default=None, max_length=40)
+
+
+class CheckoutRequest(BaseModel):
+    shipping_address: ShippingAddressRequest | None = None
+
+
+class RefundPreviewRequest(BaseModel):
+    payment_id: str = Field(min_length=1, max_length=200)
+    amount: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
+
+
+class RefundApplyRequest(RefundPreviewRequest):
+    proposal_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    idempotency_key: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
 
 
 class ReconciliationRequest(BaseModel):
@@ -141,6 +179,9 @@ def create_app(
     )
     if stale_apply_seconds < 1:
         raise ValueError("stale apply recovery threshold must be at least one second")
+    session_ttl_seconds = int(os.getenv("ICOMMERCE_SESSION_TTL_SECONDS", "28800"))
+    if session_ttl_seconds < 60:
+        raise ValueError("session TTL must be at least 60 seconds")
 
     anthropic_client = build_anthropic_client()
     shopping_agent = ShoppingAgent(
@@ -158,6 +199,10 @@ def create_app(
 
     shopping_sessions: SessionRegistry[ShoppingSessionState] = SessionRegistry(ShoppingSessionState)
     merchant_sessions: SessionRegistry[MerchantSessionState] = SessionRegistry(MerchantSessionState)
+    metrics = HostMetrics()
+    metrics_token = os.getenv("ICOMMERCE_METRICS_TOKEN")
+    if metrics_token is not None and len(metrics_token.encode()) < 32:
+        raise ValueError("metrics token must be at least 32 bytes")
 
     app = FastAPI(title="StateSet iCommerce agents host")
 
@@ -230,6 +275,42 @@ def create_app(
         allow_headers=["Authorization", "Content-Type", "X-Session-Id"],
     )
 
+    @app.middleware("http")
+    async def correlate_and_secure(request: Request, call_next):
+        """Attach a non-secret correlation id and safe API response defaults."""
+        supplied = request.headers.get("X-Request-Id", "")
+        request_id = supplied if _valid_request_id(supplied) else secrets.token_hex(16)
+        request.state.request_id = request_id
+        started = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            logger.exception(
+                "request failed method=%s path=%s request_id=%s",
+                request.method,
+                request.url.path,
+                request_id,
+            )
+            raise
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        route = request.scope.get("route")
+        route_path = getattr(route, "path", "unmatched")
+        metrics.request(request.method, route_path, response.status_code)
+        response.headers["X-Request-Id"] = request_id
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Frame-Options"] = "DENY"
+        logger.info(
+            "request completed method=%s path=%s status=%d elapsed_ms=%.1f request_id=%s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed_ms,
+            request_id,
+        )
+        return response
+
     # -- Health -----------------------------------------------------------------
 
     @app.get("/healthz")
@@ -244,6 +325,21 @@ def create_app(
         except Exception as error:
             raise HTTPException(status_code=503, detail="engine store is unavailable") from error
         return {"status": "ready"}
+
+    @app.get("/metrics")
+    async def prometheus_metrics(request: Request) -> PlainTextResponse:
+        """Low-cardinality metrics, disabled until a dedicated token is configured."""
+        if not metrics_token:
+            raise HTTPException(status_code=404, detail="metrics are disabled")
+        supplied = request.headers.get("Authorization", "")
+        expected = f"Bearer {metrics_token}"
+        if not secrets.compare_digest(supplied, expected):
+            raise HTTPException(
+                status_code=401,
+                detail="metrics authentication required",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return PlainTextResponse(metrics.render(), media_type="text/plain; version=0.0.4")
 
     # -- Bindings -----------------------------------------------------------------
 
@@ -299,6 +395,7 @@ def create_app(
             customer.id,
             "customer",
             authenticated_subject=identity.subject if identity else None,
+            expires_at=datetime.now(UTC) + timedelta(seconds=session_ttl_seconds),
         )
         shopping_sessions.start(session_id)
         return {"session_id": session_id}
@@ -322,15 +419,36 @@ def create_app(
             operator,
             "operator",
             authenticated_subject=identity.subject if identity else None,
+            expires_at=datetime.now(UTC) + timedelta(seconds=session_ttl_seconds),
         )
         merchant_sessions.start(session_id)
         return {"session_id": session_id}
+
+    @app.post("/shopping/session/end")
+    async def end_shopping_session(
+        x_session_id: str | None = Header(default=None),
+    ) -> dict[str, str]:
+        session = _bound_shopping_context(x_session_id)
+        shopping_sessions.discard(session.session_id)
+        store.unbind(session.session_id)
+        return {"status": "ended"}
+
+    @app.post("/merchant/session/end")
+    async def end_merchant_session(
+        x_session_id: str | None = Header(default=None),
+    ) -> dict[str, str]:
+        session = _bound_merchant_context(x_session_id)
+        merchant_sessions.discard(session.session_id)
+        store.unbind(session.session_id)
+        return {"status": "ended"}
 
     # -- Shopping: chat, cart, checkout --------------------------------------------
 
     @app.post("/shopping/chat")
     async def shopping_chat(
-        request: ChatTurnRequest, x_session_id: str | None = Header(default=None)
+        request: ChatTurnRequest,
+        http_request: Request,
+        x_session_id: str | None = Header(default=None),
     ) -> StreamingResponse:
         session = _bound_shopping_context(x_session_id)
         chat = shopping_sessions.require(session.session_id)
@@ -338,8 +456,19 @@ def create_app(
         async def event_stream() -> AsyncIterator[str]:
             async with chat.turn_lock:
                 chat.messages.append({"role": "user", "content": request.message})
+                policy = TurnResponsePolicy("shopping", request.message)
                 async for event in shopping_agent.stream_turn(chat.messages, session, chat.state):
-                    yield to_sse(event)
+                    for checked in policy.accept(event):
+                        yield to_sse(checked)
+                for checked in policy.flush():
+                    yield to_sse(checked)
+                if policy.rewritten:
+                    replace_latest_assistant_text(chat.messages, policy.final_text)
+                    metrics.policy_rewrite("shopping")
+                    logger.warning(
+                        "response policy rewrote role=shopping request_id=%s",
+                        http_request.state.request_id,
+                    )
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -411,14 +540,17 @@ def create_app(
         return {"orders": payload}
 
     @app.post("/shopping/checkout")
-    async def shopping_checkout(x_session_id: str | None = Header(default=None)) -> dict[str, Any]:
+    async def shopping_checkout(
+        http_request: Request,
+        request: CheckoutRequest | None = None,
+        x_session_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
         """The only route that completes an order. Reached by a human click, never by
         the model: no agent tool calls this. Governed by ``checkout.commit``.
 
-        Writes a fixed, fictional placeholder shipping address onto the cart first --
-        a demo stand-in for the address-collection step a real deployment would run
-        before checkout, present only because the engine's checkout-readiness check
-        requires one."""
+        Authenticated deployments must supply a validated shipping address. Demo mode
+        uses a fixed fictional placeholder so the keyless tour can satisfy the engine's
+        checkout-readiness check without collecting personal data."""
         session = _bound_shopping_context(x_session_id)
         binding = store.binding(session.session_id)
         # This session's own cart, not the customer's most recent one: every shopping
@@ -429,34 +561,45 @@ def create_app(
             raise HTTPException(status_code=409, detail="no cart to check out")
         customer = await store.call(lambda c: c.customers.get(binding.subject_id))
 
-        # DEMO PLACEHOLDER: the engine's checkout-readiness check requires a shipping
-        # address on the cart, and this host has no address-collection step yet (a real
-        # deployment collects one from the shopper before checkout). This is a fixed,
-        # unmistakably fictional ACME Supply placeholder standing in for that step --
-        # not a real address, and not one the customer gave -- and exists only to
-        # satisfy the engine's readiness check ahead of ``checkout.commit``.
-        def set_address(c: Any) -> None:
-            c.carts.set_shipping_address(
-                cart_id,
-                CartAddress(
-                    first_name=customer.first_name or "",
-                    last_name=customer.last_name or "",
-                    company=None,
-                    line1="1 Demo Placeholder Way (ACME Supply fictional address)",
-                    line2=None,
-                    city="Fictional",
-                    state="ZZ",
-                    postal_code="00000",
-                    country="US",
-                    phone=None,
-                    email=customer.email,
-                ),
+        supplied_address = request.shipping_address if request is not None else None
+        if authenticator.config.mode == "jwt" and supplied_address is None:
+            raise HTTPException(
+                status_code=422,
+                detail="shipping_address is required for authenticated checkout",
             )
+
+        # The fictional address is deliberately demo-only. Production JWT mode fails
+        # closed above rather than allowing an order to inherit data the shopper never
+        # supplied.
+        address = (
+            CartAddress(email=customer.email, **supplied_address.model_dump())
+            if supplied_address is not None
+            else CartAddress(
+                first_name=customer.first_name or "",
+                last_name=customer.last_name or "",
+                company=None,
+                line1="1 Demo Placeholder Way (ACME Supply fictional address)",
+                line2=None,
+                city="Fictional",
+                state="ZZ",
+                postal_code="00000",
+                country="US",
+                phone=None,
+                email=customer.email,
+            )
+        )
+
+        def set_address(c: Any) -> None:
+            c.carts.set_shipping_address(cart_id, address)
 
         await store.write(session.session_id, set_address)
         receipt = await kernel.execute(
-            "checkout.commit", {"cart_id": cart_id}, idempotency_key=f"checkout-{cart_id}"
+            "checkout.commit",
+            {"cart_id": cart_id},
+            idempotency_key=f"checkout-{cart_id}",
+            correlation_id=http_request.state.request_id,
         )
+        metrics.kernel_command("checkout.commit", receipt.status or "unknown")
         if not receipt.ok:
             raise HTTPException(
                 status_code=422,
@@ -472,7 +615,9 @@ def create_app(
 
     @app.post("/merchant/chat")
     async def merchant_chat(
-        request: ChatTurnRequest, x_session_id: str | None = Header(default=None)
+        request: ChatTurnRequest,
+        http_request: Request,
+        x_session_id: str | None = Header(default=None),
     ) -> StreamingResponse:
         session = _bound_merchant_context(x_session_id)
         chat = merchant_sessions.require(session.session_id)
@@ -480,11 +625,23 @@ def create_app(
         async def event_stream() -> AsyncIterator[str]:
             async with chat.turn_lock:
                 chat.messages.append({"role": "user", "content": request.message})
+                policy = TurnResponsePolicy("merchant", request.message)
                 try:
                     async for event in merchant_agent.stream_turn(
                         chat.messages, session, chat.state
                     ):
-                        yield to_sse(await _with_change_evidence(store, event))
+                        enriched = await _with_change_evidence(store, event)
+                        for checked in policy.accept(enriched):
+                            yield to_sse(checked)
+                    for checked in policy.flush():
+                        yield to_sse(checked)
+                    if policy.rewritten:
+                        replace_latest_assistant_text(chat.messages, policy.final_text)
+                        metrics.policy_rewrite("merchant")
+                        logger.warning(
+                            "response policy rewrote role=merchant request_id=%s",
+                            http_request.state.request_id,
+                        )
                 finally:
                     # The upstream gate and the engine adapter deliberately enforce
                     # approval independently. The backend consumes its mark on an apply
@@ -728,6 +885,68 @@ def create_app(
             changes.append(item)
         changes.sort(key=lambda item: item["created_at"])
         return {"changes": changes}
+
+    # -- Merchant: governed refunds -------------------------------------------------
+
+    @app.post("/merchant/refunds/preview")
+    async def merchant_refund_preview(
+        request: RefundPreviewRequest,
+        x_session_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Build the exact proposal an operator must review; performs no write."""
+        _bound_merchant_context(x_session_id)
+        try:
+            result = await refunds.preview(store, request.payment_id, request.amount)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="payment not found") from error
+        return result.model_dump(mode="json")
+
+    @app.post("/merchant/refunds")
+    async def merchant_refund_apply(
+        request: RefundApplyRequest,
+        http_request: Request,
+        x_session_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Human-only refund path, governed inside the engine transaction.
+
+        No agent or MCP tool reaches this route. The signed HTTP identity supplies the
+        operator, while the echoed proposal digest binds approval to the reviewed
+        payment and exact amount.
+        """
+        session = _bound_merchant_context(x_session_id)
+        try:
+            proposal = await refunds.preview(store, request.payment_id, request.amount)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="payment not found") from error
+        if proposal.proposal_digest != request.proposal_digest:
+            raise HTTPException(status_code=409, detail="refund proposal digest changed")
+        receipt = await kernel.execute(
+            "payments.create_refund",
+            {"payment_id": proposal.payment_id, "amount": proposal.refund_amount},
+            idempotency_key=request.idempotency_key,
+            approval=approval_evidence(
+                f"refund:{proposal.proposal_digest.removeprefix('sha256:')}",
+                session.operator,
+                "payments.create_refund",
+                store.store_id,
+            ),
+            correlation_id=http_request.state.request_id,
+        )
+        metrics.kernel_command("payments.create_refund", receipt.status or "unknown")
+        if not receipt.ok:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error_code": receipt.error_code,
+                    "error_message": receipt.error_message,
+                    "receipt_id": receipt.receipt_id,
+                    "sealed": receipt.sealed,
+                },
+            )
+        return {
+            "proposal": proposal.model_dump(mode="json"),
+            "receipt": receipt.model_dump(mode="json"),
+        }
 
     # -- Capabilities ---------------------------------------------------------------
 

@@ -85,6 +85,10 @@ class KernelClient:
         payload: dict,
         idempotency_key: str,
         approval: dict | None = None,
+        *,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+        trace_id: str | None = None,
     ) -> Receipt:
         bound_approval = None
         if approval is not None:
@@ -105,14 +109,14 @@ class KernelClient:
                 "capabilities": list(self.principal.get("capabilities", [])),
             },
             "store_id": self.store.store_id,
-            "correlation_id": None,
-            "causation_id": None,
+            "correlation_id": correlation_id,
+            "causation_id": causation_id,
             "expected_version": None,
             "policy_version": self.policy.get("version"),
             "approval": bound_approval,
             "authority": None,
             "deadline": None,
-            "trace_id": None,
+            "trace_id": trace_id,
             "mode": "apply",
             "payload": payload,
             "issued_at": _now_iso(),
