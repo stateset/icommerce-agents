@@ -1,7 +1,13 @@
+from datetime import UTC, datetime, timedelta
+
+import jwt
 from fastapi.testclient import TestClient
 
 from engine_backend.store import EngineStore
 from host.app import create_app
+from host.auth import AuthConfig
+
+AUTH_SECRET = "refund-test-secret-long-enough-for-hs256"
 
 
 def _merchant(client: TestClient) -> dict[str, str]:
@@ -110,3 +116,43 @@ def test_refund_routes_require_a_merchant_session_and_validate_money(tmp_path):
         ).status_code
         == 404
     )
+
+
+def test_refund_apply_requires_dedicated_permission_in_jwt_mode(tmp_path):
+    auth = AuthConfig(
+        mode="jwt",
+        issuer="https://identity.example.test",
+        audience="icommerce-host",
+        hs256_secret=AUTH_SECRET,
+    )
+    client = TestClient(create_app(str(tmp_path / "store.db"), auth_config=auth))
+    now = datetime.now(UTC)
+    token = jwt.encode(
+        {
+            "iss": auth.issuer,
+            "aud": auth.audience,
+            "sub": "operator:merchant-only",
+            "iat": now,
+            "exp": now + timedelta(minutes=5),
+            "roles": ["merchant"],
+            "store_id": "store:acme",
+        },
+        AUTH_SECRET,
+        algorithm="HS256",
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+    session = client.post("/merchant/session", headers=headers)
+    headers["X-Session-Id"] = session.json()["session_id"]
+
+    response = client.post(
+        "/merchant/refunds",
+        headers=headers,
+        json={
+            "payment_id": "not-reached",
+            "amount": "10.00",
+            "proposal_digest": "sha256:" + "0" * 64,
+            "idempotency_key": "refund-authz-check",
+        },
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "payment refund access required"

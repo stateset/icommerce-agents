@@ -32,6 +32,9 @@ export ICOMMERCE_STABLECOIN_PAY_TO=0x0000000000000000000000000000000000000000
 export ICOMMERCE_STABLECOIN_QUOTE_TTL_SECONDS=300
 export ICOMMERCE_STABLECOIN_PROCESSING_TIMEOUT_SECONDS=60
 export ICOMMERCE_X402_FACILITATOR_TOKEN=optional-provider-credential
+# Optional: enables the separate human-operated refund surface.
+export ICOMMERCE_STABLECOIN_REFUND_URL=https://treasury.example.com/v1/refunds
+export ICOMMERCE_STABLECOIN_REFUND_TOKEN=treasury-service-credential
 ```
 
 Replace both zero addresses; they only illustrate the required format. The host accepts
@@ -46,6 +49,13 @@ returns safely to `quoted`, while abandoned settlement or order-commit work move
 The reference adapter targets the interoperable x402 `exact` scheme. Confirm the
 facilitator's `/verify` and `/settle` compatibility in testnet before enabling mainnet.
 Do not point a production deployment at a public development facilitator.
+
+Refunds are not an x402 operation. When `ICOMMERCE_STABLECOIN_REFUND_URL` is set, the
+host sends a `stablecoin-refund-v1` JSON request to that HTTPS treasury endpoint with an
+`Idempotency-Key` header. The request binds the refund id, original payment and
+transaction, network, asset, merchant and payer addresses, and atomic amount. The
+adapter must return `{"success":true,"transaction":"0x...","network":"eip155:..."}`
+only after accepting the transfer. Its credential remains server-side.
 
 ## Protocol
 
@@ -91,7 +101,8 @@ and the recovery record for the interval between chain settlement and order crea
 A timeout or malformed response from `/settle`, a negative settlement response, and a
 settlement whose payer/network evidence differs from the quote all fail closed into
 `reconciliation_required`. The automatic path will not call `/settle` again. Operators
-can read the recovery queue at `GET /merchant/stablecoin-payments` and submit externally
+can read recent completed and recovery records at `GET /merchant/stablecoin-payments`
+and submit externally
 verified chain truth to `POST /merchant/stablecoin-payments/{paymentId}/reconcile`. A
 confirmed transaction resumes the idempotent order commit; confirmed non-settlement
 makes the payment terminally failed. Each decision and operator note is kept in the
@@ -114,6 +125,31 @@ cart/order authority and its policy kernel still commits checkout. When the Pyth
 binding exposes native x402 intents, the adapter should dual-write/migrate these records
 into that engine domain rather than silently claiming they are native engine payments.
 
+## Refunds
+
+Only a human merchant session can preview and submit a stablecoin refund. The preview
+route `POST /merchant/stablecoin-refunds/preview` binds the payment and exact amount to
+a SHA-256 proposal. `POST /merchant/stablecoin-refunds` requires that digest and a
+caller-supplied idempotency key plus `payments:refund` or `merchant_admin` authority in
+JWT mode. A database transaction reserves the amount before the
+treasury call, so concurrent requests cannot exceed the original payment and a retry
+cannot initiate a second transfer.
+
+Successful responses include the refund transaction hash. Timeouts, malformed provider
+responses, and process loss during submission become `reconciliation_required`; they
+are never blindly retried. Operators inspect `GET /merchant/stablecoin-refunds` and use
+`POST /merchant/stablecoin-refunds/{refundId}/reconcile` with RPC and treasury evidence.
+The reconciliation route requires `payments:reconcile` or `merchant_admin` in JWT mode.
+Every claim and resolution is retained in append-only refund events.
+`GET /merchant/stablecoin-payments` includes recent completed payments for refund lookup
+as well as ambiguous settlements; the portal offers those ids in its refund review form.
+
+The repository supplies the contract, durable state machine, and HTTP adapter—not a
+custodial signer. A deployment must implement or select the treasury endpoint, protect
+its signing policy, test it on the configured network, and reconcile its accounting.
+`/capabilities` reports stablecoin refunds as `available` only when the endpoint or an
+in-process provider adapter is configured.
+
 ## Deliberate boundaries
 
 - The API is ready for autonomous x402 clients, and the Next.js storefront includes a
@@ -121,9 +157,10 @@ into that engine domain rather than silently claiming they are native engine pay
   configured chain, signs EIP-3009 typed data, and submits the x402 payload. It never
   adds an unknown chain or receives a private key. A deployment must still test the
   wallets and facilitator it chooses to support.
-- Refunds still require a provider/chain-specific stablecoin refund workflow. The
-  existing `payments.create_refund` route demonstrates engine-governed card-like refund
-  policy, but it must not be presented as an on-chain stablecoin refund.
+- The generic refund adapter does not hold keys, choose a custodian, or claim that a
+  provider response has finality. The configured treasury service owns signing,
+  confirmations, sanctions controls, and chain-specific failure handling. A GA release
+  requires externally linked refund rehearsal evidence from that real integration.
 - Quote currency is the engine cart currency. A production deployment should only
   enable this 1:1 rail for a stablecoin/currency pair its treasury policy explicitly
   supports, or add an auditable FX oracle and quote-expiry policy.

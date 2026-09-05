@@ -114,10 +114,36 @@ export interface StablecoinPayment {
   last_error?: string | null;
 }
 
+export interface StablecoinRefund {
+  refund_id: string;
+  payment_id: string;
+  amount: string;
+  state: "submitting" | "completed" | "failed" | "reconciliation_required";
+  transaction_hash?: string | null;
+  last_error?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StablecoinRefundPreview {
+  payment_id: string;
+  order_number?: string | null;
+  captured_amount: string;
+  refund_amount: string;
+  amount_atomic: string;
+  asset: string;
+  network: string;
+  proposal_digest: string;
+}
+
 /** `GET /capabilities` -- whether a model is configured for this deployment. Present
  * or absent only, never valid or invalid. */
 export interface Capabilities {
   assistant: "available" | "unconfigured";
   stablecoin_checkout: "available" | "disabled";
+  stablecoin_refunds:
+    | "available"
+    | "deployment_integration_required"
+    | "disabled";
   direct_checkout: "available" | "disabled";
 }

@@ -20,11 +20,13 @@ export function ChangesPanel({
   changes,
   onRefresh,
   stablecoinAvailable = false,
+  stablecoinRefundsAvailable = false,
   sessionId = null,
 }: {
   changes: Record<string, StagedChange>;
   onRefresh: () => Promise<void>;
   stablecoinAvailable?: boolean;
+  stablecoinRefundsAvailable?: boolean;
   sessionId?: string | null;
 }) {
   const [approving, setApproving] = useState<string | null>(null);
@@ -34,19 +36,27 @@ export function ChangesPanel({
   >({});
   const [resolving, setResolving] = useState<string | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const list = Object.values(changes).sort((a, b) => a.created_at.localeCompare(b.created_at));
+  const list = Object.values(changes).sort((a, b) =>
+    a.created_at.localeCompare(b.created_at),
+  );
 
   async function approve(change: StagedChange) {
     if (!change.proposal_digest) return;
     setApproving(change.change_id);
     setErrors((current) => ({ ...current, [change.change_id]: "" }));
     try {
-      const result = await approveChange(change.change_id, change.proposal_digest);
+      const result = await approveChange(
+        change.change_id,
+        change.proposal_digest,
+      );
       if (result.ok) {
         setApprovedIds((prev) => new Set(prev).add(change.change_id));
         await onRefresh();
       } else {
-        setErrors((current) => ({ ...current, [change.change_id]: result.error }));
+        setErrors((current) => ({
+          ...current,
+          [change.change_id]: result.error,
+        }));
       }
     } finally {
       setApproving(null);
@@ -56,7 +66,10 @@ export function ChangesPanel({
   async function inspect(changeId: string) {
     const result = await fetchReconciliation(changeId);
     if (result.ok) {
-      setReconciliations((current) => ({ ...current, [changeId]: result.data }));
+      setReconciliations((current) => ({
+        ...current,
+        [changeId]: result.data,
+      }));
       setErrors((current) => ({ ...current, [changeId]: "" }));
     } else {
       setErrors((current) => ({ ...current, [changeId]: result.error }));
@@ -68,12 +81,18 @@ export function ChangesPanel({
     setResolving(change.change_id);
     setErrors((current) => ({ ...current, [change.change_id]: "" }));
     try {
-      const result = await startReconciliation(change.change_id, change.proposal_digest);
+      const result = await startReconciliation(
+        change.change_id,
+        change.proposal_digest,
+      );
       if (result.ok) {
         await onRefresh();
         await inspect(change.change_id);
       } else {
-        setErrors((current) => ({ ...current, [change.change_id]: result.error }));
+        setErrors((current) => ({
+          ...current,
+          [change.change_id]: result.error,
+        }));
       }
     } finally {
       setResolving(null);
@@ -88,7 +107,11 @@ export function ChangesPanel({
     setResolving(changeId);
     setErrors((current) => ({ ...current, [changeId]: "" }));
     try {
-      const result = await resolveReconciliation(changeId, detail.proposal_digest, resolution);
+      const result = await resolveReconciliation(
+        changeId,
+        detail.proposal_digest,
+        resolution,
+      );
       if (result.ok) {
         await onRefresh();
       } else {
@@ -105,11 +128,15 @@ export function ChangesPanel({
         <h2>Staged changes</h2>
         <p>Approve here, then ask the assistant to apply it.</p>
       </div>
-      <StablecoinPayments enabled={stablecoinAvailable} sessionId={sessionId} />
+      <StablecoinPayments
+        enabled={stablecoinAvailable}
+        refundsEnabled={stablecoinRefundsAvailable}
+        sessionId={sessionId}
+      />
       {list.length === 0 ? (
         <div className="changes-empty">
-          Nothing staged yet. Ask the assistant to draft a price change, a restock, or a
-          listing update and it will land here.
+          Nothing staged yet. Ask the assistant to draft a price change, a
+          restock, or a listing update and it will land here.
         </div>
       ) : (
         <div className="changes-list">
@@ -120,8 +147,10 @@ export function ChangesPanel({
               approvedIds.has(change.change_id) || controlState === "approved";
             const applying = controlState === "applying";
             const reconciling = controlState === "reconciling";
-            const needsReconciliation = controlState === "reconciliation_required";
-            const approvalBlocked = applying || reconciling || needsReconciliation;
+            const needsReconciliation =
+              controlState === "reconciliation_required";
+            const approvalBlocked =
+              applying || reconciling || needsReconciliation;
             const reconciliation = reconciliations[change.change_id];
             const recoveryAvailable =
               (applying || reconciling) &&
@@ -133,7 +162,10 @@ export function ChangesPanel({
                 <div className="kind">{change.kind.replace(/_/g, " ")}</div>
                 <div className="summary">{change.summary}</div>
                 {change.proposal_digest ? (
-                  <code className="proposal-digest" title={change.proposal_digest}>
+                  <code
+                    className="proposal-digest"
+                    title={change.proposal_digest}
+                  >
                     Reviewed proposal: {change.proposal_digest}
                   </code>
                 ) : null}
@@ -144,12 +176,15 @@ export function ChangesPanel({
                         {item.target} · {item.field}
                       </span>
                       <span>
-                        {formatValue(item.before)} -&gt; {formatValue(item.after)}
+                        {formatValue(item.before)} -&gt;{" "}
+                        {formatValue(item.after)}
                       </span>
                     </div>
                   ))}
                 </div>
-                <span className={`status-tag ${change.status}`}>{change.status}</span>
+                <span className={`status-tag ${change.status}`}>
+                  {change.status}
+                </span>
                 {change.status === "staged" && controlState ? (
                   <span className={`status-tag control-${controlState}`}>
                     {controlState.replace(/_/g, " ")}
@@ -171,26 +206,31 @@ export function ChangesPanel({
                       ? "Resolution in progress"
                       : applying
                         ? "Apply in progress"
-                      : needsReconciliation
-                        ? "Reconciliation required"
-                        : approved
-                      ? "Approved -- apply it via chat"
-                      : approving === change.change_id
-                        ? "Approving..."
-                        : "Approve"}
+                        : needsReconciliation
+                          ? "Reconciliation required"
+                          : approved
+                            ? "Approved -- apply it via chat"
+                            : approving === change.change_id
+                              ? "Approving..."
+                              : "Approve"}
                   </button>
                 ) : null}
                 {change.status === "staged" && approved ? (
                   <p className="apply-hint">
-                    Ask the assistant to apply {change.change_id} to complete the write.
+                    Ask the assistant to apply {change.change_id} to complete
+                    the write.
                   </p>
                 ) : null}
                 {change.status === "staged" && approvalBlocked ? (
-                  <p className={`control-note ${needsReconciliation ? "danger" : ""}`}>
+                  <p
+                    className={`control-note ${needsReconciliation ? "danger" : ""}`}
+                  >
                     {needsReconciliation
                       ? "The write outcome is ambiguous. Inspect live state and the audit log before taking another action."
                       : "Another worker claimed this approval. Reload after the apply finishes; if it remains here after a worker failure, reconcile it before retrying."}
-                    {control?.last_error ? ` Last error: ${control.last_error}` : ""}
+                    {control?.last_error
+                      ? ` Last error: ${control.last_error}`
+                      : ""}
                   </p>
                 ) : null}
                 {needsReconciliation && !reconciliation ? (
@@ -206,7 +246,9 @@ export function ChangesPanel({
                   <button
                     type="button"
                     className="reconcile-btn"
-                    disabled={!recoveryAvailable || resolving === change.change_id}
+                    disabled={
+                      !recoveryAvailable || resolving === change.change_id
+                    }
                     onClick={() => recover(change)}
                   >
                     {recoveryAvailable
@@ -220,24 +262,31 @@ export function ChangesPanel({
                 ) : null}
                 {reconciliation ? (
                   <div className="reconciliation">
-                    <strong>Observed outcome: {reconciliation.assessment.outcome}</strong>
+                    <strong>
+                      Observed outcome: {reconciliation.assessment.outcome}
+                    </strong>
                     {reconciliation.assessment.items.map((item, index) => (
                       <div className="item-line" key={index}>
                         <span>
                           {item.target} · {item.field}
                         </span>
                         <span>
-                          {formatValue(item.observed)} · {item.state.replace(/_/g, " ")}
+                          {formatValue(item.observed)} ·{" "}
+                          {item.state.replace(/_/g, " ")}
                         </span>
                       </div>
                     ))}
                     <details className="approval-history">
                       <summary>Approval history</summary>
                       {reconciliation.events.map((event, index) => (
-                        <div className="history-line" key={event.event_id ?? index}>
+                        <div
+                          className="history-line"
+                          key={event.event_id ?? index}
+                        >
                           <span>{event.event.replace(/_/g, " ")}</span>
                           <span>
-                            {event.operator} · {new Date(event.occurred_at).toLocaleString()}
+                            {event.operator} ·{" "}
+                            {new Date(event.occurred_at).toLocaleString()}
                           </span>
                         </div>
                       ))}
@@ -250,7 +299,11 @@ export function ChangesPanel({
                           reconciliation.assessment.outcome !== "applied"
                         }
                         onClick={() =>
-                          resolve(change.change_id, reconciliation, "confirmed_applied")
+                          resolve(
+                            change.change_id,
+                            reconciliation,
+                            "confirmed_applied",
+                          )
                         }
                       >
                         Confirm fully applied
@@ -259,7 +312,11 @@ export function ChangesPanel({
                         type="button"
                         disabled={resolving === change.change_id}
                         onClick={() =>
-                          resolve(change.change_id, reconciliation, "accepted_current_state")
+                          resolve(
+                            change.change_id,
+                            reconciliation,
+                            "accepted_current_state",
+                          )
                         }
                       >
                         Accept current state
@@ -267,7 +324,9 @@ export function ChangesPanel({
                     </div>
                   </div>
                 ) : null}
-                {change.status === "applied" ? <Evidence entries={change.evidence} /> : null}
+                {change.status === "applied" ? (
+                  <Evidence entries={change.evidence} />
+                ) : null}
                 {errors[change.change_id] ? (
                   <p className="control-note danger" role="alert">
                     {errors[change.change_id]}

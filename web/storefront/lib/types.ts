@@ -138,5 +138,9 @@ export interface OrdersPayload {
 export interface Capabilities {
   assistant: "available" | "unconfigured";
   stablecoin_checkout: "available" | "disabled";
+  stablecoin_refunds:
+    | "available"
+    | "deployment_integration_required"
+    | "disabled";
   direct_checkout: "available" | "disabled";
 }

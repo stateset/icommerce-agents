@@ -4,6 +4,8 @@ import type {
   ReconciliationDetail,
   ReconciliationAssessment,
   StablecoinPayment,
+  StablecoinRefund,
+  StablecoinRefundPreview,
   StagedChange,
 } from "./types";
 
@@ -16,9 +18,14 @@ export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "/api/commerce";
  * with the host's own routes under this prefix. */
 export const api = new AgentApi(API_URL, "/merchant");
 
-export type ControlResult<T> = { ok: true; data: T } | { ok: false; error: string };
+export type ControlResult<T> =
+  | { ok: true; data: T }
+  | { ok: false; error: string };
 
-async function controlRequest<T>(path: string, init: RequestInit): Promise<ControlResult<T>> {
+async function controlRequest<T>(
+  path: string,
+  init: RequestInit,
+): Promise<ControlResult<T>> {
   try {
     const response = await fetch(`${API_URL}/merchant${path}`, init);
     const payload = (await response.json()) as T & { detail?: unknown };
@@ -26,7 +33,10 @@ async function controlRequest<T>(path: string, init: RequestInit): Promise<Contr
       const detail = payload.detail;
       return {
         ok: false,
-        error: typeof detail === "string" ? detail : `Request failed (${response.status})`,
+        error:
+          typeof detail === "string"
+            ? detail
+            : `Request failed (${response.status})`,
       };
     }
     return { ok: true, data: payload };
@@ -52,7 +62,9 @@ export async function healthy(): Promise<boolean> {
  * `healthy()`); never called unless the API already answered `healthy()`. */
 export async function capabilities(): Promise<Capabilities | null> {
   try {
-    const response = await fetch(`${API_URL}/capabilities`, { cache: "no-store" });
+    const response = await fetch(`${API_URL}/capabilities`, {
+      cache: "no-store",
+    });
     if (!response.ok) return null;
     return (await response.json()) as Capabilities;
   } catch {
@@ -122,8 +134,12 @@ export async function resolveReconciliation(
   );
 }
 
-export async function fetchStablecoinPayments(): Promise<StablecoinPayment[] | null> {
-  const data = await api.get<{ payments: StablecoinPayment[] }>("/stablecoin-payments");
+export async function fetchStablecoinPayments(): Promise<
+  StablecoinPayment[] | null
+> {
+  const data = await api.get<{ payments: StablecoinPayment[] }>(
+    "/stablecoin-payments",
+  );
   return data?.payments ?? null;
 }
 
@@ -135,6 +151,65 @@ export async function reconcileStablecoinPayment(
 ): Promise<ControlResult<StablecoinPayment>> {
   return controlRequest<StablecoinPayment>(
     `/stablecoin-payments/${encodeURIComponent(paymentId)}/reconcile`,
+    {
+      method: "POST",
+      headers: api.headers(true),
+      body: JSON.stringify({
+        resolution,
+        note,
+        transaction_hash: transactionHash || null,
+      }),
+    },
+  );
+}
+
+export async function previewStablecoinRefund(
+  paymentId: string,
+  amount: string,
+): Promise<ControlResult<StablecoinRefundPreview>> {
+  return controlRequest<StablecoinRefundPreview>(
+    "/stablecoin-refunds/preview",
+    {
+      method: "POST",
+      headers: api.headers(true),
+      body: JSON.stringify({ payment_id: paymentId, amount }),
+    },
+  );
+}
+
+export async function applyStablecoinRefund(
+  preview: StablecoinRefundPreview,
+  idempotencyKey: string,
+): Promise<ControlResult<StablecoinRefund>> {
+  return controlRequest<StablecoinRefund>("/stablecoin-refunds", {
+    method: "POST",
+    headers: api.headers(true),
+    body: JSON.stringify({
+      payment_id: preview.payment_id,
+      amount: preview.refund_amount,
+      proposal_digest: preview.proposal_digest,
+      idempotency_key: idempotencyKey,
+    }),
+  });
+}
+
+export async function fetchStablecoinRefunds(): Promise<
+  StablecoinRefund[] | null
+> {
+  const data = await api.get<{ refunds: StablecoinRefund[] }>(
+    "/stablecoin-refunds",
+  );
+  return data?.refunds ?? null;
+}
+
+export async function reconcileStablecoinRefund(
+  refundId: string,
+  resolution: "confirmed_refunded" | "confirmed_not_refunded",
+  note: string,
+  transactionHash?: string,
+): Promise<ControlResult<StablecoinRefund>> {
+  return controlRequest<StablecoinRefund>(
+    `/stablecoin-refunds/${encodeURIComponent(refundId)}/reconcile`,
     {
       method: "POST",
       headers: api.headers(true),

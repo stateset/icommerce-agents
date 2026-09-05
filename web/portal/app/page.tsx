@@ -3,17 +3,25 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAgentTurn, useSession } from "web-shared";
 import type { AgentEvent } from "web-shared";
-import { api, capabilities, fetchChanges, healthy, UNREACHABLE } from "../lib/api";
+import {
+  api,
+  capabilities,
+  fetchChanges,
+  healthy,
+  UNREACHABLE,
+} from "../lib/api";
 import type { StagedChange } from "../lib/types";
 import { ChangesPanel } from "./components/ChangesPanel";
 
 export default function PortalPage() {
   const [reachable, setReachable] = useState<boolean | null>(null);
-  const [assistant, setAssistant] = useState<"checking" | "available" | "unconfigured">(
-    "checking",
-  );
+  const [assistant, setAssistant] = useState<
+    "checking" | "available" | "unconfigured"
+  >("checking");
   const [changes, setChanges] = useState<Record<string, StagedChange>>({});
   const [stablecoinAvailable, setStablecoinAvailable] = useState(false);
+  const [stablecoinRefundsAvailable, setStablecoinRefundsAvailable] =
+    useState(false);
   const [input, setInput] = useState("");
   const transcriptRef = useRef<HTMLDivElement>(null);
 
@@ -27,6 +35,9 @@ export default function PortalPage() {
         if (!cancelled) {
           setAssistant(caps?.assistant ?? "unconfigured");
           setStablecoinAvailable(caps?.stablecoin_checkout === "available");
+          setStablecoinRefundsAvailable(
+            caps?.stablecoin_refunds === "available",
+          );
         }
       });
     });
@@ -40,7 +51,9 @@ export default function PortalPage() {
   const refreshChanges = useCallback(async () => {
     const list = await fetchChanges();
     if (!list) return;
-    setChanges(Object.fromEntries(list.map((change) => [change.change_id, change])));
+    setChanges(
+      Object.fromEntries(list.map((change) => [change.change_id, change])),
+    );
   }, []);
 
   // Live store state: fetched as soon as a session exists, independent of whether an
@@ -66,7 +79,9 @@ export default function PortalPage() {
   });
 
   useEffect(() => {
-    transcriptRef.current?.scrollTo({ top: transcriptRef.current.scrollHeight });
+    transcriptRef.current?.scrollTo({
+      top: transcriptRef.current.scrollHeight,
+    });
   }, [turn.items]);
 
   if (reachable === false) {
@@ -76,8 +91,9 @@ export default function PortalPage() {
           <div className="unreachable">
             <strong>API not reachable.</strong>
             <p>
-              Start the host (uvicorn on :8000) and reload this page. The portal needs it for
-              every request -- there is nothing this page can show without it.
+              Start the host (uvicorn on :8000) and reload this page. The portal
+              needs it for every request -- there is nothing this page can show
+              without it.
             </p>
           </div>
         </div>
@@ -99,13 +115,15 @@ export default function PortalPage() {
           <div className="assistant-unavailable">
             <h2>The assistant is unavailable</h2>
             <p>
-              No model is configured for this deployment, so there is no chat here. Set{" "}
-              <code>ANTHROPIC_API_KEY</code> and reload this page to bring the assistant back.
+              No model is configured for this deployment, so there is no chat
+              here. Set <code>ANTHROPIC_API_KEY</code> and reload this page to
+              bring the assistant back.
             </p>
             <p>
-              The staged and applied changes to the right are real writes against the engine,
-              including anything a keyless tour run staged and applied -- each carrying its own
-              sealed kernel receipt or activity-log entry as evidence. Nothing here is a mock.
+              The staged and applied changes to the right are real writes
+              against the engine, including anything a keyless tour run staged
+              and applied -- each carrying its own sealed kernel receipt or
+              activity-log entry as evidence. Nothing here is a mock.
             </p>
           </div>
         </section>
@@ -113,6 +131,7 @@ export default function PortalPage() {
           changes={changes}
           onRefresh={refreshChanges}
           stablecoinAvailable={stablecoinAvailable}
+          stablecoinRefundsAvailable={stablecoinRefundsAvailable}
           sessionId={session.sessionId}
         />
       </main>
@@ -125,8 +144,14 @@ export default function PortalPage() {
         <header className="header">
           <h1>ACME Supply</h1>
           <span className="sub">merchant portal</span>
-          <span className={`status-pill ${reachable === null ? "" : reachable ? "ok" : "down"}`}>
-            {reachable === null ? "checking..." : ready ? "connected" : "starting session..."}
+          <span
+            className={`status-pill ${reachable === null ? "" : reachable ? "ok" : "down"}`}
+          >
+            {reachable === null
+              ? "checking..."
+              : ready
+                ? "connected"
+                : "starting session..."}
           </span>
         </header>
         <div className="transcript" ref={transcriptRef}>
@@ -134,8 +159,8 @@ export default function PortalPage() {
             <div className="empty-state">
               <h2>Ask about the business, or stage a change</h2>
               <p>
-                Try &ldquo;how did revenue do this week&rdquo; or &ldquo;raise the price of
-                SKU-1002 by 10%&rdquo;.
+                Try &ldquo;how did revenue do this week&rdquo; or &ldquo;raise
+                the price of SKU-1002 by 10%&rdquo;.
               </p>
             </div>
           ) : null}
@@ -147,7 +172,8 @@ export default function PortalPage() {
             ) : (
               <div className="msg assistant" key={index}>
                 {item.segments.map((segment, si) => {
-                  if (segment.type === "text") return <span key={si}>{segment.text}</span>;
+                  if (segment.type === "text")
+                    return <span key={si}>{segment.text}</span>;
                   if (segment.type === "error")
                     return (
                       <p key={si} style={{ color: "var(--danger)" }}>
@@ -155,12 +181,17 @@ export default function PortalPage() {
                       </p>
                     );
                   return (
-                    <p key={si} style={{ color: "var(--ink-soft)", fontSize: 12.5 }}>
+                    <p
+                      key={si}
+                      style={{ color: "var(--ink-soft)", fontSize: 12.5 }}
+                    >
                       [{segment.block.component}]
                     </p>
                   );
                 })}
-                {item.activity ? <div className="activity">{item.activity}</div> : null}
+                {item.activity ? (
+                  <div className="activity">{item.activity}</div>
+                ) : null}
               </div>
             ),
           )}
@@ -190,6 +221,7 @@ export default function PortalPage() {
         changes={changes}
         onRefresh={refreshChanges}
         stablecoinAvailable={stablecoinAvailable}
+        stablecoinRefundsAvailable={stablecoinRefundsAvailable}
         sessionId={session.sessionId}
       />
     </main>
