@@ -116,7 +116,7 @@ def test_legacy_approval_ledger_is_upgraded_without_losing_records(tmp_path):
     connection.close()
 
     store = EngineStore(db_path)
-    record = store.approval_record("chg-legacy")
+    record = store.approvals.record_for("chg-legacy")
     assert record["approved_by"] == "operator:7"
     assert record["proposal_digest"] is None
     connection = sqlite3.connect(db_path)
@@ -184,22 +184,22 @@ def test_control_schema_upgrades_version_one_with_refund_ledger(tmp_path):
 
 def test_reconciliation_has_a_single_owner_and_normal_failures_are_retryable(store):
     digest = "sha256:" + "a" * 64
-    store.record_approval("chg-1", "operator:1", digest)
-    claim = store.claim_approval("chg-1", "operator:1", digest, ["sku:1"])
-    store.finish_approval_attempt(
+    store.approvals.record("chg-1", "operator:1", digest)
+    claim = store.approvals.claim("chg-1", "operator:1", digest, ["sku:1"])
+    store.approvals.finish_attempt(
         "chg-1", claim.attempt_id, outcome="reconciliation_required", error="ambiguous"
     )
 
-    store.claim_reconciliation("chg-1", "operator:1", digest, "accepted_current_state")
+    store.approvals.claim_reconciliation("chg-1", "operator:1", digest, "accepted_current_state")
     with pytest.raises(ValueError, match="does not require reconciliation"):
-        store.claim_reconciliation("chg-1", "operator:2", digest, "confirmed_applied")
+        store.approvals.claim_reconciliation("chg-1", "operator:2", digest, "confirmed_applied")
 
-    store.abort_reconciliation(
+    store.approvals.abort_reconciliation(
         "chg-1", "operator:1", digest, "accepted_current_state", "metadata write failed"
     )
-    assert store.approval_record("chg-1")["state"] == "reconciliation_required"
-    store.claim_reconciliation("chg-1", "operator:2", digest, "confirmed_applied")
-    assert store.approval_record("chg-1")["resolved_by"] == "operator:2"
+    assert store.approvals.record_for("chg-1")["state"] == "reconciliation_required"
+    store.approvals.claim_reconciliation("chg-1", "operator:2", digest, "confirmed_applied")
+    assert store.approvals.record_for("chg-1")["resolved_by"] == "operator:2"
 
 
 async def test_a_direct_sql_write_is_visible_to_the_engine_handle(tmp_path):

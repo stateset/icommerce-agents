@@ -46,7 +46,9 @@ def configure_logging(level: str | None = None) -> None:
     resolved = (level if level is not None else os.getenv("ICOMMERCE_LOG_LEVEL", "INFO")).upper()
     root.setLevel(resolved)
     for handler in root.handlers:
-        if handler.get_name() == _HANDLER_NAME:
+        # Already JSON: installed here earlier, or by uvicorn's --log-config
+        # (config/uvicorn-logging.json names this formatter). Never double-log.
+        if handler.get_name() == _HANDLER_NAME or isinstance(handler.formatter, JsonFormatter):
             return
     handler = logging.StreamHandler(sys.stderr)
     handler.set_name(_HANDLER_NAME)

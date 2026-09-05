@@ -493,14 +493,14 @@ def test_operator_can_reconcile_an_ambiguous_apply_from_observed_state(engine_db
     backend.approve(change.change_id, session.operator)
     record = asyncio.run(load_record(store, change.change_id))
     digest = record["proposal_digest"]
-    claim = store.claim_approval(change.change_id, session.operator, digest, ["TENT-RIDGE-TAN"])
+    claim = store.approvals.claim(change.change_id, session.operator, digest, ["TENT-RIDGE-TAN"])
     asyncio.run(
         store.write_sql(
             "UPDATE product_variants SET price = ?, version = version + 1 WHERE sku = ?",
             ("199.00", "TENT-RIDGE-TAN"),
         )
     )
-    store.finish_approval_attempt(
+    store.approvals.finish_attempt(
         change.change_id,
         claim.attempt_id,
         outcome="reconciliation_required",
@@ -523,10 +523,12 @@ def test_operator_can_reconcile_an_ambiguous_apply_from_observed_state(engine_db
     )
     assert resolved.status_code == 200
     assert asyncio.run(load(store, change.change_id)).status is ChangeStatus.APPLIED
-    control = store.approval_record(change.change_id)
+    control = store.approvals.record_for(change.change_id)
     assert control["state"] == "resolved"
     assert control["resolution"] == "confirmed_applied"
-    assert store.approval_events(change.change_id)[-1]["event"] == ("reconciled:confirmed_applied")
+    assert store.approvals.events_for(change.change_id)[-1]["event"] == (
+        "reconciled:confirmed_applied"
+    )
 
 
 def test_reconciliation_cannot_confirm_a_write_that_did_not_land(engine_db):
@@ -560,8 +562,8 @@ def test_reconciliation_cannot_confirm_a_write_that_did_not_land(engine_db):
     )
     backend.approve(change.change_id, session.operator)
     digest = asyncio.run(load_record(store, change.change_id))["proposal_digest"]
-    claim = store.claim_approval(change.change_id, session.operator, digest, ["TENT-RIDGE-TAN"])
-    store.finish_approval_attempt(
+    claim = store.approvals.claim(change.change_id, session.operator, digest, ["TENT-RIDGE-TAN"])
+    store.approvals.finish_attempt(
         change.change_id,
         claim.attempt_id,
         outcome="reconciliation_required",
@@ -580,7 +582,7 @@ def test_reconciliation_cannot_confirm_a_write_that_did_not_land(engine_db):
         json={"proposal_digest": digest, "resolution": "accepted_current_state"},
     )
     assert accepted.status_code == 200
-    control = store.approval_record(change.change_id)
+    control = store.approvals.record_for(change.change_id)
     assert control["state"] == "resolved"
     assert control["resolution"] == "accepted_current_state"
 
@@ -597,7 +599,10 @@ def test_operator_can_recover_a_stale_applying_claim_without_retrying_it(engine_
     from engine_backend.store import EngineStore
 
     db_path = engine_db("store.db")
-    c = TestClient(create_app(db_path, stale_apply_seconds=1))
+    # A generous threshold: the "too soon" refusal below must not depend on the test
+    # reaching the route within a second on a loaded machine. Staleness is then forced
+    # by backdating the claim, not by waiting.
+    c = TestClient(create_app(db_path, stale_apply_seconds=3600))
     headers = {"X-Session-Id": c.post("/merchant/session").json()["session_id"]}
     store = EngineStore(db_path)
     backend = EngineMerchant(
@@ -616,7 +621,7 @@ def test_operator_can_recover_a_stale_applying_claim_without_retrying_it(engine_
     )
     backend.approve(change.change_id, session.operator)
     digest = asyncio.run(load_record(store, change.change_id))["proposal_digest"]
-    claim = store.claim_approval(change.change_id, session.operator, digest, ["TENT-RIDGE-TAN"])
+    claim = store.approvals.claim(change.change_id, session.operator, digest, ["TENT-RIDGE-TAN"])
     assert claim.attempt_id
 
     endpoint = f"/merchant/changes/{change.change_id}/reconciliation/start"
@@ -635,7 +640,7 @@ def test_operator_can_recover_a_stale_applying_claim_without_retrying_it(engine_
     recovered = c.post(endpoint, headers=headers, json={"proposal_digest": digest})
     assert recovered.status_code == 200
     assert recovered.json()["assessment"]["outcome"] == "not_applied"
-    assert store.approval_record(change.change_id)["state"] == "reconciliation_required"
+    assert store.approvals.record_for(change.change_id)["state"] == "reconciliation_required"
     connection = sqlite3.connect(db_path)
     lease = connection.execute(
         "SELECT change_id FROM icommerce_agent_target_leases WHERE target = ?",
@@ -643,7 +648,7 @@ def test_operator_can_recover_a_stale_applying_claim_without_retrying_it(engine_
     ).fetchone()
     connection.close()
     assert lease == (change.change_id,)
-    assert store.approval_events(change.change_id)[-1]["event"] == "reconciliation_required"
+    assert store.approvals.events_for(change.change_id)[-1]["event"] == "reconciliation_required"
 
 
 def test_discarded_lifecycle_remains_visible_while_reconciliation_is_in_flight(engine_db):
@@ -683,14 +688,16 @@ def test_discarded_lifecycle_remains_visible_while_reconciliation_is_in_flight(e
     backend.approve(change.change_id, session.operator)
     record = asyncio.run(staging.load_record(store, change.change_id))
     digest = record["proposal_digest"]
-    claim = store.claim_approval(change.change_id, session.operator, digest, ["TENT-RIDGE-TAN"])
-    store.finish_approval_attempt(
+    claim = store.approvals.claim(change.change_id, session.operator, digest, ["TENT-RIDGE-TAN"])
+    store.approvals.finish_attempt(
         change.change_id,
         claim.attempt_id,
         outcome="reconciliation_required",
         error="ambiguous",
     )
-    store.claim_reconciliation(change.change_id, session.operator, digest, "accepted_current_state")
+    store.approvals.claim_reconciliation(
+        change.change_id, session.operator, digest, "accepted_current_state"
+    )
     asyncio.run(
         staging.save(
             store,
@@ -729,4 +736,4 @@ def test_discarded_lifecycle_remains_visible_while_reconciliation_is_in_flight(e
         json={"proposal_digest": digest, "resolution": "accepted_current_state"},
     )
     assert resolved.status_code == 200
-    assert store.approval_record(change.change_id)["state"] == "resolved"
+    assert store.approvals.record_for(change.change_id)["state"] == "resolved"

@@ -16,7 +16,7 @@ DIGEST = "sha256:" + "a" * 64
 def _hold_apply(path, ready):
     store = EngineStore(path)
     with store.merchant_operation("change"):
-        claim = store.claim_approval("change", "operator", DIGEST, ["sku"])
+        claim = store.approvals.claim("change", "operator", DIGEST, ["sku"])
         ready.send(claim.attempt_id)
         signal.pause()
 
@@ -24,7 +24,7 @@ def _hold_apply(path, ready):
 def test_paused_apply_cannot_be_recovered_until_worker_exits(engine_db):
     path = engine_db("store.db")
     store = EngineStore(path)
-    store.record_approval("change", "operator", DIGEST)
+    store.approvals.record("change", "operator", DIGEST)
     context = multiprocessing.get_context("spawn")
     parent, child = context.Pipe()
     process = context.Process(target=_hold_apply, args=(path, child))
@@ -36,17 +36,17 @@ def test_paused_apply_cannot_be_recovered_until_worker_exits(engine_db):
         # Force the age predicate to pass; OS ownership must still prevent recovery.
         stale_before = datetime.now(UTC) + timedelta(seconds=1)
         with pytest.raises(MerchantOperationBusy, match="still active"):
-            store.recover_stale_approval("change", "reviewer", DIGEST, stale_before=stale_before)
-        assert store.approval_record("change")["state"] == "applying"
+            store.approvals.recover_stale("change", "reviewer", DIGEST, stale_before=stale_before)
+        assert store.approvals.record_for("change")["state"] == "applying"
         process.kill()
         process.join(10)
         assert not process.is_alive()
-        store.recover_stale_approval("change", "reviewer", DIGEST, stale_before=stale_before)
-        assert store.approval_record("change")["state"] == "reconciliation_required"
+        store.approvals.recover_stale("change", "reviewer", DIGEST, stale_before=stale_before)
+        assert store.approvals.record_for("change")["state"] == "reconciliation_required"
         # Crash recovery must retain target leases, not permit another mutation.
-        store.record_approval("other", "operator", DIGEST)
+        store.approvals.record("other", "operator", DIGEST)
         assert (
-            store.claim_approval("other", "operator", DIGEST, ["sku"]).refusal == "target_claimed"
+            store.approvals.claim("other", "operator", DIGEST, ["sku"]).refusal == "target_claimed"
         )
     finally:
         if process.is_alive():
@@ -82,7 +82,7 @@ async def test_real_apply_retains_ownership_through_final_write(store, kernel, m
         session, [PriceUpdateItem(listing_id="TENT-RIDGE-TAN", new_price=199)]
     )
     backend.approve(change.change_id, "operator")
-    digest = store.approval_record(change.change_id)["proposal_digest"]
+    digest = store.approvals.record_for(change.change_id)["proposal_digest"]
     started = asyncio.Event()
     release = asyncio.Event()
     original = module._apply_change
@@ -97,7 +97,7 @@ async def test_real_apply_retains_ownership_through_final_write(store, kernel, m
     await asyncio.wait_for(started.wait(), 5)
     try:
         with pytest.raises(MerchantOperationBusy):
-            store.recover_stale_approval(
+            store.approvals.recover_stale(
                 change.change_id,
                 "reviewer",
                 digest,
@@ -106,6 +106,6 @@ async def test_real_apply_retains_ownership_through_final_write(store, kernel, m
     finally:
         release.set()
         await task
-    assert store.approval_record(change.change_id)["state"] == "applied"
+    assert store.approvals.record_for(change.change_id)["state"] == "applied"
     with store.merchant_operation(change.change_id):
         pass

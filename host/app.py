@@ -15,24 +15,18 @@ Identity is never a tool argument and never a request body field: ``POST .../ses
 mints an unguessable id, binds it to a principal server-side, and returns only the id.
 Every other route reads it back from ``X-Session-Id``.
 
-This module builds the deployment (``create_app``) and owns the two middlewares. The
-routes live in ``host.routes``, shared helpers in ``host.context``, request bodies in
-``host.schemas``, and every environment knob in ``host.settings``.
+This module builds the deployment (``create_app``). The middlewares live in
+``host.middleware``, the routes in ``host.routes``, shared helpers in ``host.context``,
+request bodies in ``host.schemas``, and every environment knob in ``host.settings``.
 """
 
 from __future__ import annotations
 
-import asyncio
-import logging
-import secrets
-import time
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI
 from merchant_agent.types import ChangeStatus, MerchantSessionContext, MerchantSessionState
 from merchant_agent_runtime import MerchantAgent
 from shopping_agent.types import ShoppingSessionState
@@ -52,23 +46,16 @@ from engine_backend.stablecoins import (
 from engine_backend.store import EngineStore
 from engine_backend.storefront import EngineStorefront
 
-from . import logs
 from .anthropic_client import build_anthropic_client
-from .auth import AuthConfig, AuthenticationError, Authenticator
+from .auth import AuthConfig, Authenticator
 from .context import HostContext, _with_change_evidence
 from .metrics import HostMetrics
+from .middleware import install_middleware
 from .routes import build_routers
 from .sessions import SessionRegistry
 from .settings import HostSettings
 
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
-
-_REQUEST_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-")
-logger = logging.getLogger(__name__)
-
-
-def _valid_request_id(value: str) -> bool:
-    return 1 <= len(value) <= 128 and all(char in _REQUEST_ID_CHARS for char in value)
 
 
 def create_app(
@@ -141,8 +128,6 @@ def create_app(
         merchant_sessions=merchant_sessions,
         metrics=metrics,
     )
-    rate_limit_per_minute = settings.rate_limit_per_minute
-    allowed_origins = list(settings.allowed_origins)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -156,125 +141,7 @@ def create_app(
 
     app = FastAPI(title="StateSet iCommerce agents host", lifespan=lifespan)
 
-    @app.middleware("http")
-    async def authenticate_commerce_request(request: Request, call_next):
-        """Verify identity before any commerce route can reach an agent or engine.
-
-        In JWT mode a session id is only a workflow handle, never a bearer credential:
-        subsequent requests must present the same signed subject that created it.
-        """
-        path = request.url.path
-        if request.method == "OPTIONS" or not path.startswith(("/shopping/", "/merchant/")):
-            return await call_next(request)
-        try:
-            identity = await asyncio.to_thread(
-                authenticator.authenticate, request.headers.get("Authorization")
-            )
-        except AuthenticationError as error:
-            return JSONResponse(
-                status_code=401,
-                content={"detail": str(error)},
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        request.state.identity = identity
-        expected_kind = "customer" if path.startswith("/shopping/") else "operator"
-        if identity is not None:
-            if expected_kind == "customer" and not identity.permits(
-                role="customer", scope="shopping:use"
-            ):
-                return JSONResponse(status_code=403, content={"detail": "shopping access required"})
-            if expected_kind == "operator" and (
-                not identity.permits(role="merchant", scope="merchant:write")
-                or identity.store_id != store.store_id
-            ):
-                return JSONResponse(status_code=403, content={"detail": "merchant access required"})
-        if rate_limit_per_minute:
-            principal = identity.subject if identity is not None else "demo"
-            window_start = int(time.time() // 60) * 60
-            allowed = await asyncio.to_thread(
-                store.consume_rate_limit,
-                f"{path.split('/', 2)[1]}:{principal}",
-                rate_limit_per_minute,
-                window_start,
-            )
-            if not allowed:
-                return JSONResponse(
-                    status_code=429,
-                    content={"detail": "request rate limit exceeded"},
-                    headers={"Retry-After": str(60 - int(time.time()) % 60)},
-                )
-        if authenticator.config.mode == "demo" or path in (
-            "/shopping/session",
-            "/merchant/session",
-        ):
-            return await call_next(request)
-        session_id = request.headers.get("X-Session-Id")
-        if not session_id:
-            return JSONResponse(status_code=401, content={"detail": "missing X-Session-Id"})
-        try:
-            binding = store.binding(session_id)
-        except KeyError:
-            return JSONResponse(status_code=401, content={"detail": "unknown session"})
-        if binding.kind != expected_kind:
-            return JSONResponse(status_code=403, content={"detail": "session role mismatch"})
-        if identity is None or binding.authenticated_subject != identity.subject:
-            return JSONResponse(status_code=403, content={"detail": "session subject mismatch"})
-        return await call_next(request)
-
-    # Added after the auth middleware so CORS wraps even an early 401/403 response.
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=allowed_origins,
-        allow_methods=["GET", "POST"],
-        allow_headers=[
-            "Authorization",
-            "Content-Type",
-            "PAYMENT-SIGNATURE",
-            "X-Request-Id",
-            "X-Session-Id",
-        ],
-        expose_headers=["PAYMENT-REQUIRED", "PAYMENT-RESPONSE", "X-Request-Id"],
-    )
-
-    @app.middleware("http")
-    async def correlate_and_secure(request: Request, call_next):
-        """Attach a non-secret correlation id and safe API response defaults."""
-        supplied = request.headers.get("X-Request-Id", "")
-        request_id = supplied if _valid_request_id(supplied) else secrets.token_hex(16)
-        request.state.request_id = request_id
-        token = logs.request_id_var.set(request_id)
-        started = time.perf_counter()
-        try:
-            response = await call_next(request)
-        except Exception:
-            logger.exception(
-                "request failed method=%s path=%s request_id=%s",
-                request.method,
-                request.url.path,
-                request_id,
-            )
-            raise
-        finally:
-            logs.request_id_var.reset(token)
-        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
-        route = request.scope.get("route")
-        route_path = getattr(route, "path", "unmatched")
-        metrics.request(request.method, route_path, response.status_code, elapsed_ms / 1000)
-        response.headers["X-Request-Id"] = request_id
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["X-Frame-Options"] = "DENY"
-        logger.info(
-            "request completed method=%s path=%s status=%d elapsed_ms=%.1f request_id=%s",
-            request.method,
-            request.url.path,
-            response.status_code,
-            elapsed_ms,
-            request_id,
-        )
-        return response
-
+    install_middleware(app, ctx)
     for router in build_routers(ctx):
         app.include_router(router)
     app.state.context = ctx
