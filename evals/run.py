@@ -12,10 +12,15 @@ exits 0, the same contract as ``scripts/smoke_chat.py``.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
+import subprocess
 import sys
 import tempfile
+from contextlib import aclosing
+from dataclasses import asdict
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +42,7 @@ from engine_backend.merchant import EngineMerchant  # noqa: E402
 from engine_backend.seed import seed_store  # noqa: E402
 from engine_backend.store import EngineStore  # noqa: E402
 from engine_backend.storefront import EngineStorefront  # noqa: E402
+from scripts.live_eval_check import serialize_report  # noqa: E402
 
 from .cases import CASES  # noqa: E402
 from .graders import EvalCase, EvalResult, grade  # noqa: E402
@@ -58,6 +64,8 @@ def _new_deployment(db_path: str) -> tuple[EngineStorefront, EngineMerchant, Eng
 
 
 async def _run_case(case: EvalCase, client: Any, db_path: str) -> EvalResult:
+    if case.requires_cart and case.role != "shopping":
+        raise ValueError("requires_cart is only valid for shopping cases")
     storefront, merchant, store = _new_deployment(db_path)
 
     if case.role == "shopping":
@@ -92,25 +100,61 @@ async def _run_case(case: EvalCase, client: Any, db_path: str) -> EvalResult:
     # and store, but not graded. This is what puts a cart on the store before the
     # checkout case's own turn -- each case gets a fresh store, so without it that turn
     # would have nothing to check out and would fail for a reason unrelated to its rule.
-    for turn in case.lead_in:
+    for index, turn in enumerate(case.lead_in, start=1):
         messages.append({"role": "user", "content": turn})
-        async for _event in agent.stream_turn(messages, session, state):
-            pass
+        responded = False
+        async with aclosing(agent.stream_turn(messages, session, state)) as events:
+            async for event in events:
+                if event.type == "error":
+                    return EvalResult(case.id, False, f"setup turn {index} emitted an agent error")
+                if event.type == "text_delta" and event.data.get("text", "").strip():
+                    responded = True
+        if not responded:
+            return EvalResult(case.id, False, f"setup turn {index} produced no assistant response")
+
+    if case.requires_cart:
+        cart = await storefront.get_cart(session)
+        if not cart.items:
+            return EvalResult(case.id, False, "setup did not populate the engine-backed cart")
 
     messages.append({"role": "user", "content": case.prompt})
-    transcript: list[AgentEvent] = [
-        event async for event in agent.stream_turn(messages, session, state)
-    ]
+    async with aclosing(agent.stream_turn(messages, session, state)) as events:
+        transcript: list[AgentEvent] = [event async for event in events]
     return grade(case, transcript)
 
 
-async def _run_all(cases: list[EvalCase], client: Any) -> list[EvalResult]:
-    results = []
+async def _iter_results(cases: list[EvalCase], client: Any, *, case_timeout_seconds: int = 120):
     with tempfile.TemporaryDirectory() as tmp:
         for index, case in enumerate(cases):
             db_path = str(Path(tmp) / f"eval-{index}.db")
-            results.append(await _run_case(case, client, db_path))
-    return results
+            async with asyncio.timeout(case_timeout_seconds):
+                result = await _run_case(case, client, db_path)
+            yield result
+
+
+async def _run_all(cases: list[EvalCase], client: Any) -> list[EvalResult]:
+    return [result async for result in _iter_results(cases, client)]
+
+
+def _checkpoint_report(path: Path | None, report: dict[str, Any]) -> None:
+    """Replace a report atomically; a failed write preserves the last checkpoint."""
+    if path is None:
+        return
+    encoded = serialize_report(report)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as output:
+            temporary = Path(output.name)
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def run(cases: list[EvalCase], client: Any) -> list[EvalResult]:
@@ -120,23 +164,91 @@ def run(cases: list[EvalCase], client: Any) -> list[EvalResult]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = sys.argv[1:] if argv is None else argv
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("No ANTHROPIC_API_KEY set -- skipping the live eval suite; set one to exercise it.")
-        return 0
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("cases", nargs="*", help="case IDs; defaults to all cases")
+    parser.add_argument("--repetitions", type=int, choices=range(1, 11), default=1)
+    parser.add_argument("--require-key", action="store_true", help="fail instead of skipping")
+    parser.add_argument("--report", type=Path, help="write structured, commit-bound results")
+    parser.add_argument("--case-timeout-seconds", type=int, default=120)
+    args = parser.parse_args(argv)
+    if not 1 <= args.case_timeout_seconds <= 600:
+        parser.error("--case-timeout-seconds must be between 1 and 600")
+    unknown = set(args.cases) - {case.id for case in CASES}
+    if unknown:
+        parser.error(f"unknown cases: {', '.join(sorted(unknown))}")
 
     from host.anthropic_client import build_anthropic_client
 
-    cases = [c for c in CASES if c.id in args] if args else CASES
+    cases = [c for c in CASES if c.id in args.cases] if args.cases else CASES
+    root = Path(__file__).resolve().parent.parent
 
-    client = build_anthropic_client()
-    results = run(cases, client)
-    failures = [r for r in results if not r.passed]
-    for result in results:
-        status = "PASS" if result.passed else "FAIL"
-        print(f"[{status}] {result.case_id}: {result.reason}")
-    print(f"\n{len(results) - len(failures)}/{len(results)} passed")
-    return 0 if not failures else 1
+    def git(*arguments: str) -> str:
+        return subprocess.check_output(["git", *arguments], cwd=root, text=True, timeout=30).strip()
+
+    async def execute() -> int:
+        client = build_anthropic_client()
+        if client is None:
+            print(
+                "No ANTHROPIC_API_KEY set -- skipping the live eval suite; set one to exercise it."
+            )
+            return 2 if args.require_key or args.report else 0
+        report: dict[str, Any] | None = None
+        try:
+            try:
+                report = {
+                    "format_version": 1,
+                    "commit_sha": git("rev-parse", "HEAD"),
+                    "worktree_dirty": bool(git("status", "--porcelain")),
+                    "started_at": datetime.now(UTC).isoformat(),
+                    "models": {
+                        "shopping": shopping_agent_config().model,
+                        "merchant": merchant_agent_config().model,
+                    },
+                    "requested_repetitions": args.repetitions,
+                    "case_timeout_seconds": args.case_timeout_seconds,
+                    "case_ids": [case.id for case in cases],
+                    "runs": [],
+                    "passed": False,
+                }
+                _checkpoint_report(args.report, report)
+                for repetition in range(1, args.repetitions + 1):
+                    current_run: dict[str, Any] = {"repetition": repetition, "results": []}
+                    report["runs"].append(current_run)
+                    async for result in _iter_results(
+                        cases, client, case_timeout_seconds=args.case_timeout_seconds
+                    ):
+                        current_run["results"].append(asdict(result))
+                        _checkpoint_report(args.report, report)
+                        status = "PASS" if result.passed else "FAIL"
+                        print(
+                            f"[{repetition}/{args.repetitions} {status}] "
+                            f"{result.case_id}: {result.reason}",
+                            flush=True,
+                        )
+            finally:
+                await client.close()
+            # Cleanup must succeed before any checkpoint can be marked passing.
+            report["passed"] = all(
+                [result["case_id"] for result in run["results"]] == report["case_ids"]
+                and all(result["passed"] for result in run["results"])
+                for run in report["runs"]
+            )
+        except BaseException as error:
+            if report is not None:
+                report["passed"] = False
+                # Do not embed provider error messages, headers, or credentials.
+                report["failure_type"] = type(error).__name__
+            raise
+        finally:
+            if report is not None:
+                report["finished_at"] = datetime.now(UTC).isoformat()
+                _checkpoint_report(args.report, report)
+        total = sum(len(run["results"]) for run in report["runs"])
+        passed = sum(result["passed"] for run in report["runs"] for result in run["results"])
+        print(f"\n{passed}/{total} passed")
+        return 0 if report["passed"] else 1
+
+    return asyncio.run(execute())
 
 
 if __name__ == "__main__":
