@@ -1,7 +1,7 @@
 # StateSet iCommerce Agents
 
 [![CI](https://github.com/stateset/icommerce-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/stateset/icommerce-agents/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/release-v0.9.0-2563eb)](https://github.com/stateset/icommerce-agents/tree/v0.9.0)
+[![Release](https://img.shields.io/badge/release-v0.10.0-2563eb)](https://github.com/stateset/icommerce-agents/tree/v0.10.0)
 [![Python](https://img.shields.io/badge/python-3.12-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520.9-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-MIT-black)](LICENSE)
@@ -200,7 +200,10 @@ The FastAPI host exposes:
 
 All `/shopping/*` and `/merchant/*` commerce reads and writes share their role's
 session boundary. `GET /shopping/orders` is customer-scoped; cart and merchant-change
-reads are session-scoped. Route definitions and request models live in `host/app.py`.
+reads are session-scoped. `host/app.py` builds the deployment and owns the two
+middlewares; routes live in `host/routes/` (one module per surface), request models in
+`host/schemas.py`, shared helpers in `host/context.py`, and every environment knob in
+`host/settings.py`.
 
 The separate MCP servers expose 13 shopping tools and 18 merchant tools over the same
 backends and gates. They are loopback-oriented, principal-scoped processes—not public
@@ -281,18 +284,20 @@ explains exactly what green CI proves—and what it does not.
 - `vendor/commerce-agents/` — pinned upstream architecture as an unmodified submodule.
 - `engine_backend/` — `agent_config.py`, `analysis.py`, `apply.py`, `catalog.py`,
   `content.py`, `custom_objects.py`, `kernel.py`, `listings.py`, `merchant.py`,
-  `money.py`, `reconciliation.py`, `refunds.py`, `search.py`, `seed.py`, `staging.py`,
-  `stablecoins.py`, `store.py`, and `storefront.py` implement the StateSet adapters and
-  durable controls.
+  `migrations.py`, `money.py`, `reconciliation.py`, `refunds.py`, `search.py`,
+  `seed.py`, `staging.py`, `stablecoins.py`, `store.py`, and `storefront.py` implement
+  the StateSet adapters and durable controls.
 - `engine_backend/async_utils.py` — cancellation-safe completion of engine work
   before releasing operation locks; see the [integration review](docs/integration-review.md).
 - `engine_backend/turn_locks.py` — OS-held chat ownership that prevents a paused
   worker from being replaced solely because its database lease expired, plus
   merchant apply/reconciliation exclusion during stale-attempt recovery.
-- `host/` — FastAPI sessions, JWT identity, streaming agents, human approval/refund
-  routes, response policy, metrics, and operational endpoints.
+- `host/` — `app.py` (deployment assembly and middleware), `routes/` (system,
+  sessions, shopping, stablecoin, merchant, refunds), `context.py`, `schemas.py`,
+  `settings.py`, JWT identity, response policy, JSON logging, and metrics.
 - `mcp_servers/` — role-specific MCP entry points over the same adapters and gates.
-- `web/storefront/`, `web/portal/` — customer and operator applications.
+- `web/storefront/`, `web/portal/` — customer and operator applications;
+  `web/shared/` holds the BFF proxy, API helpers, and host types they have in common.
 - `config/` — deployment-owned kernel policy and principal; never model input.
 - `evals/` — six structural graders for rules that still depend on model behavior.
 - `scripts/` — install, demo, denial, drift, tour, browser, and live smoke tooling.

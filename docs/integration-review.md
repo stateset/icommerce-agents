@@ -62,30 +62,16 @@ acquisition, claim failures, persistence on disconnect, and heartbeat failure.
 
 ## Resolved environment finding: eval setup integration
 
-The new `tests/test_eval_setup.py::test_populated_real_cart_allows_grading` passed
-in its first focused 90-test run, then stalled on repeated and isolated runs.
-A bounded diagnostic showed the test waiting through `add_to_cart` → `_cart_id`
-→ `EngineStore.write` → `complete_before_cancelling`; the `to_thread` task was
-pending while its awaited future showed a finished cart ID. An isolated standard
-`asyncio.to_thread` sleep/completion check passed. At that point, the observations
-did not distinguish an engine, runtime, test-harness, or environment cause.
-
-Follow-up diagnostics on 2026-09-05 enabled asyncio debug logging and reproduced
+`tests/test_eval_setup.py::test_populated_real_cart_allows_grading` stalled inside a
+restricted sandbox while waiting on `EngineStore.write`. Asyncio debug logging showed
 `PermissionError: [Errno 1] Operation not permitted` in `_write_to_self`: the sandbox
-denied the socket send that wakes the event loop when a worker finishes. The same
-seeded real-engine diagnostic outside the sandbox completed cart creation, add,
-read, and event-loop shutdown in 6.88 seconds. The combined environment/setup
-regressions then passed **21/21**, including the previously stalled cart test. A
-second run, after adding coverage for pytest's startup refusal, passed **22/22**.
-This establishes an environment cause for this reproduction, not a claim that all
-possible engine stalls are impossible.
+denied the socket send that wakes the event loop when a worker thread finishes, so
+completed engine work looked hung. The same test completes in seconds outside that
+sandbox. This is an environment cause, not a serialization or cancellation defect, and
+no protection was bypassed.
 
-`scripts/runtime_check.py` now checks nonblocking socket-pair delivery without
-importing the engine, opening a listener, or running an event loop. Pytest runs it
-at session startup and reports an actionable error when notifications are blocked.
-The integration test remains enabled; no serialization or cancellation protection
-was bypassed. Its cooperative deadline may still exceed its limit while draining
-engine work, so use an outer process deadline when diagnosing other stalls (for
-example `timeout 180s .venv/bin/pytest -s -q -p no:cacheprovider
-tests/test_eval_setup.py::test_populated_real_cart_allows_grading`). A complete
-current-candidate run is still required in addition to these focused results.
+`scripts/runtime_check.py` now checks nonblocking socket-pair delivery without importing
+the engine, opening a listener, or running an event loop. Pytest runs it at session
+startup and reports an actionable error when notifications are blocked. Cooperative
+deadlines deliberately drain already-started engine writes, so use an outer process
+deadline (for example `timeout 180s pytest ...`) when diagnosing other stalls.

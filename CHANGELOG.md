@@ -5,8 +5,32 @@ the authoritative commit-level record; notable operator-visible changes are list
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-05
+
+### Changed
+
+- The host is a package: `host/app.py` builds the deployment and owns the middlewares,
+  routes live in `host/routes/` (system, sessions, shopping, stablecoin, merchant,
+  refunds), request bodies in `host/schemas.py`, shared helpers in `host/context.py`,
+  and every environment knob in `host/settings.py`, validated before the engine opens.
+- `EngineStore` is file-backed only. The parallel in-memory implementation of
+  approvals, leases, bindings, and chat locks is gone; `:memory:` is refused.
+- The control-plane schema and its forward-only migrations moved to
+  `engine_backend/migrations.py`.
+- Host logs are JSON lines carrying the request id (`host/logs.py`).
+- The two web apps share one backend-for-frontend proxy, the API helpers, and the host
+  response types through the `web/shared` workspace package.
+- Demo databases default to `data/` instead of the repository root.
+- `pyproject.toml` declares the vendored commerce-agents packages it imports.
+
 ### Added
 
+- A session-scoped seeded engine template for pytest; fixtures copy it instead of paying
+  the engine's first-open migration cost per test, cutting the suite from about seven
+  minutes to about three.
+- `npm run typecheck` and `npm run lint` (ESLint with the Next 16 flat config) for the
+  web workspace, required in CI and in the release workflow; Next 16 had removed
+  `next lint`, leaving the previous scripts broken.
 - Fast pytest environment preflight for blocked asyncio socket-pair notifications,
   with a standalone keyless diagnostic and actionable sandbox error.
 - Read-only JSON release preflight for candidate evidence, exact-commit CI, and GitHub controls.
@@ -70,6 +94,7 @@ the authoritative commit-level record; notable operator-visible changes are list
 - Authenticated same-origin web BFFs, Prometheus metrics, online backups, and hardened
   production configuration validation.
 
-[Unreleased]: https://github.com/stateset/icommerce-agents/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/stateset/icommerce-agents/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/stateset/icommerce-agents/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/stateset/icommerce-agents/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/stateset/icommerce-agents/compare/v0.7.1...v0.8.0

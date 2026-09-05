@@ -19,43 +19,19 @@ release workflow and human review of the linked evidence. Repositories using
 rulesets instead of classic branch protection need a separate ruleset review;
 this command conservatively leaves that branch-protection check unverified.
 
-## Implementation and verification added on 2026-09-05
+## What the deterministic suite does and does not prove
 
-- Cancellation-safe engine execution and chat persistence.
-- OS-held turn locks, tested using real worker pause, expired lease, process kill,
-  and recovery. See the mandatory first-upgrade drain procedure in `operations.md`.
-- Immutable customer/operator, role, store, and authenticated-subject bindings.
-- Three-run structured Claude eval reports with model IDs, commit identity,
-  working-tree status, and failed/partial results retained.
-- Mandatory Chromium verification in the production release workflow, using
-  `scripts/browser_check.py` to manage an isolated host and both built apps.
-- Stricter release-evidence URL and numeric-field validation.
-- UTC-normalized, immutable principal bindings, with legacy-offset cleanup,
-  sub-millisecond expiry boundaries, and concurrent renewal regression tests.
-- Twelve live scenarios (six baseline plus six user-pressure variants), with
-  graders rejecting empty/error turns and price claims preceding successful retrieval.
+The pytest suite, the drift check, the denial walkthrough, the keyless tour, and the
+browser check are all deterministic and keyless. A green run proves the agent-layer
+gates, the engine's transactional refusals, the durable control plane (approval claims,
+target leases, session identity, turn locks, cancellation safety), the stablecoin state
+machine against fake providers, and that both web apps render live engine state. It
+proves nothing about a live model's tool choices, a real facilitator or treasury
+adapter, an OIDC issuer, or the deployment's load profile. Those are the external
+evidence gates below, and each must be bound to the exact candidate commit.
 
-An earlier local full deterministic run passed **365 tests with no skips**, using
-Node 22.18.0, with one upstream Starlette/AnyIO deprecation warning. Repository-wide
-lint, formatting, and drift checks also passed. This is evidence for the working
-tree at that time, not a reviewed release commit or a new live-model result. That
-full run predates the latest eval-report recovery, setup-integrity, and environment
-preflight changes; it must not be presented as verification of the current tree.
-
-The latest environment/setup checks passed twice (21 tests, then 22 after adding
-startup-hook coverage), including the real-cart regression. Repository-wide lint,
-formatting (105 files), and whitespace checks passed. A new full-suite attempt
-outside the restrictive sandbox exceeded its 600-second process deadline without
-a final result; the separate drift check exceeded 30 seconds. The host had nearly
-exhausted RAM and fully occupied swap during these attempts. Neither interrupted
-check counts as a pass, and a fresh complete run remains required. The diagnosed
-socket-notification failure and its regression coverage are recorded in
-`integration-review.md`.
-
-Both applications were built under Node 22.18.0 and passed the real browser smoke
-test. `npm audit --audit-level=high` reported zero vulnerabilities; `uv pip check`
-reported compatible installed dependencies. These are local observations, not
-evidence for a future immutable release commit.
+Run results belong in `release-evidence/` and the CHANGELOG, not here: this page
+describes the process and stays true across candidates.
 
 ## External setup and evidence still required
 

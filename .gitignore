@@ -17,3 +17,6 @@ release-evidence/v*.json
 # content is upstream Next's, not this repo's.
 web/*/AGENTS.md
 web/*/CLAUDE.md
+
+# Demo databases scripts create by default (tour, denials, run_demo, MCP servers).
+data/

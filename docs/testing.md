@@ -33,6 +33,13 @@ exits. Cancellation tests cover repeated cancellation, AnyIO disconnect scopes,
 late lease acquisition, and persistence cleanup. Session-identity tests cover
 cross-worker attempts to reassign customer, role, store, and authenticated subject.
 
+Every store or app fixture opens a copy of one seeded engine file built once per
+session (`tests/conftest.py`'s `engine_template`, copied by `engine_db`). Opening the
+engine on a *new* file runs its own migrations and costs about 2.5 seconds; reopening
+an existing file costs a quarter of that, which is the difference between a seven-minute
+suite and a three-minute one. Tests that need a fresh, unseeded, or deliberately legacy
+database (`tests/test_store.py`, `tests/test_backup_store.py`) still build their own.
+
 One file per module in `engine_backend/`, `host/`, and `mcp_servers/`, plus the suites
 listed below. All of it runs against `EngineMerchant`/`EngineStorefront` over a real,
 seeded `stateset-embedded` engine instance and, where a route is involved, an in-process
@@ -81,6 +88,9 @@ engine, and never a model.
   client that never calls the expected tool — confirming the check actually fails when
   it should, rather than passing vacuously.
 - The Next.js builds for `web/storefront` and `web/portal` (`tests/test_web_build.py`).
+  Type checking (`tsc --noEmit`) and ESLint run in the CI `web` job through
+  `npm run typecheck` and `npm run lint`; Next 16 removed `next lint`, so those scripts
+  are the only lint and type gates the web workspace has.
 - The opt-in production JWT boundary: issuer, audience, expiry, roles/scopes, store
   tenancy, customer provisioning, and token-subject/session binding (`tests/test_auth.py`).
 - The last-mile host response boundary: affirmative claims that a merely staged change
