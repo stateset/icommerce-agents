@@ -37,6 +37,19 @@ from a tool argument or from the client.
 }
 ```
 
+Every variable each server reads is collected in `mcp_servers/settings.py` and validated
+once at startup; a bad port or an empty principal fails before the store is opened.
+
+| Shopping server | Merchant server | Default | Meaning |
+|---|---|---|---|
+| `STOREFRONT_MCP_DB` | `MERCHANT_MCP_DB` | `data/acme.db` | Engine store file (never `:memory:`) |
+| `ACME_CUSTOMER` | `ACME_OPERATOR` | seeded principal | The one principal the process acts for |
+| `STOREFRONT_MCP_SESSION_ID` | `MERCHANT_MCP_SESSION_ID` | `mcp-shopping` / `mcp-merchant` | Durable session handle bound to that principal |
+| `STOREFRONT_MCP_HOST` | `MERCHANT_MCP_HOST` | `127.0.0.1` | Bind address; off-loopback needs the unsafe flag below |
+| `STOREFRONT_MCP_PORT` | `MERCHANT_MCP_PORT` | `8300` / `8301` | Bind port |
+| `STOREFRONT_MCP_MEMORY_FILE` | `MERCHANT_MCP_MEMORY_FILE` | repo-local JSON | Customer or store memory file |
+| `STOREFRONT_MCP_UNSAFE_ALLOW_NO_AUTH` | `MERCHANT_MCP_UNSAFE_ALLOW_NO_AUTH` | unset | Permit a non-loopback bind |
+
 For a client that speaks HTTP directly rather than spawning the process itself, run
 `python -m mcp_servers.shopping` / `python -m mcp_servers.merchant` and point the client
 at `http://127.0.0.1:8300/mcp` / `http://127.0.0.1:8301/mcp` (ports configurable via

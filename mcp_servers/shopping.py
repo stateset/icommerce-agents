@@ -12,7 +12,6 @@ construction) — never from a tool argument.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from commerce_common.execution import contracts_by_name
@@ -33,13 +32,7 @@ from engine_backend.agent_config import shopping_agent_config
 from engine_backend.seed import seed_store
 from engine_backend.store import EngineStore
 from engine_backend.storefront import EngineStorefront
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
-DEFAULT_HOST = os.environ.get("STOREFRONT_MCP_HOST", "127.0.0.1")
-DEFAULT_PORT = int(os.environ.get("STOREFRONT_MCP_PORT", "8300"))
-DEFAULT_CUSTOMER_EMAIL = os.environ.get("ACME_CUSTOMER", "rowan@example.invalid")
-DEFAULT_SESSION_ID = os.environ.get("STOREFRONT_MCP_SESSION_ID", "mcp-shopping")
+from mcp_servers.settings import McpSettings
 
 # The MCP client has no per-request context block; the registry's inline-context
 # descriptions point the model at get_preferences instead, same as upstream's server.
@@ -57,9 +50,8 @@ SERVER_INSTRUCTIONS = (
 )
 
 
-def _default_memory_store() -> MemoryStore:
-    path = os.environ.get("STOREFRONT_MCP_MEMORY_FILE", REPO_ROOT / ".storefront_mcp_memory.json")
-    return JsonFileMemoryStore(Path(path))
+def _default_memory_store(settings: McpSettings) -> MemoryStore:
+    return JsonFileMemoryStore(settings.memory_file)
 
 
 def build_shopping_server(
@@ -68,33 +60,35 @@ def build_shopping_server(
     config: ShoppingAgentConfig | None = None,
     memory_store: MemoryStore | None = None,
     customer_email: str | None = None,
-    host: str = DEFAULT_HOST,
-    port: int = DEFAULT_PORT,
+    host: str | None = None,
+    port: int | None = None,
+    settings: McpSettings | None = None,
 ) -> FastMCP:
     """The shopping role's MCP server, wired to an ``EngineStore`` at ``db_path``. The
     store is seeded (idempotently) and the customer is bound once, from
     ``customer_email`` or ``ACME_CUSTOMER`` — never from a tool argument."""
-    enforce_local_only_bind(
-        host, server="storefront", unsafe_env_var="STOREFRONT_MCP_UNSAFE_ALLOW_NO_AUTH"
-    )
+    settings = settings or McpSettings.shopping()
+    host = settings.host if host is None else host
+    port = settings.port if port is None else port
+    enforce_local_only_bind(host, server="storefront", unsafe_env_var=settings.unsafe_env_var)
     cfg = config or shopping_agent_config()
 
     store = EngineStore(db_path)
     seed_store(store.commerce)
     backend = EngineStorefront(store, max_quantity_per_item=cfg.max_quantity_per_item)
 
-    email = customer_email or DEFAULT_CUSTOMER_EMAIL
+    email = customer_email or settings.principal
     # Synchronous on purpose: this runs during server construction, before any event
     # loop is serving requests (like `seed_store` just above), so there is no loop to
     # block and no concurrent writer to race.
     customer = store.commerce.customers.get_by_email(email)
     if customer is None:
         raise ValueError(f"no customer with email {email!r} in this store")
-    session_id = DEFAULT_SESSION_ID
+    session_id = settings.session_id
     store.bind(session_id, customer.id, "customer")
 
     memory = build_memory(
-        cfg, memory_store if memory_store is not None else _default_memory_store()
+        cfg, memory_store if memory_store is not None else _default_memory_store(settings)
     )
     session = ShoppingSessionContext(session_id=session_id, user_id=customer.id)
     executors = ConnectionExecutors(
@@ -179,11 +173,11 @@ def build_shopping_server(
 
 
 def main() -> None:
-    db_path = os.environ.get("STOREFRONT_MCP_DB", str(REPO_ROOT / "data" / "acme.db"))
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    settings = McpSettings.shopping()
+    Path(settings.db_path).parent.mkdir(parents=True, exist_ok=True)
     run(
-        build_shopping_server(db_path),
-        url=f"http://{DEFAULT_HOST}:{DEFAULT_PORT}/mcp",
+        build_shopping_server(settings.db_path, settings=settings),
+        url=settings.url,
         warning=(
             "this reference server has no authentication of its own; anyone who reaches "
             "it can read carts and orders and write cart lines. Expose it only behind "
