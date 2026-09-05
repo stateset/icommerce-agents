@@ -1,8 +1,10 @@
+/** The same-origin backend-for-frontend both web apps mount at `/api/commerce/[...path]`.
+ * It keeps the production bearer token in an HttpOnly cookie, forwards only the headers
+ * the host needs, and rejects cross-site mutations. Each app's route file re-exports
+ * `proxy` for every method and declares its own `runtime`/`dynamic` literals, which
+ * Next requires to be written in the route module itself. */
 import { cookies } from "next/headers";
 import type { NextRequest } from "next/server";
-
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
 
 const REQUEST_HEADERS = [
   "content-type",
@@ -45,7 +47,7 @@ function sameOriginMutation(request: NextRequest): boolean {
   }
 }
 
-async function proxy(
+export async function proxy(
   request: NextRequest,
   context: { params: Promise<{ path: string[] }> },
 ): Promise<Response> {
@@ -85,9 +87,3 @@ async function proxy(
     headers: responseHeaders,
   });
 }
-
-export const GET = proxy;
-export const POST = proxy;
-export const PUT = proxy;
-export const PATCH = proxy;
-export const DELETE = proxy;

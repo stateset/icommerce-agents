@@ -1,3 +1,5 @@
+export type { Capabilities, StablecoinPayment } from "icommerce-shared";
+
 export interface ChangeItem {
   target: string;
   field: string;
@@ -100,20 +102,6 @@ export interface StagedChange {
   currency?: string | null;
 }
 
-export interface StablecoinPayment {
-  payment_id: string;
-  quote_digest: string;
-  state: string;
-  amount: string;
-  currency: string;
-  asset: string;
-  network: string;
-  expires_at: string;
-  transaction_hash?: string | null;
-  order_number?: string | null;
-  last_error?: string | null;
-}
-
 export interface StablecoinRefund {
   refund_id: string;
   payment_id: string;
@@ -134,16 +122,4 @@ export interface StablecoinRefundPreview {
   asset: string;
   network: string;
   proposal_digest: string;
-}
-
-/** `GET /capabilities` -- whether a model is configured for this deployment. Present
- * or absent only, never valid or invalid. */
-export interface Capabilities {
-  assistant: "available" | "unconfigured";
-  stablecoin_checkout: "available" | "disabled";
-  stablecoin_refunds:
-    | "available"
-    | "deployment_integration_required"
-    | "disabled";
-  direct_checkout: "available" | "disabled";
 }

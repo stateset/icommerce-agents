@@ -6,9 +6,11 @@
     "dev": "next dev -p 3000",
     "build": "next build",
     "start": "next start -p 3000",
-    "lint": "next lint"
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "icommerce-shared": "file:../shared",
     "next": "^16.3.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

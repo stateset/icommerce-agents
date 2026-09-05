@@ -1,3 +1,7 @@
+import type { KernelReceipt } from "icommerce-shared";
+
+export type { Capabilities, KernelReceipt, StablecoinPayment } from "icommerce-shared";
+
 export interface Product {
   product_id: string;
   title: string;
@@ -44,13 +48,7 @@ export interface CartPayload {
 
 export interface CheckoutResponse {
   order_number?: string;
-  receipt: {
-    ok: boolean;
-    sealed: boolean;
-    receipt_id?: string | null;
-    error_code?: string | null;
-    error_message?: string | null;
-  };
+  receipt: KernelReceipt;
 }
 
 export interface ShippingAddress {
@@ -87,21 +85,6 @@ export interface StablecoinChallenge {
   detail?: unknown;
 }
 
-export interface StablecoinPayment {
-  payment_id: string;
-  quote_digest: string;
-  state: string;
-  amount: string;
-  currency: string;
-  asset: string;
-  network: string;
-  expires_at: string;
-  transaction_hash?: string | null;
-  order_number?: string | null;
-  receipt?: CheckoutResponse["receipt"];
-  detail?: unknown;
-}
-
 export interface OrderItem {
   product_id: string;
   title: string;
@@ -131,16 +114,4 @@ export interface Order {
 
 export interface OrdersPayload {
   orders: Order[];
-}
-
-/** `GET /capabilities` -- whether a model is configured for this deployment. Present
- * or absent only, never valid or invalid. */
-export interface Capabilities {
-  assistant: "available" | "unconfigured";
-  stablecoin_checkout: "available" | "disabled";
-  stablecoin_refunds:
-    | "available"
-    | "deployment_integration_required"
-    | "disabled";
-  direct_checkout: "available" | "disabled";
 }

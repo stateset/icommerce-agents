@@ -49,6 +49,9 @@ export function StablecoinPayments({
   }, [enabled, refundsEnabled, sessionId]);
 
   useEffect(() => {
+    // `refresh` only sets state after awaiting the host, so this is not a synchronous
+    // setState in the effect body; the compiler lint cannot see past the await.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void refresh();
   }, [refresh]);
 

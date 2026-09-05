@@ -59,8 +59,12 @@ Pip is cached via `actions/setup-python`'s `cache: pip`.
 
 Checks out the repo (submodules too, since the web workspace depends on
 `vendor/commerce-agents/examples/web-shared`), installs Node via `actions/setup-node`
-with `cache: npm`, runs `npm ci`, then `npm audit --audit-level=high`, then builds
-`web/storefront` and `web/portal`.
+with `cache: npm`, runs `npm ci`, then `npm audit --audit-level=high`, then
+`npm run typecheck` (`tsc --noEmit` in each app) and `npm run lint` (ESLint with the
+Next 16 flat config; Next 16 removed `next lint`, so these are the only type and lint
+gates the web workspace has), then builds `web/storefront` and `web/portal`. The BFF
+proxy, the shared API helpers, and the host response types the two apps have in common
+live in the `web/shared` workspace package (`icommerce-shared`).
 
 The audit step is there because the Next 16 / React 19 upgrade was done to clear the
 workspace's high-severity advisories. Without a gate, they come back on a transitive

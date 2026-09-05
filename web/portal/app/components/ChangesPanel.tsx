@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   approveChange,
   fetchReconciliation,
@@ -36,6 +36,13 @@ export function ChangesPanel({
   >({});
   const [resolving, setResolving] = useState<string | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  // Recovery eligibility compares a server timestamp with wall-clock time. Reading the
+  // clock during render is impure, so the clock lives in state and ticks on an interval.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 5_000);
+    return () => clearInterval(timer);
+  }, []);
   const list = Object.values(changes).sort((a, b) =>
     a.created_at.localeCompare(b.created_at),
   );
@@ -156,7 +163,7 @@ export function ChangesPanel({
               (applying || reconciling) &&
               change.recovery_available_at !== null &&
               change.recovery_available_at !== undefined &&
-              Date.parse(change.recovery_available_at) <= Date.now();
+              Date.parse(change.recovery_available_at) <= now;
             return (
               <div className="change-card" key={change.change_id}>
                 <div className="kind">{change.kind.replace(/_/g, " ")}</div>

@@ -70,6 +70,8 @@ jobs:
           python scripts/tour.py --db /tmp/release-tour.db
           npm ci
           npm audit --audit-level=high
+          npm run typecheck
+          npm run lint
           npm run build --workspace web/storefront
           npm run build --workspace web/portal
           npx playwright install --with-deps chromium

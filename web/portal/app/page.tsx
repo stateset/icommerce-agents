@@ -61,6 +61,9 @@ export default function PortalPage() {
   // must be visible on first load after a keyless tour run, with no typing.
   useEffect(() => {
     if (!session.sessionId) return;
+    // `refreshChanges` only sets state after awaiting the host, so this is not a synchronous
+    // setState in the effect body; the compiler lint cannot see past the await.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void refreshChanges();
   }, [refreshChanges, session.sessionId]);
 
