@@ -263,7 +263,7 @@ python scripts/denials.py
 npm audit --audit-level=high
 npm run typecheck
 npm run lint
-npm test          # the shared web package: BFF origin and cross-site rules
+npm test          # shared web package (BFF rules) and portal components
 npm run build --workspace web/storefront
 npm run build --workspace web/portal
 ```
@@ -286,7 +286,7 @@ explains exactly what green CI proves—and what it does not.
 ## Repository map
 
 - `vendor/commerce-agents/` — pinned upstream architecture as an unmodified submodule.
-- `engine_backend/` — `agent_config.py`, `analysis.py`, `apply.py`, `catalog.py`,
+- `engine_backend/` — `agent_config.py`, `analysis.py`, `apply.py`, `approvals.py`, `catalog.py`,
   `content.py`, `custom_objects.py`, `kernel.py`, `listings.py`, `merchant.py`,
   `migrations.py`, `money.py`, `reconciliation.py`, `refunds.py`, `search.py`,
   `seed.py`, `staging.py`, `stablecoins.py`, `store.py`, and `storefront.py` implement
@@ -296,9 +296,10 @@ explains exactly what green CI proves—and what it does not.
 - `engine_backend/turn_locks.py` — OS-held chat ownership that prevents a paused
   worker from being replaced solely because its database lease expired, plus
   merchant apply/reconciliation exclusion during stale-attempt recovery.
-- `host/` — `app.py` (deployment assembly and middleware), `routes/` (system,
-  sessions, shopping, stablecoin, merchant, refunds), `context.py`, `schemas.py`,
-  `settings.py`, JWT identity, response policy, JSON logging, and metrics.
+- `host/` — `app.py` (deployment assembly), `middleware.py` (identity, rate limit,
+  CORS, correlation), `routes/` (system, sessions, shopping, stablecoin, merchant,
+  refunds), `context.py`, `schemas.py`, `settings.py`, JWT identity, response policy,
+  JSON logging, and metrics.
 - `mcp_servers/` — role-specific MCP entry points over the same adapters and gates.
 - `web/storefront/`, `web/portal/` — customer and operator applications;
   `web/shared/` holds the BFF proxy, API helpers, and host types they have in common.
