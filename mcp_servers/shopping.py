@@ -88,6 +88,8 @@ def build_shopping_server(
     # loop is serving requests (like `seed_store` just above), so there is no loop to
     # block and no concurrent writer to race.
     customer = store.commerce.customers.get_by_email(email)
+    if customer is None:
+        raise ValueError(f"no customer with email {email!r} in this store")
     session_id = DEFAULT_SESSION_ID
     store.bind(session_id, customer.id, "customer")
 

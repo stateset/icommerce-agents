@@ -37,12 +37,13 @@ def build_router(ctx: HostContext) -> APIRouter:
                 raise HTTPException(status_code=403, detail="shopping access required")
             if not identity.email:
                 raise HTTPException(status_code=403, detail="customer email claim required")
+            wanted = identity.email.casefold()
             customer = await store.call(
                 lambda c: next(
                     (
                         item
                         for item in c.customers.list()
-                        if item.email and item.email.casefold() == identity.email.casefold()
+                        if item.email and item.email.casefold() == wanted
                     ),
                     None,
                 )
@@ -51,6 +52,8 @@ def build_router(ctx: HostContext) -> APIRouter:
                 raise HTTPException(status_code=403, detail="customer is not provisioned")
         else:
             customer = await store.call(lambda c: c.customers.get_by_email(_ROWAN_EMAIL))
+            if customer is None:
+                raise HTTPException(status_code=503, detail="demo customer is not seeded")
         session_id = secrets.token_urlsafe(24)
         store.bind(
             session_id,

@@ -10,7 +10,6 @@ from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
-from stateset_embedded import CartAddress
 
 from engine_backend.stablecoins import (
     FacilitatorUncertain,
@@ -142,47 +141,21 @@ def build_router(ctx: HostContext) -> APIRouter:
             response = public_payment(payment)
         else:
             try:
-                payment = await stablecoin_payments.transition(
+                payment, checkout_result = await ctx.complete_settled_payment(
                     payment_id,
-                    session.session_id,
-                    {"settled", "checkout_committing"},
-                    "checkout_committing",
-                )
-                address_data = json.loads(payment["shipping_address_json"])
-                customer = await store.call(lambda c: c.customers.get(payment["customer_id"]))
-                address = CartAddress(email=customer.email, **address_data)
-                checkout_result = await _commit_cart(
-                    session_id=session.session_id,
-                    cart_id=payment["cart_id"],
-                    address=address,
+                    payment,
+                    resume=True,
                     correlation_id=http_request.state.request_id,
+                    failure="stablecoin settled but checkout commit did not complete",
                 )
-                payment = await stablecoin_payments.transition(
-                    payment_id,
-                    session.session_id,
-                    {"checkout_committing"},
-                    "completed",
-                    order_number=checkout_result["order_number"],
-                    checkout_receipt_json=json.dumps(
-                        checkout_result["receipt"], sort_keys=True, separators=(",", ":")
-                    ),
-                    last_error=None,
-                )
-                response = {**public_payment(payment), **checkout_result}
-                metrics.stablecoin_payment("checkout", "completed")
             except Exception as error:
-                await stablecoin_payments.transition(
-                    payment_id,
-                    session.session_id,
-                    {"checkout_committing"},
-                    "reconciliation_required",
-                    last_error="stablecoin settled but checkout commit did not complete",
-                )
                 metrics.stablecoin_payment("checkout", "reconciliation_required")
                 raise HTTPException(
                     status_code=202,
                     detail="payment settled; checkout requires reconciliation",
                 ) from error
+            response = {**public_payment(payment), **checkout_result}
+            metrics.stablecoin_payment("checkout", "completed")
         settlement_evidence = {
             "success": True,
             "transaction": payment["transaction_hash"],
@@ -267,30 +240,12 @@ def build_router(ctx: HostContext) -> APIRouter:
                 transaction_hash=transaction_hash.lower(),
                 last_error="operator confirmed settlement from external evidence",
             )
-            payment = await stablecoin_payments.transition(
+            payment, checkout_result = await ctx.complete_settled_payment(
                 payment_id,
-                payment["session_id"],
-                {"settled"},
-                "checkout_committing",
-            )
-            address_data = json.loads(payment["shipping_address_json"])
-            customer = await store.call(lambda c: c.customers.get(payment["customer_id"]))
-            checkout_result = await _commit_cart(
-                session_id=payment["session_id"],
-                cart_id=payment["cart_id"],
-                address=CartAddress(email=customer.email, **address_data),
+                payment,
+                resume=False,
                 correlation_id=http_request.state.request_id,
-            )
-            payment = await stablecoin_payments.transition(
-                payment_id,
-                payment["session_id"],
-                {"checkout_committing"},
-                "completed",
-                order_number=checkout_result["order_number"],
-                checkout_receipt_json=json.dumps(
-                    checkout_result["receipt"], sort_keys=True, separators=(",", ":")
-                ),
-                last_error=None,
+                failure="settlement confirmed but checkout commit did not complete",
             )
             metrics.stablecoin_payment("reconcile", "completed")
             return {**public_payment(payment), **checkout_result}
@@ -300,16 +255,5 @@ def build_router(ctx: HostContext) -> APIRouter:
             raise HTTPException(status_code=422, detail=str(error)) from error
         except (PaymentConflict, sqlite3.IntegrityError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
-        except HTTPException as error:
-            current = await stablecoin_payments.get_for_operator(payment_id, operator.merchant_id)
-            if current["state"] == "checkout_committing":
-                await stablecoin_payments.transition(
-                    payment_id,
-                    current["session_id"],
-                    {"checkout_committing"},
-                    "reconciliation_required",
-                    last_error="settlement confirmed but checkout commit did not complete",
-                )
-            raise error
 
     return router

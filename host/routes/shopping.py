@@ -7,22 +7,17 @@ both go through the governed ``checkout.commit`` kernel command."""
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
 from typing import Any
 
-from commerce_common.streaming import to_sse
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from stateset_embedded import CartAddress
 
-from ..context import HostContext
-from ..response_policy import TurnResponsePolicy, replace_latest_assistant_text
+from ..context import HostContext, build_cart_address
 from ..schemas import (
     CartAddRequest,
     ChatTurnRequest,
     CheckoutRequest,
 )
-from ..sessions import ChatTurnBusy
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +29,6 @@ def build_router(ctx: HostContext) -> APIRouter:
     authenticator = ctx.authenticator
     shopping_agent = ctx.shopping_agent
     shopping_sessions = ctx.shopping_sessions
-    metrics = ctx.metrics
     _bound_shopping_context = ctx.bound_shopping_context
     _cart_payload = ctx.cart_payload
     _commit_cart = ctx.commit_cart
@@ -46,36 +40,16 @@ def build_router(ctx: HostContext) -> APIRouter:
         x_session_id: str | None = Header(default=None),
     ) -> StreamingResponse:
         session = _bound_shopping_context(x_session_id)
-        try:
-            claimed = await shopping_sessions.claim(session.session_id)
-        except ChatTurnBusy as error:
-            raise HTTPException(
-                status_code=409, detail="another chat turn is in progress"
-            ) from error
+        claimed = await ctx.claim_chat(shopping_sessions, session.session_id)
         chat = claimed.session
-
-        async def event_stream() -> AsyncIterator[str]:
-            try:
-                chat.messages.append({"role": "user", "content": request.message})
-                policy = TurnResponsePolicy("shopping", request.message)
-                async for event in shopping_sessions.stream(
-                    claimed, shopping_agent.stream_turn(chat.messages, session, chat.state)
-                ):
-                    for checked in policy.accept(event):
-                        yield to_sse(checked)
-                for checked in policy.flush():
-                    yield to_sse(checked)
-                if policy.rewritten:
-                    replace_latest_assistant_text(chat.messages, policy.final_text)
-                    metrics.policy_rewrite("shopping")
-                    logger.warning(
-                        "response policy rewrote role=shopping request_id=%s",
-                        http_request.state.request_id,
-                    )
-            finally:
-                await shopping_sessions.finish(claimed)
-
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
+        return ctx.stream_chat_turn(
+            "shopping",
+            shopping_sessions,
+            claimed,
+            lambda: shopping_agent.stream_turn(chat.messages, session, chat.state),
+            message=request.message,
+            request_id=http_request.state.request_id,
+        )
 
     @router.post("/shopping/cart/add")
     async def shopping_cart_add(
@@ -159,14 +133,17 @@ def build_router(ctx: HostContext) -> APIRouter:
         if cart_id is None:
             raise HTTPException(status_code=409, detail="no cart to check out")
         customer = await store.call(lambda c: c.customers.get(binding.subject_id))
+        if customer is None:
+            raise HTTPException(status_code=409, detail="session customer no longer exists")
 
         supplied_address = request.shipping_address if request is not None else None
         # The fictional address is deliberately demo-only. Production JWT mode fails
         # closed before this route rather than creating an unpaid order.
         address = (
-            CartAddress(email=customer.email, **supplied_address.model_dump())
+            build_cart_address(customer.email, **supplied_address.model_dump())
             if supplied_address is not None
-            else CartAddress(
+            else build_cart_address(
+                customer.email,
                 first_name=customer.first_name or "",
                 last_name=customer.last_name or "",
                 company=None,
@@ -177,7 +154,6 @@ def build_router(ctx: HostContext) -> APIRouter:
                 postal_code="00000",
                 country="US",
                 phone=None,
-                email=customer.email,
             )
         )
 

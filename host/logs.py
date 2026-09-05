@@ -43,7 +43,7 @@ class JsonFormatter(logging.Formatter):
 def configure_logging(level: str | None = None) -> None:
     """Install the JSON handler once; repeated calls only adjust the level."""
     root = logging.getLogger()
-    resolved = (level or os.getenv("ICOMMERCE_LOG_LEVEL", "INFO")).upper()
+    resolved = (level if level is not None else os.getenv("ICOMMERCE_LOG_LEVEL", "INFO")).upper()
     root.setLevel(resolved)
     for handler in root.handlers:
         if handler.get_name() == _HANDLER_NAME:

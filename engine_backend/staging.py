@@ -34,7 +34,7 @@ from pydantic import BaseModel
 from stateset_embedded import Commerce
 
 from engine_backend import money
-from engine_backend.catalog import catalog_rows, resolve_product_and_merch
+from engine_backend.catalog import catalog_rows, resolve_product_and_merch, stock_reader
 from engine_backend.custom_objects import (
     ensure_payload_type,
     list_payloads,
@@ -252,6 +252,7 @@ async def stage_listing_update(
         "unit_cost": "unit_cost",
     }
     change_items: list[ChangeItem] = []
+    before: Any
     for field, value in fields.items():
         if field == "description":
             before = product.description
@@ -324,7 +325,7 @@ async def stage_inventory_action(
     change_items: list[ChangeItem] = []
     for item in items:
         if item.action == "restock":
-            stock = await store.call(lambda c, sku=item.listing_id: c.inventory.get_stock(sku))
+            stock = await store.call(stock_reader(item.listing_id))
             before = float(stock.total_available) if stock is not None else 0.0
             quantity = item.quantity or 0
             change_items.append(

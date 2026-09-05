@@ -9,13 +9,18 @@ that both the direct and the stablecoin checkout share.
 
 from __future__ import annotations
 
+import json
+import logging
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
-from commerce_common.streaming import AgentEvent
+from commerce_common.streaming import AgentEvent, to_sse
 from fastapi import HTTPException, Request
+from fastapi.responses import StreamingResponse
 from merchant_agent.types import ChangeStatus, MerchantSessionContext, MerchantSessionState
 from merchant_agent_runtime import MerchantAgent
+from pydantic import BaseModel
 from shopping_agent.types import ShoppingSessionContext, ShoppingSessionState
 from shopping_agent_runtime import ShoppingAgent
 from stateset_embedded import CartAddress
@@ -29,8 +34,11 @@ from engine_backend.storefront import EngineStorefront
 
 from .auth import Authenticator, Identity
 from .metrics import HostMetrics
-from .sessions import SessionRegistry
+from .response_policy import TurnResponsePolicy, replace_latest_assistant_text
+from .sessions import ChatTurnBusy, ClaimedChat, SessionRegistry
 from .settings import HostSettings
+
+logger = logging.getLogger(__name__)
 
 _ROWAN_EMAIL = "rowan@example.invalid"
 _OPERATOR_ID = "user:acme-operator"
@@ -156,6 +164,132 @@ class HostContext:
             "order_number": result.get("order_number"),
             "receipt": receipt.model_dump(mode="json"),
         }
+
+    async def complete_settled_payment(
+        self,
+        payment_id: str,
+        payment: dict[str, Any],
+        *,
+        resume: bool,
+        correlation_id: str,
+        failure: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Commit the cart behind a settled stablecoin payment and mark it completed.
+
+        Both the shopper's settle route and the operator's reconciliation route end
+        here. The payment moves ``settled`` -> ``checkout_committing`` -> ``completed``;
+        any failure in between parks it in ``reconciliation_required`` with ``failure``
+        as its error and re-raises, so a settled transfer can never be charged twice and
+        never silently stays in ``checkout_committing``. ``resume`` lets the shopper
+        route re-enter a commit an earlier request started.
+        """
+        session_id = payment["session_id"]
+        from_states = {"settled", "checkout_committing"} if resume else {"settled"}
+        payment = await self.stablecoin_payments.transition(
+            payment_id, session_id, from_states, "checkout_committing"
+        )
+        try:
+            address_data = json.loads(payment["shipping_address_json"])
+            customer_id = payment["customer_id"]
+            customer = await self.store.call(lambda c: c.customers.get(customer_id))
+            if customer is None:
+                raise RuntimeError("payment customer no longer exists")
+            checkout_result = await self.commit_cart(
+                session_id=session_id,
+                cart_id=payment["cart_id"],
+                address=build_cart_address(customer.email, **address_data),
+                correlation_id=correlation_id,
+            )
+            payment = await self.stablecoin_payments.transition(
+                payment_id,
+                session_id,
+                {"checkout_committing"},
+                "completed",
+                order_number=checkout_result["order_number"],
+                checkout_receipt_json=json.dumps(
+                    checkout_result["receipt"], sort_keys=True, separators=(",", ":")
+                ),
+                last_error=None,
+            )
+        except Exception:
+            await self.stablecoin_payments.transition(
+                payment_id,
+                session_id,
+                {"checkout_committing"},
+                "reconciliation_required",
+                last_error=failure,
+            )
+            raise
+        return payment, checkout_result
+
+    # -- Chat turns -----------------------------------------------------------------
+
+    async def claim_chat[StateT: BaseModel](
+        self, registry: SessionRegistry[StateT], session_id: str
+    ) -> ClaimedChat[StateT]:
+        try:
+            return await registry.claim(session_id)
+        except ChatTurnBusy as error:
+            raise HTTPException(
+                status_code=409, detail="another chat turn is in progress"
+            ) from error
+
+    def stream_chat_turn[StateT: BaseModel](
+        self,
+        role: Literal["shopping", "merchant"],
+        registry: SessionRegistry[StateT],
+        claimed: ClaimedChat[StateT],
+        events: Callable[[], AsyncIterator[AgentEvent]],
+        *,
+        message: str,
+        request_id: str,
+        enrich: Callable[[AgentEvent], Awaitable[AgentEvent]] | None = None,
+        after_turn: Callable[[], None] | None = None,
+    ) -> StreamingResponse:
+        """One SSE turn: append the user message, stream the agent under the turn
+        lease, apply the last-mile response policy, then persist and release.
+
+        ``events`` is a factory so the agent generator is created only after the user
+        message is on the transcript. ``enrich`` runs per event (the merchant attaches
+        change evidence); ``after_turn`` runs once the agent is done, before persistence.
+        """
+        chat = claimed.session
+
+        async def event_stream() -> AsyncIterator[str]:
+            try:
+                chat.messages.append({"role": "user", "content": message})
+                policy = TurnResponsePolicy(role, message)
+                try:
+                    async for event in registry.stream(claimed, events()):
+                        if enrich is not None:
+                            event = await enrich(event)
+                        for checked in policy.accept(event):
+                            yield to_sse(checked)
+                    for checked in policy.flush():
+                        yield to_sse(checked)
+                    if policy.rewritten:
+                        replace_latest_assistant_text(chat.messages, policy.final_text)
+                        self.metrics.policy_rewrite(role)
+                        logger.warning(
+                            "response policy rewrote role=%s request_id=%s", role, request_id
+                        )
+                finally:
+                    if after_turn is not None:
+                        after_turn()
+            finally:
+                await registry.finish(claimed)
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+def build_cart_address(email: str | None, **fields: Any) -> CartAddress:
+    """Construct the engine's ``CartAddress``.
+
+    The binding's ``.pyi`` declares the class without an ``__init__``, so a direct
+    keyword construction is a type error even though the runtime accepts exactly these
+    fields. Funnel every construction through here so that stub gap is one line.
+    """
+    return CartAddress(email=email, **fields)  # type: ignore[call-arg]
 
 
 def _session_id(x_session_id: str | None) -> str:

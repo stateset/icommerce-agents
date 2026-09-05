@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from engine_backend import custom_objects, money
 from engine_backend.apply import CAMPAIGN_TYPE
-from engine_backend.catalog import resolve_product_and_merch, resolve_variant_row
+from engine_backend.catalog import resolve_product_and_merch, resolve_variant_row, stock_reader
 from engine_backend.store import EngineStore
 
 
@@ -28,7 +28,10 @@ class ReconciliationAssessment(BaseModel):
     items: list[ReconciliationItem]
 
 
-def _classified(target: str, field: str, before: Any, after: Any, observed: Any):
+def _classified(
+    target: str, field: str, before: Any, after: Any, observed: Any
+) -> ReconciliationItem:
+    state: Literal["matches_before", "matches_after", "diverged", "indeterminate"]
     if observed == after:
         state = "matches_after"
     elif observed == before:
@@ -56,7 +59,7 @@ async def assess(
             ChangeKind.PROMOTION,
         ):
             row = await resolve_variant_row(store, item.target)
-            observed = None if row is None else money.exact(row.variant.price_exact)
+            observed: Any = None if row is None else money.exact(row.variant.price_exact)
             items.append(
                 _classified(
                     item.target,
@@ -69,7 +72,7 @@ async def assess(
             continue
 
         if change.kind is ChangeKind.INVENTORY_ACTION and item.field == "stock":
-            stock = await store.call(lambda c, sku=item.target: c.inventory.get_stock(sku))
+            stock = await store.call(stock_reader(item.target))
             observed = None if stock is None else float(stock.total_available)
             classified = _classified(
                 item.target,
@@ -139,6 +142,7 @@ async def assess(
         )
 
     states = {item.state for item in items}
+    outcome: Literal["not_applied", "applied", "partial_or_diverged", "indeterminate"]
     if not items or "indeterminate" in states:
         outcome = "indeterminate"
     elif states == {"matches_after"}:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from decimal import Decimal
+from typing import Any
 
 from stateset_embedded import (
     Commerce,
@@ -44,7 +45,7 @@ def _price(value: str | int | float | Decimal) -> float:
     return money.to_float(money.exact(value))
 
 
-_CATALOG = [
+_CATALOG: list[dict[str, Any]] = [
     {
         "name": "Ridgeline 2-Person Tent",
         "description": "A three-season backpacking tent for two.",
