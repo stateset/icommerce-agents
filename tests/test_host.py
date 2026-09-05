@@ -344,6 +344,7 @@ def test_capabilities_reports_presence_never_validity(tmp_path, monkeypatch):
     assert body == {
         "assistant": "unconfigured",
         "stablecoin_checkout": "disabled",
+        "stablecoin_refunds": "disabled",
         "direct_checkout": "available",
     }
     assert "key" not in str(body).lower()

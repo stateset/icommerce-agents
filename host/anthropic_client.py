@@ -28,7 +28,7 @@ def build_anthropic_client() -> AsyncAnthropic | None:
 
     With ``ANTHROPIC_WORKSPACE_ID`` set, the returned client sends it as the
     ``anthropic-workspace-id`` header on every request, as an identity-linked key
-    requires. Without it, the client is unconfigured and behaves exactly as before.
+    requires. Without it, no workspace header is added.
     """
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return None

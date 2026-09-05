@@ -11,6 +11,51 @@ class ExampleState(BaseModel):
     seen: list[str] = []
 
 
+async def test_evicted_transcript_and_provenance_reload_from_database(tmp_path):
+    store = EngineStore(str(tmp_path / "cache.db"))
+    registry = SessionRegistry(ExampleState, store, "shopping", 60, max_cached_sessions=1)
+    for session_id in ("first", "second"):
+        store.bind(session_id, "customer", "customer")
+    first = await registry.claim("first")
+    first.session.state.seen.append("SKU-1")
+    first.session.messages.append({"role": "user", "content": "remember SKU-1"})
+    await registry.finish(first)
+    registry.start("second")
+    assert registry.get("first") is None
+    recovered = await registry.claim("first")
+    assert recovered.session.state.seen == ["SKU-1"]
+    assert recovered.session.messages[0]["content"] == "remember SKU-1"
+    await registry.finish(recovered)
+    assert len(registry._sessions) == 1
+
+
+async def test_active_turns_survive_cache_pressure(tmp_path):
+    store = EngineStore(str(tmp_path / "cache.db"))
+    registry = SessionRegistry(ExampleState, store, "shopping", 60, max_cached_sessions=1)
+    for session_id in ("first", "second"):
+        store.bind(session_id, "customer", "customer")
+    first = await registry.claim("first")
+    second = await registry.claim("second")
+    try:
+        assert registry.get("first") is first.session
+        assert registry.get("second") is second.session
+        assert len(registry._sessions) == 2
+    finally:
+        await registry.finish(first)
+        await registry.finish(second)
+    assert len(registry._sessions) == 1
+
+
+async def test_memory_only_sessions_are_not_evicted():
+    store = EngineStore(":memory:")
+    registry = SessionRegistry(ExampleState, store, "shopping", 60, max_cached_sessions=1)
+    first = await registry.claim("first")
+    first.session.state.seen.append("SKU-1")
+    await registry.finish(first)
+    registry.start("second")
+    assert registry.get("first").state.seen == ["SKU-1"]
+
+
 async def test_chat_transcript_and_provenance_survive_worker_change(tmp_path):
     db_path = str(tmp_path / "sessions.db")
     first_store = EngineStore(db_path)
@@ -47,7 +92,7 @@ async def test_only_one_worker_can_own_a_chat_turn(tmp_path):
     await second.finish(next_turn)
 
 
-async def test_expired_chat_lease_is_recoverable(tmp_path):
+async def test_expired_chat_lease_cannot_steal_a_live_workers_turn(tmp_path):
     db_path = str(tmp_path / "sessions.db")
     store = EngineStore(db_path)
     store.bind("session-1", "customer-1", "customer")
@@ -67,6 +112,9 @@ async def test_expired_chat_lease_is_recoverable(tmp_path):
         connection.close()
 
     recovered = SessionRegistry(ExampleState, EngineStore(db_path), "shopping", 60)
+    with pytest.raises(ChatTurnBusy):
+        await recovered.claim("session-1")
+    await first.finish(abandoned)
     claimed = await recovered.claim("session-1")
     assert claimed.owner != abandoned.owner
     await recovered.finish(claimed)

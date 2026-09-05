@@ -57,7 +57,7 @@ from engine_backend.listings import (
     to_listing,
 )
 from engine_backend.search import search as engine_search
-from engine_backend.store import EngineStore
+from engine_backend.store import EngineStore, MerchantOperationBusy
 
 
 class EngineMerchant(MerchantBackend):
@@ -439,6 +439,15 @@ class EngineMerchant(MerchantBackend):
     # -- Apply dispatch (the one place that mutates) ------------------------------
 
     async def apply_change(self, session: MerchantSessionContext, change_id: str) -> StagedChange:
+        try:
+            with self.store.merchant_operation(change_id):
+                return await self._apply_change_owned(session, change_id)
+        except MerchantOperationBusy as error:
+            raise ChangeNotApplicable(str(error)) from error
+
+    async def _apply_change_owned(
+        self, session: MerchantSessionContext, change_id: str
+    ) -> StagedChange:
         # Status-check + live writes + final status persistence are one logical
         # operation. Without an outer lock, two simultaneous calls can both observe
         # STAGED and execute the mutation before either one saves APPLIED.

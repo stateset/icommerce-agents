@@ -7,16 +7,25 @@ import hashlib
 import sqlite3
 import threading
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, TypeVar
 from uuid import uuid4
+from weakref import WeakValueDictionary
 
-from pydantic import BaseModel
+from pydantic import AwareDatetime, BaseModel, ConfigDict, ValidationError, field_validator
 from stateset_embedded import Commerce
 
+from engine_backend.async_utils import complete_before_cancelling
+from engine_backend.turn_locks import TurnLocks
+
 T = TypeVar("T")
+CONTROL_SCHEMA_VERSION = 2
+
+
+class MerchantOperationBusy(ValueError):
+    """A live worker still owns an apply or reconciliation operation."""
 
 
 @dataclass(frozen=True)
@@ -42,12 +51,19 @@ class ApprovalClaim:
 class PrincipalBinding(BaseModel):
     """Who a session acts for. Set by the host at session start; never a tool argument."""
 
+    model_config = ConfigDict(frozen=True)
+
     session_id: str
     subject_id: str
     kind: Literal["customer", "operator"]
     store_id: str
     authenticated_subject: str | None = None
-    expires_at: datetime | None = None
+    expires_at: AwareDatetime | None = None
+
+    @field_validator("expires_at")
+    @classmethod
+    def normalize_expiry(cls, value: datetime | None) -> datetime | None:
+        return value.astimezone(UTC) if value is not None else None
 
 
 class EngineStore:
@@ -107,8 +123,13 @@ class EngineStore:
     def __init__(self, db_path: str, store_id: str = "store:acme") -> None:
         self.db_path = db_path
         self.store_id = store_id
-        self._locks: dict[str, asyncio.Lock] = {}
+        # Owners and queued callers retain strong references; idle keys do not
+        # retain one lock forever for every session this worker has ever seen.
+        self._locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+        self._merchant_operations: set[str] = set()
+        self._merchant_operations_lock = threading.Lock()
         self._bindings: dict[str, PrincipalBinding] = {}
+        self._bindings_lock = threading.Lock()
         self._sql = threading.local()
         self._memory_approvals: dict[str, dict[str, Any]] = {}
         self._memory_target_leases: dict[str, tuple[str, str]] = {}
@@ -116,6 +137,7 @@ class EngineStore:
         self._memory_chat_leases: dict[tuple[str, str], str] = {}
         self._memory_approvals_lock = threading.Lock()
         self._memory_chat_leases_lock = threading.Lock()
+        self._turn_locks = TurnLocks(db_path) if db_path != ":memory:" else None
         # Create adapter-owned tables before opening the embedded engine. Opening and
         # closing Python's SQLite afterwards can invalidate the engine binding's WAL
         # view on some SQLite builds (the pin below exists for the same reason).
@@ -135,6 +157,25 @@ class EngineStore:
         connection = sqlite3.connect(self.db_path, timeout=30)
         try:
             connection.execute("PRAGMA busy_timeout = 30000")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS icommerce_agent_schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                )
+                """
+            )
+            row = connection.execute(
+                "SELECT MAX(version) FROM icommerce_agent_schema_migrations"
+            ).fetchone()
+            installed_version = int(row[0] or 0)
+            if installed_version > CONTROL_SCHEMA_VERSION:
+                raise RuntimeError(
+                    "control schema is newer than this application "
+                    f"({installed_version} > {CONTROL_SCHEMA_VERSION})"
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS icommerce_agent_approvals (
@@ -383,7 +424,71 @@ class EngineStore:
                 "CREATE INDEX IF NOT EXISTS idx_icommerce_agent_rate_limits_window_start "
                 "ON icommerce_agent_rate_limits(window_start)"
             )
+            if installed_version < 1:
+                connection.execute(
+                    "INSERT INTO icommerce_agent_schema_migrations "
+                    "(version, name, applied_at) VALUES (?, ?, ?)",
+                    (
+                        1,
+                        "baseline-v0.9-control-plane",
+                        self._now(),
+                    ),
+                )
+            if installed_version < 2:
+                connection.execute(
+                    """
+                    CREATE TABLE icommerce_stablecoin_refunds (
+                        refund_id TEXT PRIMARY KEY,
+                        payment_id TEXT NOT NULL,
+                        store_id TEXT NOT NULL,
+                        amount TEXT NOT NULL,
+                        amount_atomic TEXT NOT NULL,
+                        proposal_digest TEXT NOT NULL,
+                        idempotency_key TEXT NOT NULL UNIQUE,
+                        operator TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK (
+                            state IN (
+                                'submitting', 'completed', 'failed',
+                                'reconciliation_required'
+                            )
+                        ),
+                        transaction_hash TEXT UNIQUE,
+                        last_error TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY(payment_id)
+                            REFERENCES icommerce_stablecoin_payments(payment_id)
+                    )
+                    """
+                )
+                connection.execute(
+                    "CREATE INDEX idx_stablecoin_refunds_payment "
+                    "ON icommerce_stablecoin_refunds(payment_id, created_at)"
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE icommerce_stablecoin_refund_events (
+                        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        refund_id TEXT NOT NULL,
+                        event TEXT NOT NULL,
+                        occurred_at TEXT NOT NULL,
+                        detail TEXT
+                    )
+                    """
+                )
+                connection.execute(
+                    "CREATE INDEX idx_stablecoin_refund_events_refund "
+                    "ON icommerce_stablecoin_refund_events(refund_id, event_id)"
+                )
+                connection.execute(
+                    "INSERT INTO icommerce_agent_schema_migrations "
+                    "(version, name, applied_at) VALUES (?, ?, ?)",
+                    (2, "stablecoin-refund-ledger", self._now()),
+                )
             connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -762,10 +867,23 @@ class EngineStore:
         *,
         stale_before: datetime,
     ) -> None:
+        with self.merchant_operation(change_id):
+            self._recover_stale_approval(
+                change_id, operator, proposal_digest, stale_before=stale_before
+            )
+
+    def _recover_stale_approval(
+        self,
+        change_id: str,
+        operator: str,
+        proposal_digest: str,
+        *,
+        stale_before: datetime,
+    ) -> None:
         """Move an abandoned ``applying`` claim into explicit reconciliation.
 
         This never retries the write and never releases its target leases. The age gate
-        prevents an operator from racing a healthy worker; after the transition, the
+        and OS-held operation lock prevent racing a live worker; after the transition, the
         observed-state workflow decides what actually happened.
         """
         now = self._now()
@@ -1126,12 +1244,43 @@ class EngineStore:
         finally:
             connection.close()
 
+    @contextmanager
+    def merchant_operation(self, change_id: str):
+        """Exclude apply, resolution, and stale recovery for one proposal.
+
+        Durable state still arbitrates approvals and target ownership. This guard
+        additionally prevents a paused live operation being declared abandoned.
+        Callers retain it until engine work and final bookkeeping have drained.
+        """
+        owner = uuid4().hex
+        with self._merchant_operations_lock:
+            if change_id in self._merchant_operations:
+                raise MerchantOperationBusy(
+                    "merchant operation is still active; retry after it finishes"
+                )
+            self._merchant_operations.add(change_id)
+        try:
+            if self._turn_locks is not None and not self._turn_locks.acquire(
+                change_id, "merchant-operation", owner
+            ):
+                raise MerchantOperationBusy(
+                    "merchant operation is still active; retry after it finishes"
+                )
+            try:
+                yield
+            finally:
+                if self._turn_locks is not None:
+                    self._turn_locks.release(owner)
+        finally:
+            with self._merchant_operations_lock:
+                self._merchant_operations.remove(change_id)
+
     async def call(self, fn: Callable[[Commerce], T]) -> T:
-        return await asyncio.to_thread(fn, self.commerce)
+        return await complete_before_cancelling(asyncio.to_thread(fn, self.commerce))
 
     async def write(self, session_key: str, fn: Callable[[Commerce], T]) -> T:
         async with self.serialized(session_key):
-            return await asyncio.to_thread(fn, self.commerce)
+            return await complete_before_cancelling(asyncio.to_thread(fn, self.commerce))
 
     @asynccontextmanager
     async def serialized(self, operation_key: str):
@@ -1172,7 +1321,7 @@ class EngineStore:
 
         lock = self._locks.setdefault("direct_sql", asyncio.Lock())
         async with lock:
-            await asyncio.to_thread(body)
+            await complete_before_cancelling(asyncio.to_thread(body))
 
     def _pin_connection(self) -> sqlite3.Connection | None:
         """One read-only connection that joins the WAL index and then holds a share of it.
@@ -1282,22 +1431,21 @@ class EngineStore:
             authenticated_subject=authenticated_subject,
             expires_at=expires_at,
         )
-        self._bindings[session_id] = binding
         if self.db_path != ":memory:":
             connection = self._control_connection()
             try:
-                connection.execute(
+                cursor = connection.execute(
                     """
                     INSERT INTO icommerce_agent_sessions (
                         session_id, subject_id, kind, store_id,
                         authenticated_subject, expires_at
                     ) VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(session_id) DO UPDATE SET
-                        subject_id = excluded.subject_id,
-                        kind = excluded.kind,
-                        store_id = excluded.store_id,
-                        authenticated_subject = excluded.authenticated_subject,
                         expires_at = excluded.expires_at
+                    WHERE subject_id = excluded.subject_id
+                      AND kind = excluded.kind
+                      AND store_id = excluded.store_id
+                      AND authenticated_subject IS excluded.authenticated_subject
                     """,
                     (
                         session_id,
@@ -1305,12 +1453,24 @@ class EngineStore:
                         kind,
                         self.store_id,
                         authenticated_subject,
-                        expires_at.isoformat() if expires_at is not None else None,
+                        binding.expires_at.isoformat(timespec="microseconds")
+                        if binding.expires_at is not None
+                        else None,
                     ),
                 )
+                if cursor.rowcount != 1:
+                    raise ValueError("session identity cannot be rebound; start a new session")
                 connection.commit()
             finally:
                 connection.close()
+        else:
+            with self._bindings_lock:
+                existing = self._bindings.get(session_id)
+                if existing is not None and existing.model_dump(
+                    exclude={"expires_at"}
+                ) != binding.model_dump(exclude={"expires_at"}):
+                    raise ValueError("session identity cannot be rebound; start a new session")
+                self._bindings[session_id] = binding
         return binding
 
     def binding(self, session_id: str) -> PrincipalBinding:
@@ -1321,23 +1481,37 @@ class EngineStore:
                     "SELECT * FROM icommerce_agent_sessions WHERE session_id = ?",
                     (session_id,),
                 ).fetchone()
+                if row is None:
+                    raise KeyError(session_id)
+                try:
+                    binding = PrincipalBinding.model_validate(dict(row))
+                except ValidationError as error:
+                    # Corrupt/legacy naive expiries have no unambiguous instant.
+                    # Deny access rather than guess a timezone or produce an HTTP 500.
+                    raise KeyError(session_id) from error
+                if binding.expires_at is not None and binding.expires_at <= datetime.now(UTC):
+                    # A renewal can race this read. Remove only the expired
+                    # snapshot we observed, never its newly renewed replacement.
+                    connection.execute("PRAGMA foreign_keys = ON")
+                    connection.execute(
+                        "DELETE FROM icommerce_agent_sessions "
+                        "WHERE session_id = ? AND expires_at = ?",
+                        (session_id, row["expires_at"]),
+                    )
+                    connection.commit()
+                    raise KeyError(session_id)
+                return binding
             finally:
                 connection.close()
-            if row is None:
-                self._bindings.pop(session_id, None)
-                raise KeyError(session_id)
-            binding = PrincipalBinding.model_validate(dict(row))
-            self._bindings[session_id] = binding
-        else:
+        with self._bindings_lock:
             binding = self._bindings[session_id]
-        if binding.expires_at is not None and binding.expires_at <= datetime.now(UTC):
-            self.unbind(session_id)
-            raise KeyError(session_id)
-        return binding
+            if binding.expires_at is not None and binding.expires_at <= datetime.now(UTC):
+                self._bindings.pop(session_id)
+                raise KeyError(session_id)
+            return binding
 
     def unbind(self, session_id: str) -> None:
         """Revoke a durable session binding; missing ids are already revoked."""
-        self._bindings.pop(session_id, None)
         if self.db_path != ":memory:":
             connection = self._control_connection()
             try:
@@ -1348,32 +1522,49 @@ class EngineStore:
                 connection.commit()
             finally:
                 connection.close()
+        else:
+            with self._bindings_lock:
+                self._bindings.pop(session_id, None)
 
     def cleanup_expired_sessions(self) -> int:
         """Delete expired identity/workflow state and its chat/cart children."""
         if self.db_path == ":memory:":
-            now = datetime.now(UTC)
-            expired = [
-                session_id
-                for session_id, binding in self._bindings.items()
-                if binding.expires_at is not None and binding.expires_at <= now
-            ]
-            for session_id in expired:
-                self.unbind(session_id)
-            return len(expired)
+            with self._bindings_lock:
+                now = datetime.now(UTC)
+                expired = [
+                    session_id
+                    for session_id, binding in self._bindings.items()
+                    if binding.expires_at is not None and binding.expires_at <= now
+                ]
+                for session_id in expired:
+                    self._bindings.pop(session_id)
+                return len(expired)
         connection = self._control_connection()
         try:
             now = datetime.now(UTC)
             connection.execute("PRAGMA foreign_keys = ON")
-            cursor = connection.execute(
-                "DELETE FROM icommerce_agent_sessions "
-                "WHERE expires_at IS NOT NULL AND expires_at <= ?",
+            rows = connection.execute(
+                "SELECT * FROM icommerce_agent_sessions "
+                "WHERE expires_at IS NOT NULL AND julianday(expires_at) <= julianday(?)",
                 (now.isoformat(),),
+            ).fetchall()
+            expired = []
+            for row in rows:
+                try:
+                    binding = PrincipalBinding.model_validate(dict(row))
+                except ValidationError:
+                    # Preserve ambiguous records for operator repair. binding()
+                    # rejects them; cleanup must not invent an expiry instant.
+                    continue
+                # SQLite's date conversion handles legacy offsets but rounds to
+                # milliseconds. Confirm in Python before deleting a future row.
+                if binding.expires_at is not None and binding.expires_at <= now:
+                    expired.append((row["session_id"], row["expires_at"]))
+            cursor = connection.executemany(
+                "DELETE FROM icommerce_agent_sessions WHERE session_id = ? AND expires_at = ?",
+                expired,
             )
             connection.commit()
-            for session_id, binding in list(self._bindings.items()):
-                if binding.expires_at is not None and binding.expires_at <= now:
-                    self._bindings.pop(session_id, None)
             return cursor.rowcount
         finally:
             connection.close()
@@ -1443,6 +1634,22 @@ class EngineStore:
     ) -> tuple[str, dict[str, Any]] | None:
         """Atomically own a chat turn and return the latest durable snapshot."""
         owner = uuid4().hex
+        if self._turn_locks is not None:
+            if not self._turn_locks.acquire(session_id, role, owner):
+                return None
+        try:
+            claimed = self._claim_chat_turn(session_id, role, lease_seconds, owner)
+            if claimed is None and self._turn_locks is not None:
+                self._turn_locks.release(owner)
+            return claimed
+        except BaseException:
+            if self._turn_locks is not None:
+                self._turn_locks.release(owner)
+            raise
+
+    def _claim_chat_turn(
+        self, session_id: str, role: str, lease_seconds: int, owner: str
+    ) -> tuple[str, dict[str, Any]] | None:
         if self.db_path == ":memory:":
             key = (session_id, role)
             with self._memory_chat_leases_lock:
@@ -1513,6 +1720,15 @@ class EngineStore:
         state_json: str,
         messages_json: str,
     ) -> None:
+        try:
+            self._finish_chat_turn(session_id, role, owner, state_json, messages_json)
+        finally:
+            if self._turn_locks is not None:
+                self._turn_locks.release(owner)
+
+    def _finish_chat_turn(
+        self, session_id: str, role: str, owner: str, state_json: str, messages_json: str
+    ) -> None:
         if self.db_path == ":memory:":
             with self._memory_chat_leases_lock:
                 if self._memory_chat_leases.get((session_id, role)) != owner:
@@ -1536,6 +1752,13 @@ class EngineStore:
             connection.close()
 
     def release_chat_turn(self, session_id: str, role: str, owner: str) -> None:
+        try:
+            self._release_chat_turn(session_id, role, owner)
+        finally:
+            if self._turn_locks is not None:
+                self._turn_locks.release(owner)
+
+    def _release_chat_turn(self, session_id: str, role: str, owner: str) -> None:
         if self.db_path == ":memory:":
             with self._memory_chat_leases_lock:
                 if self._memory_chat_leases.get((session_id, role)) == owner:

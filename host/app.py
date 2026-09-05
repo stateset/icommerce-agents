@@ -27,7 +27,7 @@ import secrets
 import sqlite3
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -64,12 +64,16 @@ from engine_backend.stablecoins import (
     FacilitatorUncertain,
     PaymentConflict,
     PaymentNotFound,
+    RefundNotFound,
+    RefundProvider,
+    RefundUncertain,
     StablecoinConfig,
     StablecoinPayments,
     public_payment,
+    public_refund,
 )
 from engine_backend.staging import STAGED_TYPE, load_evidence
-from engine_backend.store import EngineStore
+from engine_backend.store import EngineStore, MerchantOperationBusy
 from engine_backend.storefront import EngineStorefront
 
 from .anthropic_client import build_anthropic_client
@@ -141,6 +145,12 @@ class RefundPreviewRequest(BaseModel):
 class RefundApplyRequest(RefundPreviewRequest):
     proposal_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     idempotency_key: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+
+
+class StablecoinRefundReconciliationRequest(BaseModel):
+    resolution: Literal["confirmed_refunded", "confirmed_not_refunded"]
+    transaction_hash: str | None = Field(default=None, pattern=r"^0x[0-9a-fA-F]{64}$")
+    note: str = Field(min_length=8, max_length=500)
 
 
 class ReconciliationRequest(BaseModel):
@@ -234,6 +244,7 @@ def create_app(
     stale_apply_seconds: int | None = None,
     stablecoin_config: StablecoinConfig | None = None,
     stablecoin_facilitator: Facilitator | None = None,
+    stablecoin_refund_provider: RefundProvider | None = None,
 ) -> FastAPI:
     """Build one deployment: one engine store (seeded), both backends, one kernel
     client bound to the host-owned policy and principal files, and both agents."""
@@ -248,9 +259,7 @@ def create_app(
     merchant = EngineMerchant(store, kernel)
     authenticator = Authenticator(auth_config or AuthConfig.from_env())
     stablecoin_config = stablecoin_config or StablecoinConfig.from_env()
-    stablecoin_payments = StablecoinPayments(
-        store, stablecoin_config, facilitator=stablecoin_facilitator
-    )
+    stablecoin_config.validate()
     stale_apply_seconds = (
         int(os.getenv("ICOMMERCE_STALE_APPLY_SECONDS", "900"))
         if stale_apply_seconds is None
@@ -268,6 +277,33 @@ def create_app(
     if rate_limit_per_minute < 0:
         raise ValueError("request rate limit cannot be negative")
 
+    metrics_token = os.getenv("ICOMMERCE_METRICS_TOKEN")
+    if metrics_token is not None and len(metrics_token.encode()) < 32:
+        raise ValueError("metrics token must be at least 32 bytes")
+    # Validate deployment settings before allocating any network clients.
+    # The storefront and portal call the host from separate origins. Production
+    # origins must be explicit; there is deliberately no wildcard fallback.
+    allowed_origins = [
+        origin.strip()
+        for origin in os.getenv(
+            "ICOMMERCE_ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:3100"
+        ).split(",")
+        if origin.strip()
+    ]
+    _validate_production_deployment(
+        environment=os.getenv("ICOMMERCE_ENVIRONMENT", "development").strip().lower(),
+        db_path=db_path,
+        auth_config=authenticator.config,
+        allowed_origins=allowed_origins,
+        metrics_token=metrics_token,
+        rate_limit_per_minute=rate_limit_per_minute,
+    )
+    stablecoin_payments = StablecoinPayments(
+        store,
+        stablecoin_config,
+        facilitator=stablecoin_facilitator,
+        refund_provider=stablecoin_refund_provider,
+    )
     anthropic_client = build_anthropic_client()
     shopping_agent = ShoppingAgent(
         backend=storefront,
@@ -289,38 +325,18 @@ def create_app(
         MerchantSessionState, store, "merchant", chat_lease_seconds
     )
     metrics = HostMetrics()
-    metrics_token = os.getenv("ICOMMERCE_METRICS_TOKEN")
-    if metrics_token is not None and len(metrics_token.encode()) < 32:
-        raise ValueError("metrics token must be at least 32 bytes")
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        try:
+        # Both agents share this client. Close it once, and attempt every cleanup
+        # even if a provider's close raises (including cancellation).
+        async with AsyncExitStack() as cleanup:
+            if anthropic_client is not None:
+                cleanup.push_async_callback(anthropic_client.close)
+            cleanup.push_async_callback(stablecoin_payments.aclose)
             yield
-        finally:
-            await stablecoin_payments.aclose()
 
     app = FastAPI(title="StateSet iCommerce agents host", lifespan=lifespan)
-
-    # `web/storefront` (:3000) and `web/portal` (:3100) call this host from their own
-    # origin -- there is no reverse proxy or Next.js rewrite in front of either -- so a
-    # browser refuses to expose any response to their JS without this. Production
-    # origins are configured explicitly; there is deliberately no wildcard fallback.
-    allowed_origins = [
-        origin.strip()
-        for origin in os.getenv(
-            "ICOMMERCE_ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:3100"
-        ).split(",")
-        if origin.strip()
-    ]
-    _validate_production_deployment(
-        environment=os.getenv("ICOMMERCE_ENVIRONMENT", "development").strip().lower(),
-        db_path=db_path,
-        auth_config=authenticator.config,
-        allowed_origins=allowed_origins,
-        metrics_token=metrics_token,
-        rate_limit_per_minute=rate_limit_per_minute,
-    )
 
     @app.middleware("http")
     async def authenticate_commerce_request(request: Request, call_next):
@@ -501,6 +517,13 @@ def create_app(
         ):
             raise HTTPException(status_code=403, detail="payment reconciliation access required")
 
+    def _require_refund_operator(request: Request) -> None:
+        if authenticator.config.mode == "demo":
+            return
+        identity: Identity | None = request.state.identity
+        if identity is None or not identity.permits(role="merchant_admin", scope="payments:refund"):
+            raise HTTPException(status_code=403, detail="payment refund access required")
+
     # -- Sessions -----------------------------------------------------------------
 
     @app.post("/shopping/session")
@@ -601,7 +624,9 @@ def create_app(
             try:
                 chat.messages.append({"role": "user", "content": request.message})
                 policy = TurnResponsePolicy("shopping", request.message)
-                async for event in shopping_agent.stream_turn(chat.messages, session, chat.state):
+                async for event in shopping_sessions.stream(
+                    claimed, shopping_agent.stream_turn(chat.messages, session, chat.state)
+                ):
                     for checked in policy.accept(event):
                         yield to_sse(checked)
                 for checked in policy.flush():
@@ -956,7 +981,7 @@ def create_app(
     async def stablecoin_reconciliation_queue(
         x_session_id: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        """Operator queue of payments that may still need settlement/order recovery."""
+        """Recent completed payments and any transfer needing operator recovery."""
         if not stablecoin_config.enabled:
             raise HTTPException(status_code=404, detail="stablecoin checkout is not configured")
         session = _bound_merchant_context(x_session_id)
@@ -1081,8 +1106,8 @@ def create_app(
                 chat.messages.append({"role": "user", "content": request.message})
                 policy = TurnResponsePolicy("merchant", request.message)
                 try:
-                    async for event in merchant_agent.stream_turn(
-                        chat.messages, session, chat.state
+                    async for event in merchant_sessions.stream(
+                        claimed, merchant_agent.stream_turn(chat.messages, session, chat.state)
                     ):
                         enriched = await _with_change_evidence(store, event)
                         for checked in policy.accept(enriched):
@@ -1220,6 +1245,15 @@ def create_app(
         x_session_id: str | None = Header(default=None),
     ) -> dict[str, Any]:
         session = _bound_merchant_context(x_session_id)
+        try:
+            with store.merchant_operation(change_id):
+                return await _resolve_reconciliation(change_id, request, session)
+        except MerchantOperationBusy as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    async def _resolve_reconciliation(
+        change_id: str, request: ReconciliationRequest, session: MerchantSessionContext
+    ) -> dict[str, Any]:
         record = await staging.load_record(store, change_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"no change with id {change_id!r}")
@@ -1352,6 +1386,96 @@ def create_app(
 
     # -- Merchant: governed refunds -------------------------------------------------
 
+    @app.post("/merchant/stablecoin-refunds/preview")
+    async def merchant_stablecoin_refund_preview(
+        request: RefundPreviewRequest,
+        x_session_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Build a digest-bound on-chain refund proposal without moving funds."""
+        session = _bound_merchant_context(x_session_id)
+        if not stablecoin_payments.refunds_available:
+            raise HTTPException(status_code=404, detail="stablecoin refunds are not configured")
+        try:
+            return await stablecoin_payments.preview_refund(
+                request.payment_id, session.merchant_id, request.amount
+            )
+        except PaymentNotFound as error:
+            raise HTTPException(status_code=404, detail="stablecoin payment not found") from error
+        except (PaymentConflict, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/merchant/stablecoin-refunds")
+    async def merchant_stablecoin_refund_apply(
+        request: RefundApplyRequest,
+        http_request: Request,
+        x_session_id: str | None = Header(default=None),
+    ) -> JSONResponse:
+        """Human-only, idempotent refund through the configured treasury adapter."""
+        session = _bound_merchant_context(x_session_id)
+        _require_refund_operator(http_request)
+        if not stablecoin_payments.refunds_available:
+            raise HTTPException(status_code=404, detail="stablecoin refunds are not configured")
+        try:
+            refund = await stablecoin_payments.refund(
+                payment_id=request.payment_id,
+                store_id=session.merchant_id,
+                amount=request.amount,
+                proposal_digest=request.proposal_digest,
+                idempotency_key=request.idempotency_key,
+                operator=session.operator,
+            )
+        except PaymentNotFound as error:
+            raise HTTPException(status_code=404, detail="stablecoin payment not found") from error
+        except RefundUncertain as error:
+            metrics.stablecoin_payment("refund", "reconciliation_required")
+            assert error.refund is not None
+            return JSONResponse(status_code=202, content=public_refund(error.refund))
+        except (PaymentConflict, ValueError) as error:
+            metrics.stablecoin_payment("refund", "rejected")
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        outcome = "completed" if refund["state"] == "completed" else refund["state"]
+        metrics.stablecoin_payment("refund", outcome)
+        status = 202 if refund["state"] in {"submitting", "reconciliation_required"} else 200
+        return JSONResponse(status_code=status, content=public_refund(refund))
+
+    @app.get("/merchant/stablecoin-refunds")
+    async def merchant_stablecoin_refund_list(
+        x_session_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        session = _bound_merchant_context(x_session_id)
+        if not stablecoin_payments.refunds_available:
+            raise HTTPException(status_code=404, detail="stablecoin refunds are not configured")
+        items = await stablecoin_payments.list_refunds(session.merchant_id)
+        return {"refunds": [public_refund(item) for item in items]}
+
+    @app.post("/merchant/stablecoin-refunds/{refund_id}/reconcile")
+    async def merchant_stablecoin_refund_reconcile(
+        refund_id: str,
+        request: StablecoinRefundReconciliationRequest,
+        http_request: Request,
+        x_session_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        session = _bound_merchant_context(x_session_id)
+        _require_payment_reconciler(http_request)
+        if not stablecoin_payments.refunds_available:
+            raise HTTPException(status_code=404, detail="stablecoin refunds are not configured")
+        try:
+            refund = await stablecoin_payments.reconcile_refund(
+                refund_id,
+                session.merchant_id,
+                refunded=request.resolution == "confirmed_refunded",
+                transaction_hash=request.transaction_hash,
+                note=f"{session.operator}: {request.note}",
+            )
+            metrics.stablecoin_payment("refund_reconcile", refund["state"])
+            return public_refund(refund)
+        except RefundNotFound as error:
+            raise HTTPException(status_code=404, detail="stablecoin refund not found") from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except PaymentConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
     @app.post("/merchant/refunds/preview")
     async def merchant_refund_preview(
         request: RefundPreviewRequest,
@@ -1378,6 +1502,7 @@ def create_app(
         payment and exact amount.
         """
         session = _bound_merchant_context(x_session_id)
+        _require_refund_operator(http_request)
         try:
             proposal = await refunds.preview(store, request.payment_id, request.amount)
         except KeyError as error:
@@ -1423,6 +1548,13 @@ def create_app(
         return {
             "assistant": "available" if anthropic_client is not None else "unconfigured",
             "stablecoin_checkout": "available" if stablecoin_config.enabled else "disabled",
+            "stablecoin_refunds": (
+                "available"
+                if stablecoin_payments.refunds_available
+                else "deployment_integration_required"
+                if stablecoin_config.enabled
+                else "disabled"
+            ),
             "direct_checkout": "available" if authenticator.config.mode == "demo" else "disabled",
         }
 
