@@ -13,7 +13,7 @@
     "eslint-config-next": "^16.3.4",
     "jsdom": "^26.1.0",
     "playwright-core": "^1.62.1",
-    "vitest": "^3.2.7"
+    "vitest": "^4.1.11"
   },
   "scripts": {
     "lint": "npm run lint --workspaces --if-present",
