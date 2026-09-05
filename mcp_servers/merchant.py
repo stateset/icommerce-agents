@@ -15,7 +15,6 @@ before this server's ``apply_change`` can consume the durable approval.
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -35,14 +34,11 @@ from engine_backend.kernel import KernelClient
 from engine_backend.merchant import EngineMerchant
 from engine_backend.seed import seed_store
 from engine_backend.store import EngineStore
+from mcp_servers.settings import McpSettings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = REPO_ROOT / "config"
 
-DEFAULT_HOST = os.environ.get("MERCHANT_MCP_HOST", "127.0.0.1")
-DEFAULT_PORT = int(os.environ.get("MERCHANT_MCP_PORT", "8301"))
-DEFAULT_OPERATOR = os.environ.get("ACME_OPERATOR", "user:acme-operator")
-DEFAULT_SESSION_ID = os.environ.get("MERCHANT_MCP_SESSION_ID", "mcp-merchant")
 
 # The MCP client has no per-request context block; the registry's inline-context
 # description drops the reference to it, same as upstream's server.
@@ -72,9 +68,8 @@ def default_config() -> MerchantAgentConfig:
     )
 
 
-def _default_memory_store() -> MemoryStore:
-    path = os.environ.get("MERCHANT_MCP_MEMORY_FILE", REPO_ROOT / ".merchant_mcp_memory.json")
-    return JsonFileMemoryStore(Path(path))
+def _default_memory_store(settings: McpSettings) -> MemoryStore:
+    return JsonFileMemoryStore(settings.memory_file)
 
 
 def build_merchant_server(
@@ -83,15 +78,17 @@ def build_merchant_server(
     config: MerchantAgentConfig | None = None,
     memory_store: MemoryStore | None = None,
     operator: str | None = None,
-    host: str = DEFAULT_HOST,
-    port: int = DEFAULT_PORT,
+    host: str | None = None,
+    port: int | None = None,
+    settings: McpSettings | None = None,
 ) -> FastMCP:
     """The merchant role's MCP server, wired to an ``EngineStore`` at ``db_path``. The
     store is seeded (idempotently) and the operator is bound once, from ``operator`` or
     ``ACME_OPERATOR`` — never from a tool argument."""
-    enforce_local_only_bind(
-        host, server="merchant", unsafe_env_var="MERCHANT_MCP_UNSAFE_ALLOW_NO_AUTH"
-    )
+    settings = settings or McpSettings.merchant()
+    host = settings.host if host is None else host
+    port = settings.port if port is None else port
+    enforce_local_only_bind(host, server="merchant", unsafe_env_var=settings.unsafe_env_var)
     cfg = (config or default_config()).model_copy(update={"stage_shows_preview": False})
     if cfg.require_host_approval:
         print(
@@ -108,12 +105,12 @@ def build_merchant_server(
     )
     backend = EngineMerchant(store, kernel)
 
-    op = operator or DEFAULT_OPERATOR
-    session_id = DEFAULT_SESSION_ID
+    op = operator or settings.principal
+    session_id = settings.session_id
     store.bind(session_id, op, "operator")
 
     memory = build_memory(
-        cfg, memory_store if memory_store is not None else _default_memory_store()
+        cfg, memory_store if memory_store is not None else _default_memory_store(settings)
     )
     session = MerchantSessionContext(session_id=session_id, merchant_id=store.store_id, operator=op)
     executors = ConnectionExecutors(
@@ -271,11 +268,11 @@ def build_merchant_server(
 
 
 def main() -> None:
-    db_path = os.environ.get("MERCHANT_MCP_DB", str(REPO_ROOT / "data" / "acme.db"))
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    settings = McpSettings.merchant()
+    Path(settings.db_path).parent.mkdir(parents=True, exist_ok=True)
     run(
-        build_merchant_server(db_path),
-        url=f"http://{DEFAULT_HOST}:{DEFAULT_PORT}/mcp",
+        build_merchant_server(settings.db_path, settings=settings),
+        url=settings.url,
         warning=(
             "this reference server has no authentication of its own; anyone who reaches "
             "it can read store data and stage or apply changes. Expose it only behind "

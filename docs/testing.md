@@ -94,6 +94,13 @@ engine, and never a model.
   Type checking (`tsc --noEmit`) and ESLint run in the CI `web` job through
   `npm run typecheck` and `npm run lint`; Next 16 removed `next lint`, so those scripts
   are the only lint and type gates the web workspace has.
+- The web unit tests (`npm test`, vitest): the shared BFF's origin and cross-site rules
+  (`web/shared/bff.test.ts`), the portal's evidence rows and approval flow
+  (`web/portal/app/components/*.test.tsx`), the storefront cart panel's exact-total
+  display, demo checkout, stablecoin quote/sign/settle and pending-payment recovery
+  (`web/storefront/app/components/CartPanel.test.tsx`), and the EIP-712 payment
+  authorization the wallet signs (`web/storefront/lib/stablecoin.test.ts`), driven by a
+  scripted EIP-1193 provider.
 - The opt-in production JWT boundary: issuer, audience, expiry, roles/scopes, store
   tenancy, customer provisioning, and token-subject/session binding (`tests/test_auth.py`).
 - The last-mile host response boundary: affirmative claims that a merely staged change
