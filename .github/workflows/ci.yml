@@ -109,7 +109,7 @@ jobs:
       - name: lint web apps
         run: npm run lint
 
-      - name: test the shared web package (BFF rules) and portal components
+      - name: web unit tests (BFF rules, portal and storefront components, wallet signing)
         run: npm test
 
       - name: build storefront

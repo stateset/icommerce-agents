@@ -24,6 +24,12 @@ the authoritative commit-level record; notable operator-visible changes are list
 
 ### Added
 
+- `mcp_servers/settings.py`: each MCP server's bind address, principal, session id,
+  store, and memory file are read once and validated before the store opens; the
+  variables are tabulated in `docs/mcp.md`.
+- Storefront tests: the cart panel's exact-total display, demo checkout, stablecoin
+  quote/sign/settle, reconciliation warning, and pending-payment recovery, plus the
+  EIP-712 authorization the wallet signs, driven by a scripted EIP-1193 provider.
 - `mypy` over `engine_backend/`, `host/`, and `mcp_servers/`, clean and required in CI
   and the release workflow.
 - `pytest-xdist`: the suite runs in parallel by default and finishes in about two and

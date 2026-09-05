@@ -263,7 +263,7 @@ python scripts/denials.py
 npm audit --audit-level=high
 npm run typecheck
 npm run lint
-npm test          # shared web package (BFF rules) and portal components
+npm test          # BFF rules, portal and storefront components, wallet signing
 npm run build --workspace web/storefront
 npm run build --workspace web/portal
 ```
@@ -300,7 +300,8 @@ explains exactly what green CI proves—and what it does not.
   CORS, correlation), `routes/` (system, sessions, shopping, stablecoin, merchant,
   refunds), `context.py`, `schemas.py`, `settings.py`, JWT identity, response policy,
   JSON logging, and metrics.
-- `mcp_servers/` — role-specific MCP entry points over the same adapters and gates.
+- `mcp_servers/` — role-specific MCP entry points over the same adapters and gates;
+  `settings.py` reads and validates each server's identity and bind address.
 - `web/storefront/`, `web/portal/` — customer and operator applications;
   `web/shared/` holds the BFF proxy, API helpers, and host types they have in common.
 - `config/` — deployment-owned kernel policy and principal; never model input.
