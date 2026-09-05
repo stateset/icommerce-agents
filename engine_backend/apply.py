@@ -79,7 +79,7 @@ async def validate_preconditions(
             if item.field != "price":
                 continue
             row = await resolve_variant_row(ctx.store, item.target)
-            current = None if row is None else money.exact(row.variant.price_exact)
+            current: Any = None if row is None else money.exact(row.variant.price_exact)
             expected = money.exact(item.before)
             if current != expected:
                 raise ChangeNotApplicable(

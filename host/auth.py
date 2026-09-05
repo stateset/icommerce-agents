@@ -35,7 +35,7 @@ class AuthConfig:
         if mode not in ("demo", "jwt"):
             raise ValueError("ICOMMERCE_AUTH_MODE must be 'demo' or 'jwt'")
         return cls(
-            mode=mode,
+            mode="jwt" if mode == "jwt" else "demo",
             issuer=os.getenv("ICOMMERCE_JWT_ISSUER"),
             audience=os.getenv("ICOMMERCE_JWT_AUDIENCE"),
             jwks_url=os.getenv("ICOMMERCE_JWKS_URL"),

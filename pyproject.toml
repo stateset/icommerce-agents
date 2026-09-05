@@ -27,5 +27,13 @@ dependencies = [
   "mcp<2",
 ]
 
+[tool.mypy]
+python_version = "3.12"
+files = ["engine_backend", "host", "mcp_servers"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["engine_backend", "host", "mcp_servers"]

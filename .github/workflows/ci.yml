@@ -53,6 +53,9 @@ jobs:
       - name: ruff format --check
         run: ruff format --check .
 
+      - name: mypy
+        run: mypy
+
       - name: pytest
         run: pytest
 
@@ -105,6 +108,9 @@ jobs:
 
       - name: lint web apps
         run: npm run lint
+
+      - name: test the shared web package (BFF origin and cross-site rules)
+        run: npm test
 
       - name: build storefront
         run: npm run build --workspace web/storefront

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from collections import Counter
+from collections import Counter, defaultdict
 
 
 class HostMetrics:
@@ -17,7 +17,7 @@ class HostMetrics:
         self._stablecoin_payments: Counter[tuple[str, str]] = Counter()
         self._duration_buckets: Counter[tuple[str, str, float]] = Counter()
         self._duration_count: Counter[tuple[str, str]] = Counter()
-        self._duration_sum: Counter[tuple[str, str]] = Counter()
+        self._duration_sum: defaultdict[tuple[str, str], float] = defaultdict(float)
 
     def request(self, method: str, route: str, status: int, duration_seconds: float) -> None:
         with self._lock:

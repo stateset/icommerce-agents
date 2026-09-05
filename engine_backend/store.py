@@ -141,7 +141,7 @@ class EngineStore:
         # view on some SQLite builds (the pin below exists for the same reason).
         self._ensure_control_schema()
         self.commerce = Commerce(db_path)
-        self._pin = self._pin_connection()
+        self._pin: sqlite3.Connection = self._pin_connection()
 
     def _ensure_control_schema(self) -> None:
         """Create the adapter-owned durable control plane beside engine tables.
@@ -423,7 +423,7 @@ class EngineStore:
         """Batch-read append-only approval/apply history for the operator UI."""
         if not change_ids:
             return {}
-        grouped = {change_id: [] for change_id in change_ids}
+        grouped: dict[str, list[dict[str, Any]]] = {change_id: [] for change_id in change_ids}
         connection = self._control_connection()
         try:
             placeholders = ",".join("?" for _ in change_ids)
@@ -703,17 +703,14 @@ class EngineStore:
                 )
             self._merchant_operations.add(change_id)
         try:
-            if self._turn_locks is not None and not self._turn_locks.acquire(
-                change_id, "merchant-operation", owner
-            ):
+            if not self._turn_locks.acquire(change_id, "merchant-operation", owner):
                 raise MerchantOperationBusy(
                     "merchant operation is still active; retry after it finishes"
                 )
             try:
                 yield
             finally:
-                if self._turn_locks is not None:
-                    self._turn_locks.release(owner)
+                self._turn_locks.release(owner)
         finally:
             with self._merchant_operations_lock:
                 self._merchant_operations.remove(change_id)
@@ -766,7 +763,7 @@ class EngineStore:
         async with lock:
             await complete_before_cancelling(asyncio.to_thread(body))
 
-    def _pin_connection(self) -> sqlite3.Connection | None:
+    def _pin_connection(self) -> sqlite3.Connection:
         """One read-only connection that joins the WAL index and then holds a share of it.
 
         This repo has two independent SQLite libraries open on one file: the engine's
@@ -1033,17 +1030,15 @@ class EngineStore:
     ) -> tuple[str, dict[str, Any]] | None:
         """Atomically own a chat turn and return the latest durable snapshot."""
         owner = uuid4().hex
-        if self._turn_locks is not None:
-            if not self._turn_locks.acquire(session_id, role, owner):
-                return None
+        if not self._turn_locks.acquire(session_id, role, owner):
+            return None
         try:
             claimed = self._claim_chat_turn(session_id, role, lease_seconds, owner)
-            if claimed is None and self._turn_locks is not None:
+            if claimed is None:
                 self._turn_locks.release(owner)
             return claimed
         except BaseException:
-            if self._turn_locks is not None:
-                self._turn_locks.release(owner)
+            self._turn_locks.release(owner)
             raise
 
     def _claim_chat_turn(
@@ -1110,8 +1105,7 @@ class EngineStore:
         try:
             self._finish_chat_turn(session_id, role, owner, state_json, messages_json)
         finally:
-            if self._turn_locks is not None:
-                self._turn_locks.release(owner)
+            self._turn_locks.release(owner)
 
     def _finish_chat_turn(
         self, session_id: str, role: str, owner: str, state_json: str, messages_json: str
@@ -1136,8 +1130,7 @@ class EngineStore:
         try:
             self._release_chat_turn(session_id, role, owner)
         finally:
-            if self._turn_locks is not None:
-                self._turn_locks.release(owner)
+            self._turn_locks.release(owner)
 
     def _release_chat_turn(self, session_id: str, role: str, owner: str) -> None:
         connection = self._control_connection()

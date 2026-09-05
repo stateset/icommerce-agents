@@ -8,7 +8,9 @@ the Rust crate but is not bound in Python 1.28.5. docs/mapping.md lists that rea
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from pydantic import BaseModel, Field
 from stateset_embedded import Commerce, Product, ProductVariant
@@ -109,6 +111,12 @@ async def resolve_product_and_merch(
     return None
 
 
+def stock_reader(sku: str) -> Callable[[Commerce], Any]:
+    """A binding call that reads one SKU's stock; built per SKU so a loop's closure
+    binds the value, not the loop variable."""
+    return lambda c: c.inventory.get_stock(sku)
+
+
 async def catalog_rows(store: EngineStore) -> list[CatalogRow]:
     """Every purchasable variant with its product, merchandising, and stock."""
     products = await store.call(lambda c: c.products.list())
@@ -116,7 +124,7 @@ async def catalog_rows(store: EngineStore) -> list[CatalogRow]:
     for product in products:
         merch = await read_merchandising(store, product.id)
         for variant in await list_variants(store, product.id):
-            stock = await store.call(lambda c, s=variant.sku: c.inventory.get_stock(s))
+            stock = await store.call(stock_reader(variant.sku))
             rows.append(
                 CatalogRow(
                     product=product,

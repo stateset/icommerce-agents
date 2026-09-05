@@ -10,7 +10,7 @@ available on the shape for each side to pick from.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, cast
 
 from merchant_agent.types import Listing
 from stateset_embedded import Product, ProductVariant
@@ -148,10 +148,9 @@ def _content_quality(merch: Merchandising) -> Literal["good", "needs_work", "poo
 def _status(
     product_status: str, in_stock: bool
 ) -> Literal["active", "paused", "draft", "out_of_stock"]:
-    base = product_status if product_status in _STATUSES else "active"
-    if base == "active" and not in_stock:
-        return "out_of_stock"
-    return base
+    if product_status == "active" or product_status not in _STATUSES:
+        return "active" if in_stock else "out_of_stock"
+    return cast(Literal["active", "paused", "draft", "out_of_stock"], product_status)
 
 
 def _to_listing(listing_shape: ListingShape) -> Listing:

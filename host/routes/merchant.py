@@ -6,11 +6,10 @@ called; the operator comes from the session binding, never the request body."""
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from commerce_common.streaming import to_sse
+from commerce_common.streaming import AgentEvent
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from merchant_agent.changes import ChangeNotApplicable
@@ -23,7 +22,6 @@ from engine_backend.staging import STAGED_TYPE
 from engine_backend.store import MerchantOperationBusy
 
 from ..context import HostContext, _with_change_evidence
-from ..response_policy import TurnResponsePolicy, replace_latest_assistant_text
 from ..schemas import (
     ApprovalRequest,
     ChatTurnRequest,
@@ -41,7 +39,6 @@ def build_router(ctx: HostContext) -> APIRouter:
     merchant = ctx.merchant
     merchant_agent = ctx.merchant_agent
     merchant_sessions = ctx.merchant_sessions
-    metrics = ctx.metrics
     stale_apply_seconds = ctx.settings.stale_apply_seconds
     _bound_merchant_context = ctx.bound_merchant_context
 
@@ -52,45 +49,30 @@ def build_router(ctx: HostContext) -> APIRouter:
         x_session_id: str | None = Header(default=None),
     ) -> StreamingResponse:
         session = _bound_merchant_context(x_session_id)
-        try:
-            claimed = await merchant_sessions.claim(session.session_id)
-        except ChatTurnBusy as error:
-            raise HTTPException(
-                status_code=409, detail="another chat turn is in progress"
-            ) from error
+        claimed = await ctx.claim_chat(merchant_sessions, session.session_id)
         chat = claimed.session
         chat.state.approved_change_ids.update(merchant.approved_ids)
 
-        async def event_stream() -> AsyncIterator[str]:
-            try:
-                chat.messages.append({"role": "user", "content": request.message})
-                policy = TurnResponsePolicy("merchant", request.message)
-                try:
-                    async for event in merchant_sessions.stream(
-                        claimed, merchant_agent.stream_turn(chat.messages, session, chat.state)
-                    ):
-                        enriched = await _with_change_evidence(store, event)
-                        for checked in policy.accept(enriched):
-                            yield to_sse(checked)
-                    for checked in policy.flush():
-                        yield to_sse(checked)
-                    if policy.rewritten:
-                        replace_latest_assistant_text(chat.messages, policy.final_text)
-                        metrics.policy_rewrite("merchant")
-                        logger.warning(
-                            "response policy rewrote role=merchant request_id=%s",
-                            http_request.state.request_id,
-                        )
-                finally:
-                    # The upstream gate and the engine adapter deliberately enforce
-                    # approval independently. The backend consumes its mark on an apply
-                    # attempt; mirror that consumption into session state after every
-                    # turn so a failed attempt cannot retain a stale upstream approval.
-                    chat.state.approved_change_ids.intersection_update(merchant.approved_ids)
-            finally:
-                await merchant_sessions.finish(claimed)
+        async def enrich(event: AgentEvent) -> AgentEvent:
+            return await _with_change_evidence(store, event)
 
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
+        def reconcile_approvals() -> None:
+            # The upstream gate and the engine adapter deliberately enforce approval
+            # independently. The backend consumes its mark on an apply attempt; mirror
+            # that consumption into session state after every turn so a failed attempt
+            # cannot retain a stale upstream approval.
+            chat.state.approved_change_ids.intersection_update(merchant.approved_ids)
+
+        return ctx.stream_chat_turn(
+            "merchant",
+            merchant_sessions,
+            claimed,
+            lambda: merchant_agent.stream_turn(chat.messages, session, chat.state),
+            message=request.message,
+            request_id=http_request.state.request_id,
+            enrich=enrich,
+            after_turn=reconcile_approvals,
+        )
 
     @router.post("/merchant/changes/{change_id}/approve")
     async def merchant_approve_change(
@@ -137,6 +119,8 @@ def build_router(ctx: HostContext) -> APIRouter:
         finally:
             await merchant_sessions.finish(claimed)
         approval = store.approval_record(change_id)
+        if approval is None:
+            raise HTTPException(status_code=500, detail="approval record missing after approval")
         return {
             "change_id": change_id,
             "approved_by": session.operator,
