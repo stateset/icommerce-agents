@@ -256,10 +256,14 @@ trust boundary.
 ```bash
 ruff check .
 ruff format --check .
-pytest
+mypy
+pytest            # parallel by default; add -n 0 for a serial run
 python scripts/check.py
 python scripts/denials.py
 npm audit --audit-level=high
+npm run typecheck
+npm run lint
+npm test          # the shared web package: BFF origin and cross-site rules
 npm run build --workspace web/storefront
 npm run build --workspace web/portal
 ```

@@ -22,7 +22,7 @@ const RESPONSE_HEADERS = [
 ] as const;
 const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
-function upstreamOrigin(): string {
+export function upstreamOrigin(): string {
   const value = process.env.ICOMMERCE_API_URL ?? "http://127.0.0.1:8000";
   const parsed = new URL(value);
   const local = parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost";
@@ -35,7 +35,7 @@ function upstreamOrigin(): string {
   return parsed.origin;
 }
 
-function sameOriginMutation(request: NextRequest): boolean {
+export function sameOriginMutation(request: NextRequest): boolean {
   if (!MUTATING.has(request.method)) return true;
   if (request.headers.get("sec-fetch-site") === "cross-site") return false;
   const origin = request.headers.get("origin");

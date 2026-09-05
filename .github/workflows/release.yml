@@ -63,6 +63,7 @@ jobs:
           python -m pip check
           ruff check .
           ruff format --check .
+          mypy
           pytest
           python scripts/check.py
           python scripts/denials.py
@@ -72,6 +73,7 @@ jobs:
           npm audit --audit-level=high
           npm run typecheck
           npm run lint
+          npm test
           npm run build --workspace web/storefront
           npm run build --workspace web/portal
           npx playwright install --with-deps chromium

@@ -39,6 +39,9 @@ engine on a *new* file runs its own migrations and costs about 2.5 seconds; reop
 an existing file costs a quarter of that, which is the difference between a seven-minute
 suite and a three-minute one. Tests that need a fresh, unseeded, or deliberately legacy
 database (`tests/test_store.py`, `tests/test_backup_store.py`) still build their own.
+The suite runs in parallel by default (`-n auto` in `pytest.ini`); nothing in it binds a
+fixed port or shares a path, and each worker seeds its own template. Pass `-n 0` for a
+serial run when debugging.
 
 One file per module in `engine_backend/`, `host/`, and `mcp_servers/`, plus the suites
 listed below. All of it runs against `EngineMerchant`/`EngineStorefront` over a real,

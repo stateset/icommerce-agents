@@ -5,6 +5,25 @@ the authoritative commit-level record; notable operator-visible changes are list
 
 ## [Unreleased]
 
+### Changed
+
+- The shopper's settle route and the operator's reconciliation route complete a settled
+  stablecoin payment through one path; any failure between `settled` and `completed`
+  parks the payment in `reconciliation_required` instead of leaving it committing.
+- Both chat routes stream through one turn helper: claim, response policy, persistence,
+  and lease release are written once.
+- Missing engine records (a customer behind a session or a payment, the approval record
+  after an approve) are refused explicitly instead of raising attribute errors.
+
+### Added
+
+- `mypy` over `engine_backend/`, `host/`, and `mcp_servers/`, clean and required in CI
+  and the release workflow.
+- `pytest-xdist`: the suite runs in parallel by default and finishes in about two and
+  a half minutes on four cores.
+- Vitest coverage for the shared web package: the BFF's upstream-origin validation,
+  cross-site mutation rejection, header allow-lists, and the control-request helper.
+
 ## [0.10.0] - 2026-09-05
 
 ### Changed

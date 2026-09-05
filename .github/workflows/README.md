@@ -34,7 +34,9 @@ be enabled by an administrator; workflow files cannot silently grant those contr
 
 Checks out the repo with `submodules: recursive` (`vendor/commerce-agents` is a git
 submodule), installs `requirements-dev.txt`, and runs, in order: `pip check`,
-`ruff check .`, `ruff format --check .`, `pytest`, `scripts/check.py` (the drift check between code
+`ruff check .`, `ruff format --check .`, `mypy` (over `engine_backend/`, `host/`, and
+`mcp_servers/`, configured in `pyproject.toml`), `pytest` (parallel through
+`pytest-xdist`; each worker seeds its own engine template), `scripts/check.py` (the drift check between code
 and documentation), `scripts/denials.py` (the three end-to-end refusals: a cart
 write blocked for lack of provenance, an apply blocked for lack of approval, and an
 over-refund the engine itself rejects inside the transaction), and `scripts/tour.py`
