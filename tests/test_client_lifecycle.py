@@ -11,13 +11,13 @@ from host.app import create_app
 
 
 @pytest.mark.parametrize("failure", [None, RuntimeError, asyncio.CancelledError])
-async def test_shutdown_attempts_every_client(tmp_path, monkeypatch, failure):
+async def test_shutdown_attempts_every_client(engine_db, monkeypatch, failure):
     claude = SimpleNamespace(close=AsyncMock())
     facilitator = SimpleNamespace(aclose=AsyncMock())
     refund_provider = SimpleNamespace(aclose=AsyncMock(side_effect=failure))
     monkeypatch.setattr("host.app.build_anthropic_client", lambda: claude)
     app = create_app(
-        str(tmp_path / "store.db"),
+        engine_db("store.db"),
         stablecoin_config=StablecoinConfig(enabled=False),
         stablecoin_facilitator=facilitator,
         stablecoin_refund_provider=refund_provider,
@@ -57,11 +57,11 @@ async def test_payment_cleanup_supports_optional_and_synchronous_close():
     provider.aclose.assert_called_once()
 
 
-async def test_keyless_host_still_closes_payments(tmp_path, monkeypatch):
+async def test_keyless_host_still_closes_payments(engine_db, monkeypatch):
     monkeypatch.setattr("host.app.build_anthropic_client", lambda: None)
     provider = SimpleNamespace(aclose=AsyncMock())
     app = create_app(
-        str(tmp_path / "store.db"),
+        engine_db("store.db"),
         stablecoin_config=StablecoinConfig(enabled=False),
         stablecoin_facilitator=provider,
     )
@@ -81,7 +81,7 @@ async def test_keyless_host_still_closes_payments(tmp_path, monkeypatch):
     ],
 )
 def test_invalid_config_does_not_allocate_network_clients(
-    tmp_path, monkeypatch, setting, value, message
+    engine_db, monkeypatch, setting, value, message
 ):
     monkeypatch.setenv(setting, value)
     claude_factory = Mock()
@@ -89,6 +89,6 @@ def test_invalid_config_does_not_allocate_network_clients(
     monkeypatch.setattr("host.app.build_anthropic_client", claude_factory)
     monkeypatch.setattr("host.app.StablecoinPayments", payment_factory)
     with pytest.raises(ValueError, match=message):
-        create_app(str(tmp_path / "store.db"), stablecoin_config=StablecoinConfig(enabled=False))
+        create_app(engine_db("store.db"), stablecoin_config=StablecoinConfig(enabled=False))
     claude_factory.assert_not_called()
     payment_factory.assert_not_called()

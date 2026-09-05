@@ -18,9 +18,9 @@ class ExampleState(BaseModel):
 
 @pytest.mark.parametrize("operation", ["write", "call", "sql"])
 async def test_cancelled_engine_work_keeps_outer_lock_until_thread_exits(
-    tmp_path, monkeypatch, operation
+    engine_db, monkeypatch, operation
 ):
-    store = EngineStore(str(tmp_path / "store.db"))
+    store = EngineStore(engine_db("store.db"))
     loop = asyncio.get_running_loop()
     started = asyncio.Event()
     release = threading.Event()
@@ -74,9 +74,8 @@ async def test_cancelled_engine_work_keeps_outer_lock_until_thread_exits(
     assert second_entered.is_set()
 
 
-@pytest.mark.parametrize("memory", [False, True])
-async def test_cancelled_chat_claim_releases_late_acquired_lease(tmp_path, monkeypatch, memory):
-    store = EngineStore(":memory:" if memory else str(tmp_path / "sessions.db"))
+async def test_cancelled_chat_claim_releases_late_acquired_lease(engine_db, monkeypatch):
+    store = EngineStore(engine_db("sessions.db"))
     store.bind("session", "customer", "customer")
     registry = SessionRegistry(ExampleState, store, "shopping", 60)
     loop = asyncio.get_running_loop()
@@ -102,8 +101,9 @@ async def test_cancelled_chat_claim_releases_late_acquired_lease(tmp_path, monke
     await registry.finish(claimed)
 
 
-async def test_failed_memory_claim_does_not_leak_local_lock(monkeypatch):
-    store = EngineStore(":memory:")
+async def test_failed_claim_does_not_block_the_next_claim(engine_db, monkeypatch):
+    store = EngineStore(engine_db("sessions.db"))
+    store.bind("session", "customer", "customer")
     registry = SessionRegistry(ExampleState, store, "shopping", 60)
     original = store.claim_chat_turn
 
@@ -118,8 +118,8 @@ async def test_failed_memory_claim_does_not_leak_local_lock(monkeypatch):
     await registry.finish(claimed)
 
 
-async def test_cancelled_finish_persists_state_before_releasing_lease(tmp_path, monkeypatch):
-    store = EngineStore(str(tmp_path / "sessions.db"))
+async def test_cancelled_finish_persists_state_before_releasing_lease(engine_db, monkeypatch):
+    store = EngineStore(engine_db("sessions.db"))
     store.bind("session", "customer", "customer")
     registry = SessionRegistry(ExampleState, store, "shopping", 60)
     claimed = await registry.claim("session")
@@ -170,8 +170,8 @@ async def test_completion_drains_work_inside_cancelled_anyio_scope():
     assert finished.is_set()
 
 
-async def test_lost_heartbeat_stops_agent_and_releases_lease(tmp_path):
-    store = EngineStore(str(tmp_path / "sessions.db"))
+async def test_lost_heartbeat_stops_agent_and_releases_lease(engine_db):
+    store = EngineStore(engine_db("sessions.db"))
     store.bind("session", "customer", "customer")
     registry = SessionRegistry(ExampleState, store, "shopping", 60)
     claimed = await registry.claim("session")

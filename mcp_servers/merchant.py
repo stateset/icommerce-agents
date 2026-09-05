@@ -271,7 +271,8 @@ def build_merchant_server(
 
 
 def main() -> None:
-    db_path = os.environ.get("MERCHANT_MCP_DB", str(REPO_ROOT / "acme.db"))
+    db_path = os.environ.get("MERCHANT_MCP_DB", str(REPO_ROOT / "data" / "acme.db"))
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     run(
         build_merchant_server(db_path),
         url=f"http://{DEFAULT_HOST}:{DEFAULT_PORT}/mcp",

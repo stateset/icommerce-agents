@@ -50,6 +50,9 @@ def _wait_for_host(base_url: str, timeout: float = 30.0) -> bool:
 
 
 def main() -> int:
+    from host.logs import configure_logging
+
+    configure_logging()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--web", action="store_true", help="also start the storefront and merchant web apps"
@@ -115,7 +118,9 @@ def main() -> int:
 def build_app():
     """The uvicorn factory target: ``host.app.create_app`` over ``DEMO_DB_PATH``."""
     from host.app import create_app
+    from host.logs import configure_logging
 
+    configure_logging()
     db_path = os.environ.get("DEMO_DB_PATH", str(REPO_ROOT / "data" / "demo.db"))
     return create_app(db_path)
 

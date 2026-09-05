@@ -19,8 +19,8 @@ def _payment_id(db_path: str) -> str:
     return EngineStore(db_path).commerce.payments.list()[0].id
 
 
-def test_refund_is_previewed_digest_bound_and_governed(tmp_path):
-    db_path = str(tmp_path / "store.db")
+def test_refund_is_previewed_digest_bound_and_governed(engine_db):
+    db_path = engine_db("store.db")
     client = TestClient(create_app(db_path))
     headers = _merchant(client)
     payment_id = _payment_id(db_path)
@@ -63,8 +63,8 @@ def test_refund_is_previewed_digest_bound_and_governed(tmp_path):
     assert applied.json()["receipt"]["status"] == "succeeded"
 
 
-def test_engine_refuses_over_refund_through_operator_route(tmp_path):
-    db_path = str(tmp_path / "store.db")
+def test_engine_refuses_over_refund_through_operator_route(engine_db):
+    db_path = engine_db("store.db")
     client = TestClient(create_app(db_path))
     headers = _merchant(client)
     payment_id = _payment_id(db_path)
@@ -88,8 +88,8 @@ def test_engine_refuses_over_refund_through_operator_route(tmp_path):
     assert response.json()["detail"]["sealed"] is True
 
 
-def test_refund_routes_require_a_merchant_session_and_validate_money(tmp_path):
-    db_path = str(tmp_path / "store.db")
+def test_refund_routes_require_a_merchant_session_and_validate_money(engine_db):
+    db_path = engine_db("store.db")
     client = TestClient(create_app(db_path))
     payment_id = _payment_id(db_path)
     assert (
@@ -118,14 +118,14 @@ def test_refund_routes_require_a_merchant_session_and_validate_money(tmp_path):
     )
 
 
-def test_refund_apply_requires_dedicated_permission_in_jwt_mode(tmp_path):
+def test_refund_apply_requires_dedicated_permission_in_jwt_mode(engine_db):
     auth = AuthConfig(
         mode="jwt",
         issuer="https://identity.example.test",
         audience="icommerce-host",
         hs256_secret=AUTH_SECRET,
     )
-    client = TestClient(create_app(str(tmp_path / "store.db"), auth_config=auth))
+    client = TestClient(create_app(engine_db("store.db"), auth_config=auth))
     now = datetime.now(UTC)
     token = jwt.encode(
         {

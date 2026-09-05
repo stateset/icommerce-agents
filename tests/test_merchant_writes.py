@@ -187,14 +187,14 @@ async def test_failure_after_mutation_starts_requires_reconciliation(store, kern
         await backend.apply_change(session(), competing.change_id)
 
 
-async def test_durable_approval_survives_backend_recreation(tmp_path):
+async def test_durable_approval_survives_backend_recreation(engine_db):
     from pathlib import Path
 
     from engine_backend.kernel import KernelClient
     from engine_backend.seed import seed_store
     from engine_backend.store import EngineStore
 
-    db_path = str(tmp_path / "durable.db")
+    db_path = engine_db("durable.db")
     first_store = EngineStore(db_path)
     seed_store(first_store.commerce)
     first = EngineMerchant(

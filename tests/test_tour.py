@@ -6,8 +6,8 @@ from __future__ import annotations
 from scripts.tour import main, run_tour
 
 
-def test_run_tour_places_an_order_and_records_both_evidence_kinds(tmp_path):
-    result = run_tour(str(tmp_path / "tour.db"))
+def test_run_tour_places_an_order_and_records_both_evidence_kinds(engine_db):
+    result = run_tour(engine_db("tour.db"))
     assert result.ok, result.steps
     assert result.order_number
     assert result.refused_unapproved_apply is True

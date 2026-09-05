@@ -14,6 +14,7 @@ from merchant_agent.types import InventoryActionItem, MerchantSessionContext, Pr
 from stateset_embedded import CreateProductVariantInput
 
 import host.app as host_app
+import host.context as host_context
 from engine_backend.merchant import EngineMerchant
 from engine_backend.staging import load_evidence
 
@@ -87,10 +88,11 @@ def test_no_regex_remains_anywhere_in_the_evidence_path():
     This is a source-text check, not a guarantee: `from re import search as _s` (or any
     other alias/indirection) would slip past it. It catches the coupling this module
     actually had, not every conceivable way to reintroduce a regex."""
-    source = inspect.getsource(host_app)
-    assert "import re" not in source
-    assert "re.compile" not in source
-    assert "re.search" not in source
+    for module in (host_app, host_context):
+        source = inspect.getsource(module)
+        assert "import re" not in source
+        assert "re.compile" not in source
+        assert "re.search" not in source
 
 
 async def test_a_change_update_without_a_change_id_passes_through_unchanged(store, kernel):
@@ -116,6 +118,6 @@ async def test_a_staged_change_update_costs_no_evidence_read(store, kernel, monk
     async def fail(*args, **kwargs):
         raise AssertionError("load_evidence was called for a change that cannot have any")
 
-    monkeypatch.setattr(host_app, "load_evidence", fail)
+    monkeypatch.setattr(host_context, "load_evidence", fail)
     event = AgentEvent(type="change_update", data={"change": staged.model_dump(mode="json")})
     assert await host_app._with_change_evidence(store, event) is event

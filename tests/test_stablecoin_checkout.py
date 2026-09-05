@@ -116,11 +116,11 @@ def _signature(quote: dict) -> str:
 
 
 def _client(
-    tmp_path, facilitator: FakeFacilitator, refund_provider: FakeRefundProvider | None = None
+    engine_db, facilitator: FakeFacilitator, refund_provider: FakeRefundProvider | None = None
 ) -> TestClient:
     return TestClient(
         create_app(
-            str(tmp_path / "store.db"),
+            engine_db("store.db"),
             stablecoin_config=_config(refunds=refund_provider is not None),
             stablecoin_facilitator=facilitator,
             stablecoin_refund_provider=refund_provider,
@@ -157,8 +157,8 @@ def _complete_payment(client: TestClient) -> dict:
     return response.json()
 
 
-def test_capabilities_never_imply_stablecoin_refunds_are_implemented(tmp_path):
-    client = _client(tmp_path, FakeFacilitator())
+def test_capabilities_never_imply_stablecoin_refunds_are_implemented(engine_db):
+    client = _client(engine_db, FakeFacilitator())
 
     capabilities = client.get("/capabilities").json()
 
@@ -166,9 +166,9 @@ def test_capabilities_never_imply_stablecoin_refunds_are_implemented(tmp_path):
     assert capabilities["stablecoin_refunds"] == "deployment_integration_required"
 
 
-def test_stablecoin_refund_is_digest_bound_idempotent_and_balance_limited(tmp_path):
+def test_stablecoin_refund_is_digest_bound_idempotent_and_balance_limited(engine_db):
     provider = FakeRefundProvider()
-    client = _client(tmp_path, FakeFacilitator(), provider)
+    client = _client(engine_db, FakeFacilitator(), provider)
     payment = _complete_payment(client)
     merchant = {"X-Session-Id": client.post("/merchant/session").json()["session_id"]}
 
@@ -216,9 +216,9 @@ def test_stablecoin_refund_is_digest_bound_idempotent_and_balance_limited(tmp_pa
     assert "unrefunded" in over.json()["detail"]
 
 
-def test_uncertain_stablecoin_refund_requires_explicit_reconciliation(tmp_path):
+def test_uncertain_stablecoin_refund_requires_explicit_reconciliation(engine_db):
     provider = FakeRefundProvider(uncertain=True)
-    client = _client(tmp_path, FakeFacilitator(), provider)
+    client = _client(engine_db, FakeFacilitator(), provider)
     payment = _complete_payment(client)
     merchant = {"X-Session-Id": client.post("/merchant/session").json()["session_id"]}
     proposal = client.post(
@@ -253,9 +253,9 @@ def test_uncertain_stablecoin_refund_requires_explicit_reconciliation(tmp_path):
     assert resolved.json()["transaction_hash"] == "0x" + "e" * 64
 
 
-def test_x402_quote_settles_and_commits_through_the_kernel(tmp_path):
+def test_x402_quote_settles_and_commits_through_the_kernel(engine_db):
     facilitator = FakeFacilitator()
-    client = _client(tmp_path, facilitator)
+    client = _client(engine_db, facilitator)
     headers, quote, payment_required = _cart_and_quote(client)
 
     challenge = json.loads(base64.b64decode(payment_required))
@@ -293,9 +293,9 @@ def test_x402_quote_settles_and_commits_through_the_kernel(tmp_path):
     assert facilitator.settle_calls == 1
 
 
-def test_cart_change_invalidates_an_immutable_payment_quote(tmp_path):
+def test_cart_change_invalidates_an_immutable_payment_quote(engine_db):
     facilitator = FakeFacilitator()
-    client = _client(tmp_path, facilitator)
+    client = _client(engine_db, facilitator)
     headers, quote, _ = _cart_and_quote(client)
     client.post(
         "/shopping/cart/add",
@@ -314,8 +314,8 @@ def test_cart_change_invalidates_an_immutable_payment_quote(tmp_path):
     assert facilitator.settle_calls == 0
 
 
-def test_a_cart_can_have_only_one_nonterminal_payment_quote(tmp_path):
-    client = _client(tmp_path, FakeFacilitator())
+def test_a_cart_can_have_only_one_nonterminal_payment_quote(engine_db):
+    client = _client(engine_db, FakeFacilitator())
     headers, first, _ = _cart_and_quote(client)
     duplicate = client.post(
         "/shopping/checkout/stablecoin/quote",
@@ -326,9 +326,9 @@ def test_a_cart_can_have_only_one_nonterminal_payment_quote(tmp_path):
     assert first["paymentId"] in duplicate.json()["detail"]
 
 
-def test_abandoned_pre_settlement_work_is_safely_resumed(tmp_path):
+def test_abandoned_pre_settlement_work_is_safely_resumed(engine_db, tmp_path):
     facilitator = FakeFacilitator()
-    client = _client(tmp_path, facilitator)
+    client = _client(engine_db, facilitator)
     headers, quote, _ = _cart_and_quote(client)
     with sqlite3.connect(tmp_path / "store.db") as connection:
         connection.execute(
@@ -347,8 +347,8 @@ def test_abandoned_pre_settlement_work_is_safely_resumed(tmp_path):
     assert facilitator.settle_calls == 1
 
 
-def test_abandoned_settlement_moves_to_the_operator_recovery_queue(tmp_path):
-    client = _client(tmp_path, FakeFacilitator())
+def test_abandoned_settlement_moves_to_the_operator_recovery_queue(engine_db, tmp_path):
+    client = _client(engine_db, FakeFacilitator())
     _, quote, _ = _cart_and_quote(client)
     with sqlite3.connect(tmp_path / "store.db") as connection:
         connection.execute(
@@ -366,9 +366,9 @@ def test_abandoned_settlement_moves_to_the_operator_recovery_queue(tmp_path):
     assert "unknown external outcome" in payment["last_error"]
 
 
-def test_unknown_settlement_is_never_blindly_retried(tmp_path):
+def test_unknown_settlement_is_never_blindly_retried(engine_db):
     facilitator = FakeFacilitator(settle_uncertain=True)
-    client = _client(tmp_path, facilitator)
+    client = _client(engine_db, facilitator)
     headers, quote, _ = _cart_and_quote(client)
 
     first = client.post(
@@ -407,17 +407,17 @@ def test_unknown_settlement_is_never_blindly_retried(tmp_path):
     assert facilitator.settle_calls == 1
 
 
-def test_payment_status_is_scoped_to_the_shopping_session(tmp_path):
-    client = _client(tmp_path, FakeFacilitator())
+def test_payment_status_is_scoped_to_the_shopping_session(engine_db):
+    client = _client(engine_db, FakeFacilitator())
     _, quote, _ = _cart_and_quote(client)
     other = {"X-Session-Id": client.post("/shopping/session").json()["session_id"]}
     response = client.get(f"/shopping/payments/{quote['paymentId']}", headers=other)
     assert response.status_code == 404
 
 
-def test_invalid_facilitator_payer_does_not_settle(tmp_path):
+def test_invalid_facilitator_payer_does_not_settle(engine_db):
     facilitator = FakeFacilitator(payer="0x4444444444444444444444444444444444444444")
-    client = _client(tmp_path, facilitator)
+    client = _client(engine_db, facilitator)
     headers, quote, _ = _cart_and_quote(client)
     response = client.post(
         f"/shopping/checkout/stablecoin/{quote['paymentId']}",
@@ -516,7 +516,7 @@ async def test_http_refund_provider_binds_idempotency_and_keeps_credentials_serv
     assert json.loads(seen[0].content) == {"refundId": "rfnd_1"}
 
 
-def test_manual_payment_reconciliation_requires_a_dedicated_permission(tmp_path):
+def test_manual_payment_reconciliation_requires_a_dedicated_permission(engine_db):
     auth = AuthConfig(
         mode="jwt",
         issuer="https://identity.example.test",
@@ -525,7 +525,7 @@ def test_manual_payment_reconciliation_requires_a_dedicated_permission(tmp_path)
     )
     client = TestClient(
         create_app(
-            str(tmp_path / "store.db"),
+            engine_db("store.db"),
             auth_config=auth,
             stablecoin_config=_config(),
             stablecoin_facilitator=FakeFacilitator(),

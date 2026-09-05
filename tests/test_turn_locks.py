@@ -16,8 +16,8 @@ def _hold_turn(db_path, ready):
     signal.pause()
 
 
-def test_paused_worker_cannot_be_replaced_but_dead_worker_can(tmp_path):
-    db_path = str(tmp_path / "store.db")
+def test_paused_worker_cannot_be_replaced_but_dead_worker_can(engine_db):
+    db_path = engine_db("store.db")
     store = EngineStore(db_path)
     store.bind("session", "customer", "customer")
     store.initialize_chat_session("session", "shopping", "{}", "[]")
@@ -55,9 +55,9 @@ def test_paused_worker_cannot_be_replaced_but_dead_worker_can(tmp_path):
         child.close()
 
 
-def test_locks_isolate_roles_sessions_and_exact_owners(tmp_path):
-    first = TurnLocks(str(tmp_path / "store.db"))
-    second = TurnLocks(str(tmp_path / "store.db"))
+def test_locks_isolate_roles_sessions_and_exact_owners(engine_db):
+    first = TurnLocks(engine_db("store.db"))
+    second = TurnLocks(engine_db("store.db"))
     assert first.acquire("session", "shopping", "a")
     try:
         assert not second.acquire("session", "shopping", "b")

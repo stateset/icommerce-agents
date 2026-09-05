@@ -29,6 +29,7 @@ import ast
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -50,7 +51,8 @@ def check_no_abstract_methods() -> list[str]:
     from engine_backend.store import EngineStore
     from engine_backend.storefront import EngineStorefront
 
-    store = EngineStore(":memory:")
+    with tempfile.TemporaryDirectory() as directory:
+        store = EngineStore(str(Path(directory) / "check.db"))
     kernel_stub = KernelClient.__new__(KernelClient)
     for name, cls, args in (
         ("EngineStorefront", EngineStorefront, (store,)),

@@ -5,9 +5,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def test_all_three_denials_are_demonstrated(tmp_path):
+def test_all_three_denials_are_demonstrated(engine_db):
     result = subprocess.run(
-        [sys.executable, "scripts/denials.py", "--db", str(tmp_path / "store.db")],
+        [sys.executable, "scripts/denials.py", "--db", engine_db("store.db")],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -19,12 +19,12 @@ def test_all_three_denials_are_demonstrated(tmp_path):
     assert "receipt" in out.lower()
 
 
-def test_a_rerun_against_the_same_db_produces_all_three_denials_again(tmp_path):
+def test_a_rerun_against_the_same_db_produces_all_three_denials_again(engine_db):
     """A fixed idempotency key on the over-refund attempt would make a second run
     against the same store replay the first run's idempotency conflict instead of the
     over-refund denial. Run twice against one `--db` file and assert both runs show
     all three denials -- not two denials and a conflict."""
-    db_path = str(tmp_path / "store.db")
+    db_path = engine_db("store.db")
 
     for attempt in (1, 2):
         result = subprocess.run(

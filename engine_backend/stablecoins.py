@@ -324,8 +324,6 @@ class StablecoinLedger:
     """Transactional access to the adapter-owned payment and audit tables."""
 
     def __init__(self, store: EngineStore, processing_timeout_seconds: int) -> None:
-        if store.db_path == ":memory:":
-            raise ValueError("stablecoin checkout requires a durable file-backed store")
         self.store = store
         self.processing_timeout_seconds = processing_timeout_seconds
 

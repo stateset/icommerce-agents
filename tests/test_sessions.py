@@ -11,8 +11,8 @@ class ExampleState(BaseModel):
     seen: list[str] = []
 
 
-async def test_evicted_transcript_and_provenance_reload_from_database(tmp_path):
-    store = EngineStore(str(tmp_path / "cache.db"))
+async def test_evicted_transcript_and_provenance_reload_from_database(engine_db):
+    store = EngineStore(engine_db("cache.db"))
     registry = SessionRegistry(ExampleState, store, "shopping", 60, max_cached_sessions=1)
     for session_id in ("first", "second"):
         store.bind(session_id, "customer", "customer")
@@ -29,8 +29,8 @@ async def test_evicted_transcript_and_provenance_reload_from_database(tmp_path):
     assert len(registry._sessions) == 1
 
 
-async def test_active_turns_survive_cache_pressure(tmp_path):
-    store = EngineStore(str(tmp_path / "cache.db"))
+async def test_active_turns_survive_cache_pressure(engine_db):
+    store = EngineStore(engine_db("cache.db"))
     registry = SessionRegistry(ExampleState, store, "shopping", 60, max_cached_sessions=1)
     for session_id in ("first", "second"):
         store.bind(session_id, "customer", "customer")
@@ -46,18 +46,8 @@ async def test_active_turns_survive_cache_pressure(tmp_path):
     assert len(registry._sessions) == 1
 
 
-async def test_memory_only_sessions_are_not_evicted():
-    store = EngineStore(":memory:")
-    registry = SessionRegistry(ExampleState, store, "shopping", 60, max_cached_sessions=1)
-    first = await registry.claim("first")
-    first.session.state.seen.append("SKU-1")
-    await registry.finish(first)
-    registry.start("second")
-    assert registry.get("first").state.seen == ["SKU-1"]
-
-
-async def test_chat_transcript_and_provenance_survive_worker_change(tmp_path):
-    db_path = str(tmp_path / "sessions.db")
+async def test_chat_transcript_and_provenance_survive_worker_change(engine_db):
+    db_path = engine_db("sessions.db")
     first_store = EngineStore(db_path)
     first_store.bind("session-1", "customer-1", "customer")
     first = SessionRegistry(ExampleState, first_store, "shopping", 60)
@@ -75,8 +65,8 @@ async def test_chat_transcript_and_provenance_survive_worker_change(tmp_path):
     await second.finish(recovered)
 
 
-async def test_only_one_worker_can_own_a_chat_turn(tmp_path):
-    db_path = str(tmp_path / "sessions.db")
+async def test_only_one_worker_can_own_a_chat_turn(engine_db):
+    db_path = engine_db("sessions.db")
     first_store = EngineStore(db_path)
     first_store.bind("session-1", "customer-1", "customer")
     first = SessionRegistry(ExampleState, first_store, "shopping", 60)
@@ -92,8 +82,8 @@ async def test_only_one_worker_can_own_a_chat_turn(tmp_path):
     await second.finish(next_turn)
 
 
-async def test_expired_chat_lease_cannot_steal_a_live_workers_turn(tmp_path):
-    db_path = str(tmp_path / "sessions.db")
+async def test_expired_chat_lease_cannot_steal_a_live_workers_turn(engine_db):
+    db_path = engine_db("sessions.db")
     store = EngineStore(db_path)
     store.bind("session-1", "customer-1", "customer")
     first = SessionRegistry(ExampleState, store, "shopping", 60)
@@ -120,8 +110,8 @@ async def test_expired_chat_lease_cannot_steal_a_live_workers_turn(tmp_path):
     await recovered.finish(claimed)
 
 
-def test_rate_limit_is_atomic_across_store_instances(tmp_path):
-    db_path = str(tmp_path / "sessions.db")
+def test_rate_limit_is_atomic_across_store_instances(engine_db):
+    db_path = engine_db("sessions.db")
     first = EngineStore(db_path)
     second = EngineStore(db_path)
 
@@ -131,8 +121,8 @@ def test_rate_limit_is_atomic_across_store_instances(tmp_path):
     assert second.consume_rate_limit("merchant:customer-1", 2, 1_000)
 
 
-def test_expired_session_cleanup_cascades_chat_and_cart_state(tmp_path):
-    store = EngineStore(str(tmp_path / "sessions.db"))
+def test_expired_session_cleanup_cascades_chat_and_cart_state(engine_db):
+    store = EngineStore(engine_db("sessions.db"))
     store.bind(
         "expired-session",
         "customer-1",

@@ -10,8 +10,8 @@ import pytest
 from engine_backend.store import EngineStore, MerchantOperationBusy
 
 
-async def test_completed_session_operations_do_not_retain_lock_keys():
-    store = EngineStore(":memory:")
+async def test_completed_session_operations_do_not_retain_lock_keys(engine_db):
+    store = EngineStore(engine_db("store.db"))
     for index in range(1000):
         async with store.serialized(f"session-{index}"):
             assert len(store._locks) == 1
@@ -19,8 +19,8 @@ async def test_completed_session_operations_do_not_retain_lock_keys():
     assert not store._locks
 
 
-async def test_waiters_keep_the_same_lock_through_owner_handoff():
-    store = EngineStore(":memory:")
+async def test_waiters_keep_the_same_lock_through_owner_handoff(engine_db):
+    store = EngineStore(engine_db("store.db"))
     first_waiting = asyncio.Event()
     first_entered = asyncio.Event()
     finish_first = asyncio.Event()
@@ -57,8 +57,8 @@ async def test_waiters_keep_the_same_lock_through_owner_handoff():
     assert not store._locks
 
 
-async def test_cancelled_waiter_does_not_split_active_lock():
-    store = EngineStore(":memory:")
+async def test_cancelled_waiter_does_not_split_active_lock(engine_db):
+    store = EngineStore(engine_db("store.db"))
     entered = []
 
     async def contender(name):
@@ -79,8 +79,8 @@ async def test_cancelled_waiter_does_not_split_active_lock():
     assert entered == ["survivor"]
 
 
-def test_completed_and_failed_merchant_operations_retire_keys():
-    store = EngineStore(":memory:")
+def test_completed_and_failed_merchant_operations_retire_keys(engine_db):
+    store = EngineStore(engine_db("store.db"))
     for index in range(1000):
         with store.merchant_operation(f"change-{index}"):
             assert store._merchant_operations == {f"change-{index}"}
@@ -92,8 +92,8 @@ def test_completed_and_failed_merchant_operations_retire_keys():
         pass
 
 
-def test_merchant_retirement_preserves_cross_thread_exclusion():
-    store = EngineStore(":memory:")
+def test_merchant_retirement_preserves_cross_thread_exclusion(engine_db):
+    store = EngineStore(engine_db("store.db"))
     entered = threading.Event()
     finish = threading.Event()
 
@@ -119,8 +119,8 @@ def test_merchant_retirement_preserves_cross_thread_exclusion():
         pass
 
 
-def test_cross_worker_refusal_retires_local_merchant_key(tmp_path):
-    path = str(tmp_path / "store.db")
+def test_cross_worker_refusal_retires_local_merchant_key(engine_db):
+    path = engine_db("store.db")
     first = EngineStore(path)
     second = EngineStore(path)
     with first.merchant_operation("change"):

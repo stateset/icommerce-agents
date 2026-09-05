@@ -21,9 +21,9 @@ def clock(monkeypatch):
     return NOW
 
 
-@pytest.fixture(params=[False, True], ids=["durable", "memory"])
-def store(tmp_path, request):
-    return EngineStore(":memory:" if request.param else str(tmp_path / "sessions.db"))
+@pytest.fixture
+def store(engine_db):
+    return EngineStore(engine_db("sessions.db"))
 
 
 def test_expiry_is_normalized_and_compared_as_an_instant(store, clock):
@@ -83,8 +83,8 @@ def _legacy_expiry(store, session_id, expiry):
         connection.close()
 
 
-def test_legacy_offsets_cleanup_preserves_future_cart_and_exact_boundary(tmp_path, clock):
-    store = EngineStore(str(tmp_path / "sessions.db"))
+def test_legacy_offsets_cleanup_preserves_future_cart_and_exact_boundary(engine_db, clock):
+    store = EngineStore(engine_db("sessions.db"))
     for minutes in (-720, 0, 330, 840):
         for label, delta in (("past", -1), ("now", 0), ("future", 1)):
             expiry = (clock + timedelta(microseconds=delta)).astimezone(
@@ -100,8 +100,8 @@ def test_legacy_offsets_cleanup_preserves_future_cart_and_exact_boundary(tmp_pat
 
 
 @pytest.mark.parametrize("expiry", ["not-a-date", "2026-09-04T23:59:00"])
-def test_ambiguous_legacy_expiry_denies_access_without_destroying_state(tmp_path, clock, expiry):
-    store = EngineStore(str(tmp_path / "sessions.db"))
+def test_ambiguous_legacy_expiry_denies_access_without_destroying_state(engine_db, clock, expiry):
+    store = EngineStore(engine_db("sessions.db"))
     _legacy_expiry(store, "session", expiry)
     with pytest.raises(KeyError):
         store.binding("session")
@@ -109,8 +109,8 @@ def test_ambiguous_legacy_expiry_denies_access_without_destroying_state(tmp_path
     assert store.session_cart_id("session") == "cart:session"
 
 
-def test_bulk_cleanup_does_not_delete_concurrent_renewal(tmp_path, monkeypatch, clock):
-    path = str(tmp_path / "sessions.db")
+def test_bulk_cleanup_does_not_delete_concurrent_renewal(engine_db, monkeypatch, clock):
+    path = engine_db("sessions.db")
     first, second = EngineStore(path), EngineStore(path)
     _legacy_expiry(first, "session", (clock - timedelta(hours=1)).isoformat())
     validate = PrincipalBinding.model_validate

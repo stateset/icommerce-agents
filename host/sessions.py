@@ -31,9 +31,6 @@ class ChatSession[StateT: BaseModel]:
     session_id: str
     state: StateT
     messages: list[dict[str, Any]] = field(default_factory=list)
-    # Streaming a turn mutates both transcript and provenance state. Keep that pair
-    # ordered even when one client submits overlapping requests for the same session.
-    turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
 @dataclass
@@ -74,9 +71,6 @@ class SessionRegistry[StateT: BaseModel]:
         self._trim_cache()
 
     def _trim_cache(self) -> None:
-        # Memory stores have no durable snapshot to reload after eviction.
-        if self._store.db_path == ":memory:":
-            return
         for session_id in list(self._sessions):
             if len(self._sessions) <= self._max_cached_sessions:
                 break
@@ -110,10 +104,6 @@ class SessionRegistry[StateT: BaseModel]:
 
     async def claim(self, session_id: str) -> ClaimedChat[StateT]:
         current = self.require(session_id)
-        if self._store.db_path == ":memory:":
-            if current.turn_lock.locked():
-                raise ChatTurnBusy(session_id)
-            await current.turn_lock.acquire()
         claim_task = asyncio.create_task(
             asyncio.to_thread(
                 self._store.claim_chat_turn,
@@ -129,18 +119,14 @@ class SessionRegistry[StateT: BaseModel]:
         except BaseException:
             # The thread may have acquired a lease after its caller disconnected.
             # It has finished now, so release that exact owner before propagating.
-            try:
-                if not claim_task.cancelled() and claim_task.exception() is None:
-                    acquired = claim_task.result()
-                    if acquired is not None:
-                        await complete_before_cancelling(
-                            asyncio.to_thread(
-                                self._store.release_chat_turn, session_id, self._role, acquired[0]
-                            )
+            if not claim_task.cancelled() and claim_task.exception() is None:
+                acquired = claim_task.result()
+                if acquired is not None:
+                    await complete_before_cancelling(
+                        asyncio.to_thread(
+                            self._store.release_chat_turn, session_id, self._role, acquired[0]
                         )
-            finally:
-                if self._store.db_path == ":memory:" and current.turn_lock.locked():
-                    current.turn_lock.release()
+                    )
             raise
         owner, snapshot = claimed
         if snapshot:
@@ -158,8 +144,7 @@ class SessionRegistry[StateT: BaseModel]:
         self._active[session_id] = owner
         self._cache(current)
         result = ClaimedChat(session=current, owner=owner)
-        if self._store.db_path != ":memory:":
-            result.heartbeat = asyncio.create_task(self._keepalive(result))
+        result.heartbeat = asyncio.create_task(self._keepalive(result))
         return result
 
     async def _keepalive(self, claimed: ClaimedChat[StateT]) -> None:
@@ -246,8 +231,6 @@ class SessionRegistry[StateT: BaseModel]:
             if self._active.get(session.session_id) == claimed.owner:
                 self._active.pop(session.session_id)
             self._trim_cache()
-            if self._store.db_path == ":memory:" and session.turn_lock.locked():
-                session.turn_lock.release()
 
     def discard(self, session_id: str) -> None:
         """Forget chat transcript and provenance state when its binding is revoked."""

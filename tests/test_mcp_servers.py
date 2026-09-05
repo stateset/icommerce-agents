@@ -3,31 +3,31 @@
 from __future__ import annotations
 
 
-async def test_the_tool_surface_is_the_role_surface_not_the_engines(tmp_path):
+async def test_the_tool_surface_is_the_role_surface_not_the_engines(engine_db):
     from mcp_servers.shopping import build_shopping_server
 
-    server = build_shopping_server(str(tmp_path / "store.db"))
+    server = build_shopping_server(engine_db("store.db"))
     names = {tool.name for tool in await server.list_tools()}
     assert "search_products" in names
     assert len(names) < 40, "the role surface is ~20 tools, not the engine's 900"
 
 
-async def test_the_merchant_server_exposes_apply_change(tmp_path):
+async def test_the_merchant_server_exposes_apply_change(engine_db):
     from mcp_servers.merchant import build_merchant_server
 
-    server = build_merchant_server(str(tmp_path / "store.db"))
+    server = build_merchant_server(engine_db("store.db"))
     names = {tool.name for tool in await server.list_tools()}
     assert "apply_change" in names
     assert "host_approve" not in names
 
 
-def test_servers_build_without_a_model_api_key(tmp_path, monkeypatch):
+def test_servers_build_without_a_model_api_key(engine_db, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     from mcp_servers.merchant import build_merchant_server
     from mcp_servers.shopping import build_shopping_server
 
-    build_shopping_server(str(tmp_path / "a.db"))
-    build_merchant_server(str(tmp_path / "b.db"))
+    build_shopping_server(engine_db("a.db"))
+    build_merchant_server(engine_db("b.db"))
 
 
 async def _stage_a_price_change(store, kernel) -> str:

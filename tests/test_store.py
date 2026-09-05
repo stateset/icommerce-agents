@@ -12,8 +12,9 @@ from engine_backend.store import EngineStore
 
 
 @pytest.fixture
-def store():
-    return EngineStore(":memory:")
+def store(tmp_path):
+    """A fresh, unseeded file-backed store."""
+    return EngineStore(str(tmp_path / "store.db"))
 
 
 async def test_call_runs_on_a_worker_thread(store):
@@ -201,11 +202,6 @@ def test_reconciliation_has_a_single_owner_and_normal_failures_are_retryable(sto
     assert store.approval_record("chg-1")["resolved_by"] == "operator:2"
 
 
-def test_readonly_sql_refuses_memory(store):
-    with pytest.raises(RuntimeError):
-        store.readonly_sql()
-
-
 async def test_a_direct_sql_write_is_visible_to_the_engine_handle(tmp_path):
     """`write_sql` is only sound together with the connection `EngineStore` pins for its
     own lifetime: two SQLite libraries are open on this file (the engine's, bundled in
@@ -274,7 +270,12 @@ async def test_a_direct_sql_write_is_visible_to_the_engine_handle(tmp_path):
 def test_the_store_pins_a_connection_for_its_own_lifetime(tmp_path):
     store = EngineStore(str(tmp_path / "store.db"))
     assert store._pin is not None
-    assert EngineStore(":memory:")._pin is None
+
+
+def test_in_memory_stores_are_refused():
+    """The control plane, WAL pin, and OS-held leases all need a file."""
+    with pytest.raises(ValueError, match="file-backed"):
+        EngineStore(":memory:")
 
 
 @pytest.mark.skipif(

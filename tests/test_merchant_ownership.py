@@ -21,8 +21,8 @@ def _hold_apply(path, ready):
         signal.pause()
 
 
-def test_paused_apply_cannot_be_recovered_until_worker_exits(tmp_path):
-    path = str(tmp_path / "store.db")
+def test_paused_apply_cannot_be_recovered_until_worker_exits(engine_db):
+    path = engine_db("store.db")
     store = EngineStore(path)
     store.record_approval("change", "operator", DIGEST)
     context = multiprocessing.get_context("spawn")
@@ -56,11 +56,11 @@ def test_paused_apply_cannot_be_recovered_until_worker_exits(tmp_path):
         child.close()
 
 
-@pytest.mark.parametrize("memory", [True, False])
-def test_resolution_guard_excludes_recovery_and_other_owners(tmp_path, memory):
-    path = ":memory:" if memory else str(tmp_path / "store.db")
+@pytest.mark.parametrize("same_worker", [True, False])
+def test_resolution_guard_excludes_recovery_and_other_owners(engine_db, same_worker):
+    path = engine_db("store.db")
     store = EngineStore(path)
-    other = store if memory else EngineStore(path)
+    other = store if same_worker else EngineStore(path)
     with store.merchant_operation("change"):
         with pytest.raises(MerchantOperationBusy):
             with other.merchant_operation("change"):

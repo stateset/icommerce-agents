@@ -3,15 +3,15 @@ from fastapi.testclient import TestClient
 from host.app import create_app
 
 
-def test_metrics_are_disabled_until_a_monitoring_token_is_configured(tmp_path):
-    client = TestClient(create_app(str(tmp_path / "store.db")))
+def test_metrics_are_disabled_until_a_monitoring_token_is_configured(engine_db):
+    client = TestClient(create_app(engine_db("store.db")))
     assert client.get("/metrics").status_code == 404
 
 
-def test_metrics_require_their_own_token_and_use_route_templates(tmp_path, monkeypatch):
+def test_metrics_require_their_own_token_and_use_route_templates(engine_db, monkeypatch):
     token = "monitoring-secret-that-is-at-least-32-bytes"
     monkeypatch.setenv("ICOMMERCE_METRICS_TOKEN", token)
-    client = TestClient(create_app(str(tmp_path / "store.db")))
+    client = TestClient(create_app(engine_db("store.db")))
     assert client.get("/metrics").status_code == 401
 
     session_id = client.post("/shopping/session").json()["session_id"]
@@ -38,10 +38,10 @@ def test_metrics_require_their_own_token_and_use_route_templates(tmp_path, monke
     assert session_id not in metrics.text
 
 
-def test_metrics_reject_a_weak_monitoring_token(tmp_path, monkeypatch):
+def test_metrics_reject_a_weak_monitoring_token(engine_db, monkeypatch):
     monkeypatch.setenv("ICOMMERCE_METRICS_TOKEN", "too-short")
     try:
-        create_app(str(tmp_path / "store.db"))
+        create_app(engine_db("store.db"))
     except ValueError as error:
         assert "32 bytes" in str(error)
     else:

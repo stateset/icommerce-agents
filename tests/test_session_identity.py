@@ -5,13 +5,12 @@ import pytest
 from engine_backend.store import EngineStore, PrincipalBinding
 
 
-@pytest.mark.parametrize("memory", [False, True])
 @pytest.mark.parametrize("changed", ["subject", "role", "authenticated_subject", "store"])
-def test_existing_session_identity_cannot_be_reassigned(tmp_path, memory, changed):
-    path = ":memory:" if memory else str(tmp_path / "store.db")
+def test_existing_session_identity_cannot_be_reassigned(engine_db, changed):
+    path = engine_db("store.db")
     store = EngineStore(path)
     original = store.bind("session", "customer", "customer", authenticated_subject="oidc-subject")
-    other = store if memory else EngineStore(path)
+    other = EngineStore(path)
     if changed == "store":
         other.store_id = "different-store"
     with pytest.raises(ValueError, match="cannot be rebound"):
@@ -24,8 +23,8 @@ def test_existing_session_identity_cannot_be_reassigned(tmp_path, memory, change
     assert store.binding("session") == original
 
 
-def test_same_identity_can_reconnect_but_cannot_inherit_another_customers_cart(tmp_path):
-    path = str(tmp_path / "store.db")
+def test_same_identity_can_reconnect_but_cannot_inherit_another_customers_cart(engine_db):
+    path = engine_db("store.db")
     first = EngineStore(path)
     first.bind("mcp-shopping", "customer-1", "customer")
     first.claim_session_cart("mcp-shopping", "customer-1-cart")
@@ -36,22 +35,22 @@ def test_same_identity_can_reconnect_but_cannot_inherit_another_customers_cart(t
     assert second.binding("mcp-shopping").subject_id == "customer-1"
 
 
-def test_durable_identity_reads_do_not_accumulate_worker_cache(tmp_path):
-    store = EngineStore(str(tmp_path / "store.db"))
+def test_durable_identity_reads_do_not_accumulate_worker_cache(engine_db):
+    store = EngineStore(engine_db("store.db"))
     for index in range(25):
         session_id = f"session-{index}"
         original = store.bind(session_id, f"customer-{index}", "customer")
         assert store.binding(session_id) == original
-    assert store._bindings == {}
+    assert not hasattr(store, "_bindings")
     assert store.cleanup_expired_sessions() == 0
     assert store.binding("session-0").subject_id == "customer-0"
 
 
 @pytest.mark.parametrize("renewal_has_expiry", [True, False])
 def test_expired_snapshot_cannot_delete_cross_worker_renewal(
-    tmp_path, monkeypatch, renewal_has_expiry
+    engine_db, monkeypatch, renewal_has_expiry
 ):
-    path = str(tmp_path / "store.db")
+    path = engine_db("store.db")
     reader = EngineStore(path)
     writer = EngineStore(path)
     reader.bind(
@@ -76,9 +75,8 @@ def test_expired_snapshot_cannot_delete_cross_worker_renewal(
     assert reader.session_cart_id("session") == "preserved-cart"
 
 
-@pytest.mark.parametrize("memory", [False, True])
-def test_expiry_cleanup_preserves_current_and_nonexpiring_bindings(tmp_path, memory):
-    store = EngineStore(":memory:" if memory else str(tmp_path / "store.db"))
+def test_expiry_cleanup_preserves_current_and_nonexpiring_bindings(engine_db):
+    store = EngineStore(engine_db("store.db"))
     now = datetime.now(UTC)
     store.bind("expired", "customer", "customer", expires_at=now - timedelta(seconds=1))
     store.bind("current", "customer", "customer", expires_at=now + timedelta(hours=1))

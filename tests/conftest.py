@@ -1,12 +1,15 @@
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from engine_backend.kernel import KernelClient
-from engine_backend.seed import seed_store
 from engine_backend.store import EngineStore
 
-CONFIG = Path(__file__).resolve().parent.parent / "config"
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG = ROOT / "config"
 
 
 def pytest_sessionstart(session):
@@ -46,12 +49,47 @@ def live_report():
     }
 
 
+@pytest.fixture(scope="session")
+def engine_template(tmp_path_factory) -> Path:
+    """One seeded engine file per test session.
+
+    Opening ``Commerce`` on a *new* file runs the engine's own migrations and costs
+    about 2.5 seconds; reopening an existing file costs a quarter of that. So the
+    template is built once, in a subprocess so every handle (and the WAL) is closed
+    on exit, and each test copies the file instead of paying the first-open cost.
+    """
+    path = tmp_path_factory.mktemp("engine-template") / "template.db"
+    script = (
+        "import sys; from engine_backend.store import EngineStore; "
+        "from engine_backend.seed import seed_store; "
+        "seed_store(EngineStore(sys.argv[1]).commerce)"
+    )
+    subprocess.run([sys.executable, "-c", script, str(path)], check=True, cwd=ROOT)
+    assert path.exists() and not path.with_name("template.db-wal").exists()
+    return path
+
+
 @pytest.fixture
-def store(tmp_path):
+def engine_db(tmp_path, engine_template):
+    """``engine_db("name.db")`` -> path to a fresh, seeded copy of the template."""
+
+    def make(name: str = "store.db") -> str:
+        target = tmp_path / name
+        shutil.copyfile(engine_template, target)
+        return str(target)
+
+    return make
+
+
+@pytest.fixture
+def db_path(engine_db) -> str:
+    return engine_db()
+
+
+@pytest.fixture
+def store(db_path):
     """A file-backed seeded store — file-backed so readonly_sql() works."""
-    engine_store = EngineStore(str(tmp_path / "store.db"))
-    seed_store(engine_store.commerce)
-    return engine_store
+    return EngineStore(db_path)
 
 
 @pytest.fixture
