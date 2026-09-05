@@ -1,7 +1,7 @@
 # StateSet iCommerce Agents
 
 [![CI](https://github.com/stateset/icommerce-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/stateset/icommerce-agents/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/release-v0.10.0-2563eb)](https://github.com/stateset/icommerce-agents/tree/v0.10.0)
+[![Release](https://img.shields.io/badge/release-v0.11.0-2563eb)](https://github.com/stateset/icommerce-agents/tree/v0.11.0)
 [![Python](https://img.shields.io/badge/python-3.12-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520.9-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-MIT-black)](LICENSE)

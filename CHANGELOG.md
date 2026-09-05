@@ -5,6 +5,8 @@ the authoritative commit-level record; notable operator-visible changes are list
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-05
+
 ### Changed
 
 - The approval ledger lives in `engine_backend/approvals.py`, reached as
@@ -128,7 +130,8 @@ the authoritative commit-level record; notable operator-visible changes are list
 - Authenticated same-origin web BFFs, Prometheus metrics, online backups, and hardened
   production configuration validation.
 
-[Unreleased]: https://github.com/stateset/icommerce-agents/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/stateset/icommerce-agents/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/stateset/icommerce-agents/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/stateset/icommerce-agents/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/stateset/icommerce-agents/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/stateset/icommerce-agents/compare/v0.7.1...v0.8.0
