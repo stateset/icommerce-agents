@@ -59,7 +59,7 @@ def check_no_abstract_methods() -> list[str]:
         ("EngineMerchant", EngineMerchant, (store, kernel_stub)),
     ):
         instance = cls(*args)
-        abstract = getattr(type(instance), "__abstractmethods__", frozenset())
+        abstract: frozenset[str] = getattr(type(instance), "__abstractmethods__", frozenset())
         if abstract:
             problems.append(f"{name} still has abstract methods: {sorted(abstract)}")
     return problems

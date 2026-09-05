@@ -118,7 +118,7 @@ def build_router(ctx: HostContext) -> APIRouter:
             chat.state.approved_change_ids.add(change_id)
         finally:
             await merchant_sessions.finish(claimed)
-        approval = store.approval_record(change_id)
+        approval = store.approvals.record_for(change_id)
         if approval is None:
             raise HTTPException(status_code=500, detail="approval record missing after approval")
         return {
@@ -135,7 +135,7 @@ def build_router(ctx: HostContext) -> APIRouter:
         record = await staging.load_record(store, change_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"no change with id {change_id!r}")
-        control = store.approval_record(change_id)
+        control = store.approvals.record_for(change_id)
         if control is None or control["state"] != "reconciliation_required":
             raise HTTPException(
                 status_code=409,
@@ -148,7 +148,7 @@ def build_router(ctx: HostContext) -> APIRouter:
             "proposal_digest": record["proposal_digest"],
             "control": control,
             "assessment": assessment.model_dump(mode="json"),
-            "events": store.approval_events(change_id),
+            "events": store.approvals.events_for(change_id),
         }
 
     @router.post("/merchant/changes/{change_id}/reconciliation/start")
@@ -166,7 +166,7 @@ def build_router(ctx: HostContext) -> APIRouter:
         if digest != record.get("proposal_digest") or digest != request.proposal_digest:
             raise HTTPException(status_code=409, detail="proposal digest changed")
         try:
-            store.recover_stale_approval(
+            store.approvals.recover_stale(
                 change_id,
                 session.operator,
                 digest,
@@ -205,14 +205,14 @@ def build_router(ctx: HostContext) -> APIRouter:
         digest = staging.proposal_digest(change, record.get("payload"))
         if digest != record.get("proposal_digest") or digest != request.proposal_digest:
             raise HTTPException(status_code=409, detail="proposal digest changed")
-        control = store.approval_record(change_id)
+        control = store.approvals.record_for(change_id)
         if control is None or control["state"] != "reconciliation_required":
             raise HTTPException(
                 status_code=409,
                 detail=f"change {change_id} does not require reconciliation",
             )
         try:
-            store.claim_reconciliation(
+            store.approvals.claim_reconciliation(
                 change_id,
                 session.operator,
                 digest,
@@ -256,7 +256,7 @@ def build_router(ctx: HostContext) -> APIRouter:
                 )
             await staging.save(store, resolved)
         except Exception as error:
-            store.abort_reconciliation(
+            store.approvals.abort_reconciliation(
                 change_id,
                 session.operator,
                 digest,
@@ -264,7 +264,7 @@ def build_router(ctx: HostContext) -> APIRouter:
                 str(error),
             )
             raise
-        store.finish_reconciliation(
+        store.approvals.finish_reconciliation(
             change_id,
             session.operator,
             digest,
@@ -286,10 +286,10 @@ def build_router(ctx: HostContext) -> APIRouter:
         read: it introduces no write and calls neither ``approve`` nor ``apply_change``."""
         _bound_merchant_context(x_session_id)
         records = await store.call(lambda c: list_payloads(c, STAGED_TYPE))
-        approval_records = store.approval_records(
+        approval_records = store.approvals.records_for(
             [record["change_id"] for record in records if record.get("change_id")]
         )
-        approval_events = store.approval_event_records(
+        approval_events = store.approvals.event_records_for(
             [record["change_id"] for record in records if record.get("change_id")]
         )
         changes = []

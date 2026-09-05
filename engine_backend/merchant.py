@@ -90,13 +90,13 @@ class EngineMerchant(MerchantBackend):
                 f"change {change_id} proposal digest is invalid; stage a fresh change"
             )
         try:
-            self.store.record_approval(change_id, approved_by, digest)
+            self.store.approvals.record(change_id, approved_by, digest)
         except ValueError as error:
             raise ChangeNotApplicable(str(error)) from error
 
     @property
     def approved_ids(self) -> set[str]:
-        return self.store.approved_change_ids()
+        return self.store.approvals.approved_ids()
 
     # -- Performance -------------------------------------------------------------
 
@@ -469,7 +469,7 @@ class EngineMerchant(MerchantBackend):
                     f"change {change_id} proposal digest is invalid; stage a fresh change"
                 )
             targets = sorted({item.target for item in change.items})
-            claim = self.store.claim_approval(change_id, session.operator, digest, targets)
+            claim = self.store.approvals.claim(change_id, session.operator, digest, targets)
             if claim.refusal == "missing":
                 raise ChangeNotApplicable(f"change {change_id} has not been approved")
             if claim.refusal == "different_operator":
@@ -519,10 +519,10 @@ class EngineMerchant(MerchantBackend):
                     mutation_started = True
                     applied, evidence = await _apply_change(ctx, change, payload)
                     await staging.save(self.store, applied, evidence=evidence)
-                self.store.finish_approval_attempt(change_id, claim.attempt_id, outcome="applied")
+                self.store.approvals.finish_attempt(change_id, claim.attempt_id, outcome="applied")
                 return applied
             except BaseException as error:
-                self.store.finish_approval_attempt(
+                self.store.approvals.finish_attempt(
                     change_id,
                     claim.attempt_id,
                     outcome=("reconciliation_required" if mutation_started else "failed"),

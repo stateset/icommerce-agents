@@ -131,7 +131,7 @@ async def test_approval_is_bound_to_the_exact_proposal_digest(store, kernel):
     with pytest.raises(ChangeNotApplicable, match="proposal digest is invalid"):
         await backend.apply_change(session(), change.change_id)
     assert store.commerce.products.get_variant_by_sku("TENT-RIDGE-TAN").price == 219.00
-    assert store.approval_record(change.change_id)["state"] == "approved"
+    assert store.approvals.record_for(change.change_id)["state"] == "approved"
 
 
 async def test_a_refused_apply_consumes_its_approval(store, kernel):
@@ -147,8 +147,8 @@ async def test_a_refused_apply_consumes_its_approval(store, kernel):
     with pytest.raises(GuardrailViolation):
         await backend.apply_change(session(), change.change_id)
     assert change.change_id not in backend.approved_ids
-    assert store.approval_record(change.change_id)["state"] == "failed"
-    assert "GuardrailViolation" in store.approval_record(change.change_id)["last_error"]
+    assert store.approvals.record_for(change.change_id)["state"] == "failed"
+    assert "GuardrailViolation" in store.approvals.record_for(change.change_id)["last_error"]
 
     backend.config = backend.config.model_copy(update={"max_price_delta_pct": 20.0})
     with pytest.raises(ChangeNotApplicable, match="has not been approved"):
@@ -171,7 +171,7 @@ async def test_failure_after_mutation_starts_requires_reconciliation(store, kern
     with pytest.raises(RuntimeError, match="simulated failure"):
         await backend.apply_change(session(), change.change_id)
 
-    record = store.approval_record(change.change_id)
+    record = store.approvals.record_for(change.change_id)
     assert record["state"] == "reconciliation_required"
     assert "RuntimeError" in record["last_error"]
     with pytest.raises(ChangeNotApplicable, match="reconciliation"):
@@ -219,8 +219,8 @@ async def test_durable_approval_survives_backend_recreation(engine_db):
     applied = await second.apply_change(session(), change.change_id)
 
     assert applied.status is ChangeStatus.APPLIED
-    assert second_store.approval_record(change.change_id)["state"] == "applied"
-    assert first_store.approval_record(change.change_id)["state"] == "applied"
+    assert second_store.approvals.record_for(change.change_id)["state"] == "applied"
+    assert first_store.approvals.record_for(change.change_id)["state"] == "applied"
 
 
 async def test_stale_approved_price_change_cannot_overwrite_newer_live_state(store, kernel):

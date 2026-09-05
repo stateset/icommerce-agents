@@ -7,6 +7,13 @@ the authoritative commit-level record; notable operator-visible changes are list
 
 ### Changed
 
+- The approval ledger lives in `engine_backend/approvals.py`, reached as
+  `store.approvals`; the store keeps the connection, the WAL pin, and the OS-held
+  operation lock. `engine_backend/store.py` is 645 lines, down from 1,809.
+- The host's middlewares live in `host/middleware.py`; `host/app.py` is assembly only.
+- uvicorn's own startup and access logs go through the host's JSON formatter via
+  `config/uvicorn-logging.json`.
+- `mypy` also covers `scripts/` and `evals/`.
 - The shopper's settle route and the operator's reconciliation route complete a settled
   stablecoin payment through one path; any failure between `settled` and `completed`
   parks the payment in `reconciliation_required` instead of leaving it committing.
@@ -21,6 +28,8 @@ the authoritative commit-level record; notable operator-visible changes are list
   and the release workflow.
 - `pytest-xdist`: the suite runs in parallel by default and finishes in about two and
   a half minutes on four cores.
+- Component tests for the portal's evidence rows and approval flow (React Testing
+  Library under vitest), run by `npm test` in CI.
 - Vitest coverage for the shared web package: the BFF's upstream-origin validation,
   cross-site mutation rejection, header allow-lists, and the control-request helper.
 

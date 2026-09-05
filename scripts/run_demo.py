@@ -90,6 +90,8 @@ def main() -> int:
             "0.0.0.0",
             "--port",
             "8000",
+            "--log-config",
+            str(REPO_ROOT / "config" / "uvicorn-logging.json"),
         ],
         cwd=REPO_ROOT,
         env=env,

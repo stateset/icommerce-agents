@@ -76,6 +76,8 @@ async def _run_case(case: EvalCase, client: Any, db_path: str) -> EvalResult:
             config=shopping_agent_config(),
             client=client,
         )
+        if customer is None:
+            raise RuntimeError("the seeded eval customer is missing from the store")
         session = ShoppingSessionContext(session_id=f"eval-{case.id}", user_id=customer.id)
         store.bind(session.session_id, customer.id, "customer")
         state = ShoppingSessionState()
