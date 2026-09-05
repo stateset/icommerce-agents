@@ -24,7 +24,7 @@ dependencies = [
   "shopping-agent-runtime",
   "merchant-agent-core",
   "merchant-agent-runtime",
-  "mcp<2",
+  "mcp<3",
 ]
 
 [tool.mypy]
