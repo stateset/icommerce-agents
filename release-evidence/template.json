@@ -1,0 +1,66 @@
+{
+  "format_version": 1,
+  "target_version": "1.0.0",
+  "commit_sha": "replace-with-full-release-commit-sha",
+  "gates": {
+    "live_claude_evals": {
+      "passed": false,
+      "tested_at": "replace-with-ISO-8601-time",
+      "evidence_url": "https://replace.invalid/live-evals",
+      "evidence_sha256": "sha256:replace-with-64-lowercase-hex-characters",
+      "passed_cases": 36,
+      "total_cases": 36,
+      "report": null,
+      "summary": "All twelve behavioral cases passed in three consecutive runs."
+    },
+    "oidc_authorization": {
+      "passed": false,
+      "tested_at": "replace-with-ISO-8601-time",
+      "evidence_url": "https://replace.invalid/oidc",
+      "evidence_sha256": "sha256:replace-with-64-lowercase-hex-characters",
+      "summary": "Production issuer, roles, scopes, and tenant isolation were exercised."
+    },
+    "stablecoin_checkout": {
+      "passed": false,
+      "tested_at": "replace-with-ISO-8601-time",
+      "evidence_url": "https://replace.invalid/checkout",
+      "evidence_sha256": "sha256:replace-with-64-lowercase-hex-characters",
+      "summary": "A supported wallet and facilitator completed testnet settlement."
+    },
+    "stablecoin_refund": {
+      "passed": false,
+      "tested_at": "replace-with-ISO-8601-time",
+      "evidence_url": "https://replace.invalid/refund",
+      "evidence_sha256": "sha256:replace-with-64-lowercase-hex-characters",
+      "summary": "The deployment returned funds on-chain and reconciled its accounting."
+    },
+    "ambiguous_settlement_recovery": {
+      "passed": false,
+      "tested_at": "replace-with-ISO-8601-time",
+      "evidence_url": "https://replace.invalid/reconciliation",
+      "evidence_sha256": "sha256:replace-with-64-lowercase-hex-characters",
+      "summary": "Timeout and crash recovery completed without duplicate settlement."
+    },
+    "backup_restore": {
+      "passed": false,
+      "tested_at": "replace-with-ISO-8601-time",
+      "evidence_url": "https://replace.invalid/restore",
+      "evidence_sha256": "sha256:replace-with-64-lowercase-hex-characters",
+      "summary": "An encrypted production-shaped backup restored and passed integrity checks."
+    },
+    "failure_and_load": {
+      "passed": false,
+      "tested_at": "replace-with-ISO-8601-time",
+      "evidence_url": "https://replace.invalid/load",
+      "evidence_sha256": "sha256:replace-with-64-lowercase-hex-characters",
+      "summary": "Worker loss and expected peak load remained inside the support envelope."
+    },
+    "tax_fulfillment_returns": {
+      "passed": false,
+      "tested_at": "replace-with-ISO-8601-time",
+      "evidence_url": "https://replace.invalid/operations",
+      "evidence_sha256": "sha256:replace-with-64-lowercase-hex-characters",
+      "summary": "Deployment integrations and operational ownership were accepted."
+    }
+  }
+}

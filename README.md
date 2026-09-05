@@ -113,7 +113,13 @@ outcomes until an operator reconciles observed live state.
 | Stage merchant change | Provenance and guardrails | No live mutation | Staged proposal + digest |
 | Apply price, content, promotion, or campaign change | Approval, single claim, target lease, stale-preview check | Not governed | Activity-log id |
 | Restock a new SKU | Same apply controls | `inventory.item.create` | Sealed kernel receipt |
-| Refund | Authenticated, exact-decimal, digest-bound operator route | `payments.create_refund` with required approval | Sealed success or refusal receipt |
+| Engine refund | Dedicated refund authority, exact-decimal, digest-bound operator route | `payments.create_refund` with required approval | Sealed success or refusal receipt |
+| Stablecoin refund | Dedicated refund authority, human proposal, atomic balance reservation, idempotent treasury adapter | Adapter ledger; x402 has no refund operation | Chain transaction + append-only refund events |
+
+Engine refunds and stablecoin refunds are separate paths. The stablecoin path is only
+advertised when an HTTPS treasury adapter is configured; otherwise `/capabilities`
+reports that deployment integration is required. The GA gate still requires evidence
+that the chosen provider returned funds on-chain and reconciled accounting.
 
 This deployment enables five governed commands in `config/kernel-policy.json`. Only
 three have production code paths: `checkout.commit`, `inventory.item.create`, and
@@ -132,13 +138,16 @@ exception and avoids implying broader kernel coverage.
   and explicit reconciliation for ambiguous outcomes.
 - Human-only refund preview/apply with exact decimal amounts, canonical proposal
   digests, idempotency, kernel approval evidence, and sealed receipts.
+- Provider-neutral stablecoin refund contract with atomic over-refund prevention,
+  dedicated refund authorization, idempotent treasury submission, transaction evidence,
+  and fail-closed reconciliation.
 - Demo identity for local use and production JWT authentication with issuer, audience,
   expiry, role/scope, tenant, and token-subject/session binding checks.
 - Same-origin storefront and portal BFFs keep production bearer tokens in secure
   HttpOnly cookies, restrict forwarded headers, and reject cross-site mutations.
 - Explicit session termination, configurable expiry, and durable principal/cart
   bindings plus transcript/provenance state that survive worker changes and host
-  restarts; expiring turn leases prevent split-brain conversations.
+  restarts; database leases and OS-held turn locks prevent paused-worker takeover.
 - Atomic per-principal request limits shared by every host worker, with role-separated,
   hashed buckets and production startup refusing a disabled limiter.
 - Request correlation propagated into checkout/refund kernel envelopes, secure response
@@ -232,9 +241,10 @@ and an external signing client. It never stores a payer private key. See the
 failure recovery, and the boundaries that remain deployment responsibilities.
 
 Principal/cart bindings, chat transcripts and provenance, approvals, target leases, and
-stablecoin payments are durable and cross-process safe. An expiring turn lease
-admits only one worker for each session while allowing another worker to recover after
-a crash. Expired identity, cart-binding, and conversation records are purged together.
+stablecoin payments are durable and cross-process safe. A database lease and an
+OS-held turn lock admit only one worker for each session, even if a process pauses
+past lease expiry. Another worker can recover after that process exits and its lease
+expires. Expired identity, cart-binding, and conversation records are purged together.
 The [installation and deployment guide](docs/install.md) documents every variable and
 trust boundary.
 
@@ -253,8 +263,13 @@ npm run build --workspace web/portal
 
 Required CI performs those deterministic checks, runs the keyless tour twice against
 the same database, and drives a real headless browser against both built web apps. It
-does not make paid model calls. A separate protected workflow runs all six live Claude
+does not make paid model calls. A separate protected workflow runs all twelve live Claude
 behavioral evals three times on a weekly schedule and on manual dispatch.
+
+Production/GA publication is separately fail-closed: the protected release workflow
+requires fresh external evidence bound to the exact commit, reruns verification, and
+publishes checksummed source, an SPDX SBOM, and GitHub build provenance. See the
+[release process](docs/releasing.md).
 
 The last documented raw-model run scored **4/6 on 2026-09-03**. Prompt and host
 backstops now address both observed failure modes, but that historical score is not
@@ -269,6 +284,11 @@ explains exactly what green CI proves—and what it does not.
   `money.py`, `reconciliation.py`, `refunds.py`, `search.py`, `seed.py`, `staging.py`,
   `stablecoins.py`, `store.py`, and `storefront.py` implement the StateSet adapters and
   durable controls.
+- `engine_backend/async_utils.py` — cancellation-safe completion of engine work
+  before releasing operation locks; see the [integration review](docs/integration-review.md).
+- `engine_backend/turn_locks.py` — OS-held chat ownership that prevents a paused
+  worker from being replaced solely because its database lease expired, plus
+  merchant apply/reconciliation exclusion during stale-attempt recovery.
 - `host/` — FastAPI sessions, JWT identity, streaming agents, human approval/refund
   routes, response policy, metrics, and operational endpoints.
 - `mcp_servers/` — role-specific MCP entry points over the same adapters and gates.
@@ -282,6 +302,10 @@ explains exactly what green CI proves—and what it does not.
 
 - [Install and production configuration](docs/install.md)
 - [Production operations and backup/restore](docs/operations.md)
+- [Release process and production evidence](docs/releasing.md)
+- [GA readiness and remaining deployment gates](docs/ga-readiness.md)
+- [Supported deployment envelope](SUPPORT.md)
+- [Security reporting and supported versions](SECURITY.md)
 - [Enforcement boundaries](docs/enforcement.md)
 - [Backend-to-engine mapping](docs/mapping.md)
 - [MCP deployment](docs/mcp.md)

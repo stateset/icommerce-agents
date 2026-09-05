@@ -3,12 +3,15 @@ __pycache__/
 *.db
 *.db-shm
 *.db-wal
+*.turn-locks/
 node_modules/
 .next/
 .env
 .superpowers/
 # This project installs through requirements*.txt; `uv run` may generate a local lock.
 uv.lock
+# Production rehearsal evidence is injected through the protected release environment.
+release-evidence/v*.json
 
 # Next 16 auto-generates these under each web app during `next build`/`next dev`;
 # content is upstream Next's, not this repo's.

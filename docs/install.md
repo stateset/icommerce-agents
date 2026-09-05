@@ -92,7 +92,9 @@ matches a provisioned engine customer. Merchant tokens need role `merchant` or s
 `merchant:write` plus `store_id` equal to this host's store. Every later request must
 present both the bearer token and its `X-Session-Id`; the session is bound to the signed
 `sub`, so possession of a leaked session id alone grants nothing. Public deployments
-should use asymmetric JWKS verification. `ICOMMERCE_JWT_HS256_SECRET` exists for tests
+must grant refund writes separately with `payments:refund` or `merchant_admin`, and
+refund/payment reconciliation with `payments:reconcile` or `merchant_admin`. Public
+deployments should use asymmetric JWKS verification. `ICOMMERCE_JWT_HS256_SECRET` exists for tests
 and controlled private deployments, must contain at least 32 bytes, and is mutually
 exclusive with `ICOMMERCE_JWKS_URL`. The JWKS URL must use HTTPS, include a hostname,
 and contain no embedded username or password.
@@ -127,7 +129,9 @@ The host durably stores principal/cart bindings and role-scoped chat transcript 
 provenance state. Bindings expire after `ICOMMERCE_SESSION_TTL_SECONDS`, even if a
 client retains the id, and expired session/chat/cart data is purged automatically.
 `ICOMMERCE_CHAT_LEASE_SECONDS` defaults to 900 (allowed range 30–3600); its durable
-lease admits one turn per session across workers and makes abandoned turns recoverable.
+lease plus an OS-held file lock admits one turn per session across workers and makes
+abandoned turns recoverable without replacing a paused worker. See the
+[worker recovery and upgrade procedure](operations.md#turn-ownership-and-worker-recovery).
 Checkout, payment, approval, and target-lease records are durable and cross-process
 safe as well.
 

@@ -1,0 +1,110 @@
+name: Production release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag, for example v1.0.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    environment: production-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      PRODUCTION_RELEASE_EVIDENCE: ${{ secrets.PRODUCTION_RELEASE_EVIDENCE }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Validate tag and production evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$PRODUCTION_RELEASE_EVIDENCE"
+          version="${RELEASE_TAG#v}"
+          test "$RELEASE_TAG" = "v$version"
+          package_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "$version" = "$package_version"
+          printf '%s' "$PRODUCTION_RELEASE_EVIDENCE" > /tmp/production-release-evidence.json
+          python scripts/release_check.py \
+            --evidence /tmp/production-release-evidence.json \
+            --target-version "$version" \
+            --commit "$(git rev-parse HEAD)"
+
+      - name: Install and verify
+        run: |
+          python -m pip install -r requirements-dev.txt
+          python -m pip check
+          ruff check .
+          ruff format --check .
+          pytest
+          python scripts/check.py
+          python scripts/denials.py
+          python scripts/tour.py --db /tmp/release-tour.db
+          python scripts/tour.py --db /tmp/release-tour.db
+          npm ci
+          npm audit --audit-level=high
+          npm run build --workspace web/storefront
+          npm run build --workspace web/portal
+          npx playwright install --with-deps chromium
+          python scripts/browser_check.py
+
+      - name: Build source bundle and SPDX SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python scripts/generate_sbom.py --output dist/sbom.spdx.json
+          tar \
+            --exclude=.git \
+            --exclude=.venv \
+            --exclude=.pytest_cache \
+            --exclude=.ruff_cache \
+            --exclude=node_modules \
+            --exclude='*/.next' \
+            --exclude='*/__pycache__' \
+            --exclude='*.db' \
+            --exclude='*.db-shm' \
+            --exclude='*.db-wal' \
+            --exclude='*.turn-locks' \
+            --exclude=uv.lock \
+            --exclude=dist \
+            -czf "dist/stateset-icommerce-agents-${RELEASE_TAG}.tar.gz" .
+          cd dist
+          sha256sum sbom.spdx.json "stateset-icommerce-agents-${RELEASE_TAG}.tar.gz" > SHA256SUMS
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/*
+
+      - name: Publish immutable GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes

@@ -11,8 +11,12 @@ commit `scripts/check.py` verifies against.
 `StorefrontBackend` method. It snapshots the session cart using exact engine totals,
 creates a digest-bound quote, calls a configured facilitator's `/verify` and `/settle`
 endpoints, and persists state through `StablecoinLedger.create`, `StablecoinLedger.get`,
-and `StablecoinLedger.transition`. The payment tables are created by
-`EngineStore._ensure_control_schema` before the embedded engine opens; later accesses
+and `StablecoinLedger.transition`. Its separate `StablecoinRefundLedger` atomically
+reserves refundable balances and records provider/reconciliation outcomes; the
+`RefundProvider` protocol and default HTTPS implementation keep custody and signing out
+of this process. The payment and refund tables are created by the transactional,
+recorded `EngineStore._ensure_control_schema` migration before the embedded engine
+opens; later accesses
 reuse `EngineStore._control_connection`, so the WAL pin described below protects these
 short-lived Python SQLite connections too. The engine's Python binding at 1.28.5 does
 not expose its native x402 intent APIs, so this journal is not represented as an engine
@@ -313,7 +317,8 @@ connection and the transient read under test.
 
 Three things about a second process are true and are *not* what the pin covers:
 
-The adapter's durable ledger is created by `EngineStore._ensure_control_schema` before
+The adapter's durable ledger is created by the recorded
+`EngineStore._ensure_control_schema` migration before
 the embedded handle opens. Later ledger operations use the short-lived connection from
 `EngineStore._control_connection`; the store's pinned connection keeps those transient
 opens from invalidating the embedded handle's WAL view.
