@@ -10,3 +10,8 @@ def test_deployment_configs_carry_the_live_eval_remediations():
     assert "manufacturer documentation is not a substitute" in shopping.brand_voice
     assert "never call it applied" in merchant.brand_voice
     assert "unless apply_change itself succeeded" in merchant.brand_voice
+
+
+def test_deployment_disables_detached_tool_dispatch_even_with_overrides():
+    assert shopping_agent_config().eager_tool_dispatch is False
+    assert merchant_agent_config(eager_tool_dispatch=True).eager_tool_dispatch is False

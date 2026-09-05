@@ -144,10 +144,11 @@ async def main(db_path: str) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db", default="denials-demo.db", help="path to the store db file")
+    parser.add_argument("--db", default="data/denials-demo.db", help="path to the store db file")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    Path(args.db).parent.mkdir(parents=True, exist_ok=True)
     sys.exit(asyncio.run(main(args.db)))

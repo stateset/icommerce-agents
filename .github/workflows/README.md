@@ -9,10 +9,26 @@ an immutable full commit SHA (the adjacent comment records the reviewed release 
 
 `live-evals.yml` is intentionally separate from deterministic CI. It runs weekly and
 on manual dispatch through the protected `live-evals` GitHub environment, requires an
-`ANTHROPIC_API_KEY`, and executes all six behavioral cases three times. Its preflight
+`ANTHROPIC_API_KEY`, and executes all twelve behavioral cases three times. Its preflight
 fails if the secret is absent, so a skipped no-key run cannot look like evidence that a
 model passed. Configure `ANTHROPIC_WORKSPACE_ID` in the same environment when the key is
 identity-linked. These runs are billable and may vary as hosted model behavior changes.
+The workflow validates the complete structured report, then retains its report, log,
+and SHA-256 digests for 30 days. Available artifacts from failed runs are also hashed
+and retained. The production gate checks every embedded verdict and binds that report
+to the linked artifact's digest; reviewers still verify the originating workflow.
+
+`release.yml` is manual and protected by the `production-release` environment. It will
+not publish a GitHub release unless the tag matches the package version and fresh,
+commit-bound evidence covers every external production rehearsal. It reruns deterministic
+verification, produces an SPDX SBOM and source bundle with checksums, and uses GitHub's
+OIDC-backed build-provenance attestation before publishing. See `docs/releasing.md`.
+
+`codeql.yml` scans Python and TypeScript/JavaScript on pushes, pull requests, and a
+weekly schedule. Dependabot separately watches Python, npm, GitHub Actions, and the
+Anthropic git submodule. Branch protection, private vulnerability reporting, secret
+scanning, and protected release-environment reviewers are repository settings and must
+be enabled by an administrator; workflow files cannot silently grant those controls.
 
 ## `python`
 
@@ -43,8 +59,12 @@ Pip is cached via `actions/setup-python`'s `cache: pip`.
 
 Checks out the repo (submodules too, since the web workspace depends on
 `vendor/commerce-agents/examples/web-shared`), installs Node via `actions/setup-node`
-with `cache: npm`, runs `npm ci`, then `npm audit --audit-level=high`, then builds
-`web/storefront` and `web/portal`.
+with `cache: npm`, runs `npm ci`, then `npm audit --audit-level=high`, then
+`npm run typecheck` (`tsc --noEmit` in each app) and `npm run lint` (ESLint with the
+Next 16 flat config; Next 16 removed `next lint`, so these are the only type and lint
+gates the web workspace has), then builds `web/storefront` and `web/portal`. The BFF
+proxy, the shared API helpers, and the host response types the two apps have in common
+live in the `web/shared` workspace package (`icommerce-shared`).
 
 The audit step is there because the Next 16 / React 19 upgrade was done to clear the
 workspace's high-severity advisories. Without a gate, they come back on a transitive

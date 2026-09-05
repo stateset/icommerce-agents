@@ -12,8 +12,9 @@ from engine_backend.store import EngineStore
 
 
 @pytest.fixture
-def store():
-    return EngineStore(":memory:")
+def store(tmp_path):
+    """A fresh, unseeded file-backed store."""
+    return EngineStore(str(tmp_path / "store.db"))
 
 
 async def test_call_runs_on_a_worker_thread(store):
@@ -122,10 +123,63 @@ def test_legacy_approval_ledger_is_upgraded_without_losing_records(tmp_path):
     schema = connection.execute(
         "SELECT sql FROM sqlite_master WHERE name = 'icommerce_agent_approvals'"
     ).fetchone()[0]
+    migrations = connection.execute(
+        "SELECT version, name FROM icommerce_agent_schema_migrations ORDER BY version"
+    ).fetchall()
     connection.close()
     assert "reconciliation_required" in schema
     assert "reconciling" in schema
     assert "resolved" in schema
+    assert migrations == [
+        (1, "baseline-v0.9-control-plane"),
+        (2, "stablecoin-refund-ledger"),
+    ]
+
+
+def test_control_schema_refuses_a_newer_database(tmp_path):
+    db_path = str(tmp_path / "future.db")
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "CREATE TABLE icommerce_agent_schema_migrations "
+        "(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO icommerce_agent_schema_migrations VALUES (999, 'future', 'now')"
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RuntimeError, match="control schema is newer"):
+        EngineStore(db_path)
+
+
+def test_control_schema_upgrades_version_one_with_refund_ledger(tmp_path):
+    db_path = str(tmp_path / "version-one.db")
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "CREATE TABLE icommerce_agent_schema_migrations "
+        "(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO icommerce_agent_schema_migrations VALUES "
+        "(1, 'baseline-v0.9-control-plane', '2026-01-01T00:00:00+00:00')"
+    )
+    connection.commit()
+    connection.close()
+
+    EngineStore(db_path)
+
+    connection = sqlite3.connect(db_path)
+    version = connection.execute(
+        "SELECT MAX(version) FROM icommerce_agent_schema_migrations"
+    ).fetchone()[0]
+    refund_table = connection.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'icommerce_stablecoin_refunds'"
+    ).fetchone()
+    connection.close()
+    assert version == 2
+    assert refund_table == ("icommerce_stablecoin_refunds",)
 
 
 def test_reconciliation_has_a_single_owner_and_normal_failures_are_retryable(store):
@@ -146,11 +200,6 @@ def test_reconciliation_has_a_single_owner_and_normal_failures_are_retryable(sto
     assert store.approval_record("chg-1")["state"] == "reconciliation_required"
     store.claim_reconciliation("chg-1", "operator:2", digest, "confirmed_applied")
     assert store.approval_record("chg-1")["resolved_by"] == "operator:2"
-
-
-def test_readonly_sql_refuses_memory(store):
-    with pytest.raises(RuntimeError):
-        store.readonly_sql()
 
 
 async def test_a_direct_sql_write_is_visible_to_the_engine_handle(tmp_path):
@@ -221,7 +270,12 @@ async def test_a_direct_sql_write_is_visible_to_the_engine_handle(tmp_path):
 def test_the_store_pins_a_connection_for_its_own_lifetime(tmp_path):
     store = EngineStore(str(tmp_path / "store.db"))
     assert store._pin is not None
-    assert EngineStore(":memory:")._pin is None
+
+
+def test_in_memory_stores_are_refused():
+    """The control plane, WAL pin, and OS-held leases all need a file."""
+    with pytest.raises(ValueError, match="file-backed"):
+        EngineStore(":memory:")
 
 
 @pytest.mark.skipif(

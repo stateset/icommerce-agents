@@ -1,6 +1,6 @@
 """Drift check: exits non-zero when the code and the documentation about it disagree.
 
-Six checks:
+Eight checks:
 
 1. Neither engine backend (`EngineStorefront`, `EngineMerchant`) has an unimplemented
    abstract method left over -- `__abstractmethods__` must be empty on both.
@@ -18,6 +18,9 @@ Six checks:
    undocumented.
 6. Every external GitHub Action is pinned to a full immutable commit SHA rather than a
    moving tag.
+7. The package version and README release badge name the same release.
+8. The production release workflow retains its protected evidence, provenance, SBOM,
+   checksum, and immutable-tag gates.
 """
 
 from __future__ import annotations
@@ -26,6 +29,8 @@ import ast
 import re
 import subprocess
 import sys
+import tempfile
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,6 +38,8 @@ MAPPING = ROOT / "docs" / "mapping.md"
 README = ROOT / "README.md"
 ENGINE_BACKEND = ROOT / "engine_backend"
 WORKFLOWS = ROOT / ".github" / "workflows"
+PYPROJECT = ROOT / "pyproject.toml"
+RELEASE_WORKFLOW = WORKFLOWS / "release.yml"
 
 SUBMODULE_COMMIT_RE = re.compile(r"submodule-commit:\s*([0-9a-f]{40})")
 
@@ -44,7 +51,8 @@ def check_no_abstract_methods() -> list[str]:
     from engine_backend.store import EngineStore
     from engine_backend.storefront import EngineStorefront
 
-    store = EngineStore(":memory:")
+    with tempfile.TemporaryDirectory() as directory:
+        store = EngineStore(str(Path(directory) / "check.db"))
     kernel_stub = KernelClient.__new__(KernelClient)
     for name, cls, args in (
         ("EngineStorefront", EngineStorefront, (store,)),
@@ -194,6 +202,41 @@ def check_actions_pinned() -> list[str]:
     return problems
 
 
+def check_version_references() -> list[str]:
+    package_version = tomllib.loads(PYPROJECT.read_text())["project"]["version"]
+    readme = README.read_text()
+    badge = re.search(r"release-v([0-9]+\.[0-9]+\.[0-9]+)-", readme)
+    if badge is None:
+        return ["README.md has no release version badge"]
+    if badge.group(1) != package_version:
+        return [
+            f"README release badge is v{badge.group(1)}, but pyproject.toml is {package_version}"
+        ]
+    return []
+
+
+def check_release_workflow() -> list[str]:
+    if not RELEASE_WORKFLOW.is_file():
+        return ["production release workflow is missing"]
+    workflow = RELEASE_WORKFLOW.read_text()
+    required = {
+        "environment: production-release": "protected production-release environment",
+        "PRODUCTION_RELEASE_EVIDENCE": "external production evidence secret",
+        "scripts/release_check.py": "commit-bound evidence validator",
+        "scripts/generate_sbom.py": "SPDX SBOM generation",
+        "scripts/browser_check.py": "real-browser release verification",
+        "sha256sum": "artifact checksums",
+        "actions/attest-build-provenance@": "OIDC build-provenance attestation",
+        "gh release create": "GitHub release publication",
+        "--verify-tag": "immutable existing-tag verification",
+    }
+    return [
+        f"production release workflow lost its {description}"
+        for fragment, description in required.items()
+        if fragment not in workflow
+    ]
+
+
 def main() -> int:
     problems: list[str] = []
     problems += check_no_abstract_methods()
@@ -201,6 +244,8 @@ def main() -> int:
     problems += check_sql_paths_documented()
     problems += check_modules_documented()
     problems += check_actions_pinned()
+    problems += check_version_references()
+    problems += check_release_workflow()
 
     if problems:
         print("scripts/check.py found drift:")

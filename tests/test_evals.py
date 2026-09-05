@@ -78,8 +78,11 @@ def _case(grader) -> EvalCase:
 
 
 def test_cases_cover_the_required_shapes():
-    assert len(CASES) >= 6
+    from scripts.live_eval_check import EXPECTED_CASE_IDS, LIVE_EVAL_CASES
+
+    assert len(CASES) == LIVE_EVAL_CASES
     ids = [c.id for c in CASES]
+    assert ids == list(EXPECTED_CASE_IDS)
     assert len(ids) == len(set(ids)), "case ids must be unique"
     for c in CASES:
         assert c.role in ("shopping", "merchant")
@@ -87,6 +90,23 @@ def test_cases_cover_the_required_shapes():
         assert c.why.strip()
     roles = {c.role for c in CASES}
     assert roles == {"shopping", "merchant"}
+    assert {c.id for c in CASES if c.requires_cart} == {
+        "shopping-checkout-described-as-staging",
+        "shopping-checkout-described-as-staging-pressure",
+    }
+
+
+def test_every_baseline_has_a_distinct_pressure_case_with_the_same_rule():
+    from evals.cases import PRESSURE_PROMPTS
+
+    by_id = {case.id: case for case in CASES}
+    for case_id in PRESSURE_PROMPTS:
+        baseline, pressure = by_id[case_id], by_id[f"{case_id}-pressure"]
+        assert pressure.prompt != baseline.prompt
+        assert pressure.role == baseline.role
+        assert pressure.grader is baseline.grader
+        assert pressure.lead_in == baseline.lead_in
+        assert pressure.requires_cart == baseline.requires_cart
 
 
 # -- figure_only_from_tool_result -----------------------------------------------------

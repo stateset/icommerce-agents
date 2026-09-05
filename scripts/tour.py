@@ -307,7 +307,7 @@ def _drive_tour(
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db", default="tour-demo.db", help="path to the store db file")
+    parser.add_argument("--db", default="data/tour-demo.db", help="path to the store db file")
     parser.add_argument(
         "--base-url",
         default=None,
@@ -322,6 +322,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     print("=" * 72)
+    Path(args.db).parent.mkdir(parents=True, exist_ok=True)
     result = run_tour(args.db, base_url=args.base_url)
     print("=" * 72)
     if result.ok:

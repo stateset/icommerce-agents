@@ -11,8 +11,12 @@ commit `scripts/check.py` verifies against.
 `StorefrontBackend` method. It snapshots the session cart using exact engine totals,
 creates a digest-bound quote, calls a configured facilitator's `/verify` and `/settle`
 endpoints, and persists state through `StablecoinLedger.create`, `StablecoinLedger.get`,
-and `StablecoinLedger.transition`. The payment tables are created by
-`EngineStore._ensure_control_schema` before the embedded engine opens; later accesses
+and `StablecoinLedger.transition`. Its separate `StablecoinRefundLedger` atomically
+reserves refundable balances and records provider/reconciliation outcomes; the
+`RefundProvider` protocol and default HTTPS implementation keep custody and signing out
+of this process. The payment and refund tables are created by the transactional,
+recorded `EngineStore._ensure_control_schema` migration before the embedded engine
+opens; later accesses
 reuse `EngineStore._control_connection`, so the WAL pin described below protects these
 short-lived Python SQLite connections too. The engine's Python binding at 1.28.5 does
 not expose its native x402 intent APIs, so this journal is not represented as an engine
@@ -105,20 +109,21 @@ change, and `EngineMerchant.apply_change` persists it with the change record:
 
 It is set once, at apply time, from what actually happened — never inferred from
 `guardrail_notes` prose, so a wording change cannot make evidence disappear.
-`staging.load_evidence` reads it back, and `host/app.py` attaches it to the
+`staging.load_evidence` reads it back, and `host/context.py` attaches it to the
 `change_update` event the portal renders (`tests/test_host_evidence.py`). `GET
 /merchant/changes` attaches the same stored evidence to a session-scoped list of staged
 and applied changes, for the portal to render on load with no chat turn.
 
 ## The modules `engine_backend/` shares between the two roles
 
-Three modules exist only so a mechanism is defined once rather than in each backend:
+These modules exist only so a mechanism is defined once rather than in each backend:
 
 | Module | What it owns |
 |---|---|
 | `engine_backend/custom_objects.py` | The one shape this repo stores in the engine's custom objects: a type with a single required JSON `payload` field, one object per record. `ensure_payload_type`, `find_object`, `list_payloads`, `read_payload`, `write_payload`. Four things the engine has no domain for are kept this way — merchandising (`catalog.py`), policies and disclosures (`content.py`), staged changes (`staging.py`), and applied promotions and campaigns (`apply.py`) |
 | `engine_backend/listings.py` | The family-then-variant resolution and shaping both roles do identically: `resolve_family_or_variant` returns a `FamilyResolution` or a `VariantResolution`, and `ListingShape` carries everything `storefront.py`'s `Product` and `merchant.py`'s `Listing` are each built from. The two record types are not collapsed — `Listing` has `stock`/`content_quality`/`status`, `Product` has `rating`/`review_count`/`in_stock` — only the lookup is |
 | `engine_backend/analysis.py` | The merchant's read-only analysis surface: `SCHEMA` (the tables the agent is told about) and `run_query` (the single `SELECT`, capped at 100 rows and 8000 characters, on `store.readonly_sql()`). Kept out of `merchant.py` so a second entry point cannot keep the connection and drop the caps |
+| `engine_backend/migrations.py` | The adapter-owned control-plane schema: approval ledger, target leases, approval events, stablecoin payment and refund journals, session bindings and carts, chat transcripts and leases, and rate-limit buckets. `upgrade_control_schema(connection, now)` runs inside the transaction `EngineStore._ensure_control_schema` opens before the engine handle exists; it is forward-only and refuses a database recorded at a version newer than `CONTROL_SCHEMA_VERSION`. Everything else in `engine_backend/` reaches these tables only through `EngineStore` |
 | `engine_backend/refunds.py` | The human operator refund preview: resolves a real payment, canonicalizes the exact amount, and binds store/payment/amount into the SHA-256 digest required by the governed host apply route. It performs no write itself |
 
 ## Money at the seam
@@ -313,7 +318,8 @@ connection and the transient read under test.
 
 Three things about a second process are true and are *not* what the pin covers:
 
-The adapter's durable ledger is created by `EngineStore._ensure_control_schema` before
+The adapter's durable ledger is created by the recorded
+`EngineStore._ensure_control_schema` migration before
 the embedded handle opens. Later ledger operations use the short-lived connection from
 `EngineStore._control_connection`; the store's pinned connection keeps those transient
 opens from invalidating the embedded handle's WAL view.

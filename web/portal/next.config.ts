@@ -2,7 +2,7 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
-  transpilePackages: ["web-shared"],
+  transpilePackages: ["web-shared", "icommerce-shared"],
 };
 
 export default nextConfig;

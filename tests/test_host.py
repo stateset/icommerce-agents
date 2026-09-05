@@ -15,8 +15,8 @@ def _approval_json(store, change_id):
     return {"proposal_digest": asyncio.run(load_record(store, change_id))["proposal_digest"]}
 
 
-def client(tmp_path):
-    return TestClient(create_app(str(tmp_path / "store.db")))
+def client(engine_db):
+    return TestClient(create_app(engine_db("store.db")))
 
 
 def _order_skus(tmp_path, order_number):
@@ -34,25 +34,25 @@ def _order_skus(tmp_path, order_number):
     return [row[0] for row in rows]
 
 
-def test_health(tmp_path):
-    assert client(tmp_path).get("/healthz").json()["status"] == "ok"
+def test_health(engine_db):
+    assert client(engine_db).get("/healthz").json()["status"] == "ok"
 
 
-def test_readiness_proves_the_engine_can_answer(tmp_path):
-    response = client(tmp_path).get("/readyz")
+def test_readiness_proves_the_engine_can_answer(engine_db):
+    response = client(engine_db).get("/readyz")
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
 
 
-def test_a_session_binds_identity_server_side(tmp_path):
-    c = client(tmp_path)
+def test_a_session_binds_identity_server_side(engine_db):
+    c = client(engine_db)
     body = c.post("/shopping/session").json()
     assert body["session_id"]
     assert "customer_id" not in body
 
 
-def test_checkout_completes_the_cart_through_the_engine(tmp_path):
-    c = client(tmp_path)
+def test_checkout_completes_the_cart_through_the_engine(engine_db):
+    c = client(engine_db)
     session_id = c.post("/shopping/session").json()["session_id"]
     headers = {"X-Session-Id": session_id}
     c.post(
@@ -65,8 +65,8 @@ def test_checkout_completes_the_cart_through_the_engine(tmp_path):
     assert result["receipt"]["status"] == "succeeded"
 
 
-def test_approving_a_change_requires_a_known_id(tmp_path):
-    c = client(tmp_path)
+def test_approving_a_change_requires_a_known_id(engine_db):
+    c = client(engine_db)
     session_id = c.post("/merchant/session").json()["session_id"]
     response = c.post(
         "/merchant/changes/chg-nope/approve",
@@ -76,8 +76,8 @@ def test_approving_a_change_requires_a_known_id(tmp_path):
     assert response.status_code == 404
 
 
-def test_a_session_response_carries_no_identifying_field(tmp_path):
-    c = client(tmp_path)
+def test_a_session_response_carries_no_identifying_field(engine_db):
+    c = client(engine_db)
     shopping_body = c.post("/shopping/session").json()
     merchant_body = c.post("/merchant/session").json()
     identifying = {
@@ -94,8 +94,8 @@ def test_a_session_response_carries_no_identifying_field(tmp_path):
     assert not identifying & set(merchant_body)
 
 
-def test_session_end_revokes_the_binding_and_role_state(tmp_path):
-    c = TestClient(create_app(str(tmp_path / "store.db")))
+def test_session_end_revokes_the_binding_and_role_state(engine_db):
+    c = TestClient(create_app(engine_db("store.db")))
     shopping = {"X-Session-Id": c.post("/shopping/session").json()["session_id"]}
     merchant = {"X-Session-Id": c.post("/merchant/session").json()["session_id"]}
 
@@ -107,8 +107,8 @@ def test_session_end_revokes_the_binding_and_role_state(tmp_path):
     assert c.get("/merchant/changes", headers=merchant).status_code == 401
 
 
-def test_routes_reject_a_missing_or_unknown_session_id(tmp_path):
-    c = client(tmp_path)
+def test_routes_reject_a_missing_or_unknown_session_id(engine_db):
+    c = client(engine_db)
     assert c.post("/shopping/cart/add", json={"product_id": "x", "quantity": 1}).status_code == 401
     assert c.post("/shopping/checkout").status_code == 401
     assert (
@@ -129,11 +129,11 @@ def test_routes_reject_a_missing_or_unknown_session_id(tmp_path):
     )
 
 
-def test_chat_routes_reject_a_missing_or_unknown_session_id_before_any_model_call(tmp_path):
+def test_chat_routes_reject_a_missing_or_unknown_session_id_before_any_model_call(engine_db):
     # No ANTHROPIC_API_KEY is set in this test process; if the identity gate did not
     # sit in front of the model call, this would error out reaching the runtime
     # instead of cleanly 401ing, and that would be the finding.
-    c = client(tmp_path)
+    c = client(engine_db)
     assert c.post("/shopping/chat", json={"message": "hi"}).status_code == 401
     assert c.post("/merchant/chat", json={"message": "hi"}).status_code == 401
     assert (
@@ -154,8 +154,8 @@ def test_chat_routes_reject_a_missing_or_unknown_session_id_before_any_model_cal
     )
 
 
-def test_http_write_inputs_are_bounded_before_reaching_the_engine_or_model(tmp_path):
-    c = client(tmp_path)
+def test_http_write_inputs_are_bounded_before_reaching_the_engine_or_model(engine_db):
+    c = client(engine_db)
     shopping = {"X-Session-Id": c.post("/shopping/session").json()["session_id"]}
     merchant = {"X-Session-Id": c.post("/merchant/session").json()["session_id"]}
 
@@ -173,11 +173,11 @@ def test_http_write_inputs_are_bounded_before_reaching_the_engine_or_model(tmp_p
     )
 
 
-def test_a_session_cannot_be_used_for_the_other_role(tmp_path):
+def test_a_session_cannot_be_used_for_the_other_role(engine_db):
     """The binding's `kind` is what separates the two roles. A shopping session id on a
     merchant route (and the reverse) is rejected at the binding, before any backend,
     agent, or model call -- a 401, not a 404 or an empty result."""
-    c = client(tmp_path)
+    c = client(engine_db)
     shopping = {"X-Session-Id": c.post("/shopping/session").json()["session_id"]}
     merchant = {"X-Session-Id": c.post("/merchant/session").json()["session_id"]}
 
@@ -203,12 +203,12 @@ def test_a_session_cannot_be_used_for_the_other_role(tmp_path):
     assert c.post("/shopping/checkout", headers=merchant).status_code == 401
 
 
-def test_checkout_uses_the_session_s_own_cart_not_the_customer_s_last(tmp_path):
+def test_checkout_uses_the_session_s_own_cart_not_the_customer_s_last(engine_db, tmp_path):
     """Every shopping session in this demo binds to the same seeded customer, so
     `carts.for_customer(...)[-1]` would hand one session another's cart. Two sessions
     each add a different item; each checkout must contain only its own.
     """
-    c = client(tmp_path)
+    c = client(engine_db)
     first = {"X-Session-Id": c.post("/shopping/session").json()["session_id"]}
     second = {"X-Session-Id": c.post("/shopping/session").json()["session_id"]}
 
@@ -234,13 +234,13 @@ def test_checkout_uses_the_session_s_own_cart_not_the_customer_s_last(tmp_path):
     assert _order_skus(tmp_path, second_order["order_number"]) == ["LAMP-BEACON-BLK"]
 
 
-def test_checkout_without_a_cart_is_refused(tmp_path):
-    c = client(tmp_path)
+def test_checkout_without_a_cart_is_refused(engine_db):
+    c = client(engine_db)
     headers = {"X-Session-Id": c.post("/shopping/session").json()["session_id"]}
     assert c.post("/shopping/checkout", headers=headers).status_code == 409
 
 
-def test_approving_a_change_that_is_no_longer_staged_is_refused(tmp_path):
+def test_approving_a_change_that_is_no_longer_staged_is_refused(engine_db):
     """Approval is only meaningful for a staged change. An already-applied one has
     nothing left to approve, and accepting it would put a live change id into the
     backend's `approved_ids` set."""
@@ -251,7 +251,7 @@ def test_approving_a_change_that_is_no_longer_staged_is_refused(tmp_path):
     from engine_backend import staging
     from engine_backend.store import EngineStore
 
-    db_path = str(tmp_path / "store.db")
+    db_path = engine_db("store.db")
     c = TestClient(create_app(db_path))
     headers = {"X-Session-Id": c.post("/merchant/session").json()["session_id"]}
 
@@ -273,7 +273,7 @@ def test_approving_a_change_that_is_no_longer_staged_is_refused(tmp_path):
     assert "applied" in response.json()["detail"]
 
 
-def test_http_approval_reaches_both_executor_and_backend_and_is_consumed(tmp_path, monkeypatch):
+def test_http_approval_reaches_both_executor_and_backend_and_is_consumed(engine_db, monkeypatch):
     """Claude Commerce checks session state before dispatch; the adapter checks its
     own operator-bound mark at the mutation boundary. The route must populate both."""
     import asyncio
@@ -285,7 +285,7 @@ def test_http_approval_reaches_both_executor_and_backend_and_is_consumed(tmp_pat
     from engine_backend.merchant import EngineMerchant
     from engine_backend.store import EngineStore
 
-    db_path = str(tmp_path / "store.db")
+    db_path = engine_db("store.db")
     c = TestClient(create_app(db_path))
     headers = {"X-Session-Id": c.post("/merchant/session").json()["session_id"]}
 
@@ -337,20 +337,21 @@ def test_http_approval_reaches_both_executor_and_backend_and_is_consumed(tmp_pat
     assert change.change_id not in seen["state"].approved_change_ids
 
 
-def test_capabilities_reports_presence_never_validity(tmp_path, monkeypatch):
+def test_capabilities_reports_presence_never_validity(engine_db, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    c = client(tmp_path)
+    c = client(engine_db)
     body = c.get("/capabilities").json()
     assert body == {
         "assistant": "unconfigured",
         "stablecoin_checkout": "disabled",
+        "stablecoin_refunds": "disabled",
         "direct_checkout": "available",
     }
     assert "key" not in str(body).lower()
 
 
-def test_shopping_cart_read_matches_what_was_added(tmp_path):
-    c = client(tmp_path)
+def test_shopping_cart_read_matches_what_was_added(engine_db):
+    c = client(engine_db)
     headers = {"X-Session-Id": c.post("/shopping/session").json()["session_id"]}
     c.post(
         "/shopping/cart/add",
@@ -362,12 +363,12 @@ def test_shopping_cart_read_matches_what_was_added(tmp_path):
     assert read_back["grand_total_exact"]
 
 
-def test_shopping_cart_read_on_a_fresh_session_creates_no_cart(tmp_path):
+def test_shopping_cart_read_on_a_fresh_session_creates_no_cart(engine_db):
     """A GET is a read: a session that never called ``cart/add`` must not cause a cart
     row to appear in the engine's own store just from being read."""
     from engine_backend.store import EngineStore
 
-    db_path = str(tmp_path / "store.db")
+    db_path = engine_db("store.db")
     c = TestClient(create_app(db_path))
     headers = {"X-Session-Id": c.post("/shopping/session").json()["session_id"]}
 
@@ -379,19 +380,19 @@ def test_shopping_cart_read_on_a_fresh_session_creates_no_cart(tmp_path):
     assert store.commerce.carts.list() == []
 
 
-def test_shopping_cart_read_requires_a_session(tmp_path):
-    assert client(tmp_path).get("/shopping/cart").status_code == 401
+def test_shopping_cart_read_requires_a_session(engine_db):
+    assert client(engine_db).get("/shopping/cart").status_code == 401
 
 
-def test_shopping_orders_read_requires_a_session(tmp_path):
-    assert client(tmp_path).get("/shopping/orders").status_code == 401
+def test_shopping_orders_read_requires_a_session(engine_db):
+    assert client(engine_db).get("/shopping/orders").status_code == 401
 
 
-def test_merchant_changes_read_requires_a_session(tmp_path):
-    assert client(tmp_path).get("/merchant/changes").status_code == 401
+def test_merchant_changes_read_requires_a_session(engine_db):
+    assert client(engine_db).get("/merchant/changes").status_code == 401
 
 
-def test_merchant_changes_read_excludes_discarded_changes(tmp_path):
+def test_merchant_changes_read_excludes_discarded_changes(engine_db):
     """`GET /merchant/changes` reports pending and applied changes -- a discarded one
     has nothing left to show and must not appear."""
     import asyncio
@@ -401,7 +402,7 @@ def test_merchant_changes_read_excludes_discarded_changes(tmp_path):
     from engine_backend import staging
     from engine_backend.store import EngineStore
 
-    db_path = str(tmp_path / "store.db")
+    db_path = engine_db("store.db")
     c = TestClient(create_app(db_path))
     headers = {"X-Session-Id": c.post("/merchant/session").json()["session_id"]}
 
@@ -419,7 +420,7 @@ def test_merchant_changes_read_excludes_discarded_changes(tmp_path):
     assert change.change_id not in {item["change_id"] for item in changes}
 
 
-def test_merchant_changes_exposes_durable_apply_control_state(tmp_path):
+def test_merchant_changes_exposes_durable_apply_control_state(engine_db):
     import asyncio
 
     from merchant_agent.types import ChangeItem, ChangeKind
@@ -427,7 +428,7 @@ def test_merchant_changes_exposes_durable_apply_control_state(tmp_path):
     from engine_backend import staging
     from engine_backend.store import EngineStore
 
-    db_path = str(tmp_path / "store.db")
+    db_path = engine_db("store.db")
     c = TestClient(create_app(db_path))
     headers = {"X-Session-Id": c.post("/merchant/session").json()["session_id"]}
     store = EngineStore(db_path)
@@ -460,7 +461,7 @@ def test_merchant_changes_exposes_durable_apply_control_state(tmp_path):
     assert item["apply_control"]["approved_at"]
 
 
-def test_operator_can_reconcile_an_ambiguous_apply_from_observed_state(tmp_path):
+def test_operator_can_reconcile_an_ambiguous_apply_from_observed_state(engine_db):
     import asyncio
     from pathlib import Path
 
@@ -471,7 +472,7 @@ def test_operator_can_reconcile_an_ambiguous_apply_from_observed_state(tmp_path)
     from engine_backend.staging import load, load_record
     from engine_backend.store import EngineStore
 
-    db_path = str(tmp_path / "store.db")
+    db_path = engine_db("store.db")
     client = TestClient(create_app(db_path))
     headers = {"X-Session-Id": client.post("/merchant/session").json()["session_id"]}
     store = EngineStore(db_path)
@@ -528,7 +529,7 @@ def test_operator_can_reconcile_an_ambiguous_apply_from_observed_state(tmp_path)
     assert store.approval_events(change.change_id)[-1]["event"] == ("reconciled:confirmed_applied")
 
 
-def test_reconciliation_cannot_confirm_a_write_that_did_not_land(tmp_path):
+def test_reconciliation_cannot_confirm_a_write_that_did_not_land(engine_db):
     import asyncio
     from pathlib import Path
 
@@ -539,7 +540,7 @@ def test_reconciliation_cannot_confirm_a_write_that_did_not_land(tmp_path):
     from engine_backend.staging import load_record
     from engine_backend.store import EngineStore
 
-    db_path = str(tmp_path / "store.db")
+    db_path = engine_db("store.db")
     client = TestClient(create_app(db_path))
     headers = {"X-Session-Id": client.post("/merchant/session").json()["session_id"]}
     store = EngineStore(db_path)
@@ -584,7 +585,7 @@ def test_reconciliation_cannot_confirm_a_write_that_did_not_land(tmp_path):
     assert control["resolution"] == "accepted_current_state"
 
 
-def test_operator_can_recover_a_stale_applying_claim_without_retrying_it(tmp_path):
+def test_operator_can_recover_a_stale_applying_claim_without_retrying_it(engine_db):
     import asyncio
     from pathlib import Path
 
@@ -595,7 +596,7 @@ def test_operator_can_recover_a_stale_applying_claim_without_retrying_it(tmp_pat
     from engine_backend.staging import load_record
     from engine_backend.store import EngineStore
 
-    db_path = str(tmp_path / "store.db")
+    db_path = engine_db("store.db")
     c = TestClient(create_app(db_path, stale_apply_seconds=1))
     headers = {"X-Session-Id": c.post("/merchant/session").json()["session_id"]}
     store = EngineStore(db_path)
@@ -645,7 +646,7 @@ def test_operator_can_recover_a_stale_applying_claim_without_retrying_it(tmp_pat
     assert store.approval_events(change.change_id)[-1]["event"] == "reconciliation_required"
 
 
-def test_discarded_lifecycle_remains_visible_while_reconciliation_is_in_flight(tmp_path):
+def test_discarded_lifecycle_remains_visible_while_reconciliation_is_in_flight(engine_db):
     import asyncio
     from pathlib import Path
 
@@ -661,7 +662,7 @@ def test_discarded_lifecycle_remains_visible_while_reconciliation_is_in_flight(t
     from engine_backend.merchant import EngineMerchant
     from engine_backend.store import EngineStore
 
-    db_path = str(tmp_path / "store.db")
+    db_path = engine_db("store.db")
     c = TestClient(create_app(db_path))
     headers = {"X-Session-Id": c.post("/merchant/session").json()["session_id"]}
     store = EngineStore(db_path)

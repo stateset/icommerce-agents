@@ -1,0 +1,13 @@
+{
+  "name": "icommerce-shared",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./bff": "./bff.ts"
+  },
+  "peerDependencies": {
+    "next": "^16.3.0"
+  }
+}

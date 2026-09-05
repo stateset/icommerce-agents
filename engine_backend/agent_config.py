@@ -22,7 +22,12 @@ MERCHANT_VOICE = (
 
 
 def shopping_agent_config() -> ShoppingAgentConfig:
-    return ShoppingAgentConfig(brand_name="ACME Supply", brand_voice=SHOPPING_VOICE)
+    # Upstream eager dispatch cancels spawned calls without joining them when the
+    # model stream closes early. Use the joined post-response tool path so detached
+    # writes cannot outlive the host's turn ownership and persistence boundary.
+    return ShoppingAgentConfig(
+        brand_name="ACME Supply", brand_voice=SHOPPING_VOICE, eager_tool_dispatch=False
+    )
 
 
 def merchant_agent_config(**overrides: object) -> MerchantAgentConfig:
@@ -30,4 +35,4 @@ def merchant_agent_config(**overrides: object) -> MerchantAgentConfig:
         brand_name="ACME Supply",
         brand_voice=MERCHANT_VOICE,
         **overrides,
-    )
+    ).model_copy(update={"eager_tool_dispatch": False})

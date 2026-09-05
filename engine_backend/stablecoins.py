@@ -17,6 +17,7 @@ import os
 import re
 import sqlite3
 from collections.abc import Awaitable
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -82,6 +83,8 @@ class StablecoinConfig:
     quote_ttl_seconds: int = 300
     processing_timeout_seconds: int = 60
     facilitator_bearer_token: str | None = field(default=None, repr=False)
+    refund_url: str = ""
+    refund_bearer_token: str | None = field(default=None, repr=False)
 
     @classmethod
     def from_env(cls) -> StablecoinConfig:
@@ -105,6 +108,8 @@ class StablecoinConfig:
                 os.getenv("ICOMMERCE_STABLECOIN_PROCESSING_TIMEOUT_SECONDS", "60")
             ),
             facilitator_bearer_token=os.getenv("ICOMMERCE_X402_FACILITATOR_TOKEN"),
+            refund_url=os.getenv("ICOMMERCE_STABLECOIN_REFUND_URL", "").strip(),
+            refund_bearer_token=os.getenv("ICOMMERCE_STABLECOIN_REFUND_TOKEN"),
         )
         config.validate()
         return config
@@ -140,6 +145,8 @@ class StablecoinConfig:
             raise ValueError("stablecoin maximum amount must be a positive finite decimal")
         self._validate_url("facilitator", self.facilitator_url, allow_local_http=True)
         self._validate_url("public base", self.public_base_url, allow_local_http=False)
+        if self.refund_url:
+            self._validate_url("refund", self.refund_url, allow_local_http=True)
 
     @staticmethod
     def _validate_url(label: str, value: str, *, allow_local_http: bool) -> None:
@@ -175,8 +182,28 @@ class Facilitator(Protocol):
     ) -> FacilitatorResult: ...
 
 
+@dataclass(frozen=True)
+class RefundResult:
+    success: bool
+    transaction: str | None = None
+    reason: str | None = None
+    network: str | None = None
+
+
+class RefundProvider(Protocol):
+    async def refund(self, request: dict[str, Any], idempotency_key: str) -> RefundResult: ...
+
+
 class FacilitatorUncertain(RuntimeError):
     """The facilitator call failed without proving whether settlement occurred."""
+
+
+class RefundUncertain(RuntimeError):
+    """The refund provider call failed without proving whether funds moved."""
+
+    def __init__(self, message: str, refund: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.refund = refund
 
 
 class HttpX402Facilitator:
@@ -239,7 +266,53 @@ class HttpX402Facilitator:
         )
 
 
+class HttpStablecoinRefundProvider:
+    """Minimal treasury boundary for provider-managed ERC-20 refunds.
+
+    Refunds are intentionally not part of x402 itself. Deployments expose a small HTTPS
+    adapter around their signer/custodian and return a transaction hash only after the
+    transfer is accepted. Ambiguous transport outcomes are never retried automatically.
+    """
+
+    def __init__(self, config: StablecoinConfig, *, http: httpx.AsyncClient | None = None) -> None:
+        self._url = config.refund_url
+        self._token = config.refund_bearer_token
+        self._owns_http = http is None
+        self._http = http or httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0))
+
+    async def aclose(self) -> None:
+        if self._owns_http:
+            await self._http.aclose()
+
+    async def refund(self, request: dict[str, Any], idempotency_key: str) -> RefundResult:
+        headers = {
+            "Accept": "application/json",
+            "Idempotency-Key": idempotency_key,
+            "User-Agent": "icommerce-agents/stablecoin-refunds-v1",
+        }
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        try:
+            response = await self._http.post(self._url, json=request, headers=headers)
+            response.raise_for_status()
+            result = response.json()
+        except (httpx.HTTPError, ValueError) as error:
+            raise RefundUncertain("stablecoin refund outcome is unknown") from error
+        if not isinstance(result, dict):
+            raise RefundUncertain("stablecoin refund provider returned an invalid response")
+        return RefundResult(
+            success=result.get("success") is True,
+            transaction=result.get("transaction"),
+            reason=result.get("errorReason") or result.get("error"),
+            network=result.get("network"),
+        )
+
+
 class PaymentNotFound(KeyError):
+    pass
+
+
+class RefundNotFound(KeyError):
     pass
 
 
@@ -251,8 +324,6 @@ class StablecoinLedger:
     """Transactional access to the adapter-owned payment and audit tables."""
 
     def __init__(self, store: EngineStore, processing_timeout_seconds: int) -> None:
-        if store.db_path == ":memory:":
-            raise ValueError("stablecoin checkout requires a durable file-backed store")
         self.store = store
         self.processing_timeout_seconds = processing_timeout_seconds
 
@@ -387,7 +458,8 @@ class StablecoinLedger:
             rows = connection.execute(
                 "SELECT * FROM icommerce_stablecoin_payments "
                 "WHERE store_id = ? AND state IN "
-                "('settling', 'settled', 'checkout_committing', 'reconciliation_required') "
+                "('settling', 'settled', 'checkout_committing', 'completed', "
+                "'reconciliation_required') "
                 "ORDER BY updated_at DESC LIMIT ?",
                 (store_id, limit),
             ).fetchall()
@@ -434,12 +506,187 @@ class StablecoinLedger:
             connection.close()
 
 
+class StablecoinRefundLedger:
+    """Durable refund claims and outcomes around a non-transactional treasury call."""
+
+    def __init__(self, store: EngineStore, processing_timeout_seconds: int) -> None:
+        self.store = store
+        self.processing_timeout_seconds = processing_timeout_seconds
+
+    @staticmethod
+    def _event(
+        connection: sqlite3.Connection, refund_id: str, event: str, detail: str | None = None
+    ) -> None:
+        connection.execute(
+            "INSERT INTO icommerce_stablecoin_refund_events "
+            "(refund_id, event, occurred_at, detail) VALUES (?, ?, ?, ?)",
+            (refund_id, event, _iso(_utcnow()), detail),
+        )
+
+    @staticmethod
+    def _get(connection: sqlite3.Connection, refund_id: str) -> dict[str, Any]:
+        row = connection.execute(
+            "SELECT * FROM icommerce_stablecoin_refunds WHERE refund_id = ?", (refund_id,)
+        ).fetchone()
+        if row is None:
+            raise RefundNotFound(refund_id)
+        return dict(row)
+
+    def recover_stale(self, refund_id: str | None = None) -> None:
+        connection = self.store._control_connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cutoff = _iso(_utcnow() - timedelta(seconds=self.processing_timeout_seconds))
+            query = (
+                "SELECT refund_id FROM icommerce_stablecoin_refunds "
+                "WHERE state = 'submitting' AND updated_at <= ?"
+            )
+            parameters: list[Any] = [cutoff]
+            if refund_id is not None:
+                query += " AND refund_id = ?"
+                parameters.append(refund_id)
+            for row in connection.execute(query, parameters).fetchall():
+                detail = "recovered abandoned refund with an unknown external outcome"
+                connection.execute(
+                    "UPDATE icommerce_stablecoin_refunds "
+                    "SET state = 'reconciliation_required', updated_at = ?, last_error = ? "
+                    "WHERE refund_id = ?",
+                    (_iso(_utcnow()), detail, row["refund_id"]),
+                )
+                self._event(connection, row["refund_id"], "reconciliation_required", detail)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def claim(self, values: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        connection = self.store._control_connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            payment = connection.execute(
+                "SELECT * FROM icommerce_stablecoin_payments WHERE payment_id = ? AND store_id = ?",
+                (values["payment_id"], values["store_id"]),
+            ).fetchone()
+            if payment is None:
+                raise PaymentNotFound(values["payment_id"])
+            if payment["state"] != "completed":
+                raise PaymentConflict("only a completed stablecoin payment can be refunded")
+            existing = connection.execute(
+                "SELECT * FROM icommerce_stablecoin_refunds WHERE idempotency_key = ?",
+                (values["idempotency_key"],),
+            ).fetchone()
+            if existing is not None:
+                existing = dict(existing)
+                bound = ("payment_id", "amount", "proposal_digest", "operator")
+                if any(existing[field] != values[field] for field in bound):
+                    raise PaymentConflict("idempotency key is bound to a different refund")
+                cutoff = _utcnow() - timedelta(seconds=self.processing_timeout_seconds)
+                if (
+                    existing["state"] == "submitting"
+                    and datetime.fromisoformat(existing["updated_at"]) <= cutoff
+                ):
+                    detail = "recovered abandoned refund with an unknown external outcome"
+                    connection.execute(
+                        "UPDATE icommerce_stablecoin_refunds "
+                        "SET state = 'reconciliation_required', updated_at = ?, last_error = ? "
+                        "WHERE refund_id = ?",
+                        (_iso(_utcnow()), detail, existing["refund_id"]),
+                    )
+                    self._event(
+                        connection, existing["refund_id"], "reconciliation_required", detail
+                    )
+                    existing = self._get(connection, existing["refund_id"])
+                connection.commit()
+                return existing, False
+            reserved = connection.execute(
+                "SELECT amount_atomic FROM icommerce_stablecoin_refunds "
+                "WHERE payment_id = ? AND state != 'failed'",
+                (values["payment_id"],),
+            ).fetchall()
+            total = sum(int(row["amount_atomic"]) for row in reserved)
+            if total + int(values["amount_atomic"]) > int(payment["amount_atomic"]):
+                raise PaymentConflict("refund exceeds the unrefunded stablecoin balance")
+            columns = ", ".join(values)
+            placeholders = ", ".join("?" for _ in values)
+            connection.execute(
+                f"INSERT INTO icommerce_stablecoin_refunds ({columns}) VALUES ({placeholders})",
+                tuple(values.values()),
+            )
+            self._event(connection, values["refund_id"], "submitting")
+            connection.commit()
+            return self._get(connection, values["refund_id"]), True
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def transition(
+        self,
+        refund_id: str,
+        expected: set[str],
+        state: str,
+        *,
+        event_detail: str | None = None,
+        **fields: Any,
+    ) -> dict[str, Any]:
+        connection = self.store._control_connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            refund = self._get(connection, refund_id)
+            if refund["state"] not in expected:
+                raise PaymentConflict(f"refund is {refund['state']}")
+            updates = {"state": state, "updated_at": _iso(_utcnow()), **fields}
+            clause = ", ".join(f"{name} = ?" for name in updates)
+            connection.execute(
+                f"UPDATE icommerce_stablecoin_refunds SET {clause} WHERE refund_id = ?",
+                (*updates.values(), refund_id),
+            )
+            self._event(
+                connection,
+                refund_id,
+                state,
+                event_detail if event_detail is not None else fields.get("last_error"),
+            )
+            connection.commit()
+            return self._get(connection, refund_id)
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def get(self, refund_id: str) -> dict[str, Any]:
+        self.recover_stale(refund_id)
+        connection = self.store._control_connection()
+        try:
+            return self._get(connection, refund_id)
+        finally:
+            connection.close()
+
+    def list_for_store(self, store_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        self.recover_stale()
+        connection = self.store._control_connection()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM icommerce_stablecoin_refunds WHERE store_id = ? "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (store_id, limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            connection.close()
+
+
 class StablecoinPayments:
     def __init__(
         self,
         store: EngineStore,
         config: StablecoinConfig,
         facilitator: Facilitator | None = None,
+        refund_provider: RefundProvider | None = None,
     ) -> None:
         config.validate()
         self.store = store
@@ -448,13 +695,33 @@ class StablecoinPayments:
             StablecoinLedger(store, config.processing_timeout_seconds) if config.enabled else None
         )
         self.facilitator = facilitator or (HttpX402Facilitator(config) if config.enabled else None)
+        self.refund_provider = refund_provider or (
+            HttpStablecoinRefundProvider(config) if config.enabled and config.refund_url else None
+        )
+        self.refund_ledger = (
+            StablecoinRefundLedger(store, config.processing_timeout_seconds)
+            if config.enabled
+            else None
+        )
 
     async def aclose(self) -> None:
-        close = getattr(self.facilitator, "aclose", None)
-        if close is not None:
-            result = close()
-            if isinstance(result, Awaitable):
-                await result
+        async def close_client(client: Any) -> None:
+            close = getattr(client, "aclose", None)
+            if close is not None:
+                result = close()
+                if isinstance(result, Awaitable):
+                    await result
+
+        async with AsyncExitStack() as cleanup:
+            seen: set[int] = set()
+            for client in (self.facilitator, self.refund_provider):
+                if client is not None and id(client) not in seen:
+                    seen.add(id(client))
+                    cleanup.push_async_callback(close_client, client)
+
+    @property
+    def refunds_available(self) -> bool:
+        return self.refund_provider is not None and self.refund_ledger is not None
 
     @staticmethod
     def atomic_amount(amount: str, decimals: int) -> str:
@@ -774,6 +1041,180 @@ class StablecoinPayments:
             last_error=None,
         )
 
+    async def preview_refund(
+        self, payment_id: str, store_id: str, amount: Decimal
+    ) -> dict[str, Any]:
+        payment = await self.get_for_operator(payment_id, store_id)
+        if payment["state"] != "completed":
+            raise PaymentConflict("only a completed stablecoin payment can be refunded")
+        normalized = str(amount.quantize(Decimal("0.01")))
+        amount_atomic = self.atomic_amount(normalized, int(payment["asset_decimals"]))
+        if int(amount_atomic) > int(payment["amount_atomic"]):
+            raise PaymentConflict("refund exceeds the captured stablecoin amount")
+        proposal = digest(
+            {
+                "version": "stablecoin-refund-proposal-v1",
+                "store_id": store_id,
+                "payment_id": payment_id,
+                "quote_digest": payment["quote_digest"],
+                "amount": normalized,
+                "amount_atomic": amount_atomic,
+            }
+        )
+        return {
+            "payment_id": payment_id,
+            "order_number": payment["order_number"],
+            "captured_amount": payment["amount"],
+            "refund_amount": normalized,
+            "amount_atomic": amount_atomic,
+            "asset": payment["asset_symbol"],
+            "network": payment["network"],
+            "proposal_digest": proposal,
+        }
+
+    async def refund(
+        self,
+        *,
+        payment_id: str,
+        store_id: str,
+        amount: Decimal,
+        proposal_digest: str,
+        idempotency_key: str,
+        operator: str,
+    ) -> dict[str, Any]:
+        if not self.refunds_available:
+            raise PaymentConflict("stablecoin refund provider is not configured")
+        preview = await self.preview_refund(payment_id, store_id, amount)
+        if preview["proposal_digest"] != proposal_digest:
+            raise PaymentConflict("stablecoin refund proposal digest changed")
+        payment = await self.get_for_operator(payment_id, store_id)
+        now = _iso(_utcnow())
+        values = {
+            "refund_id": f"rfnd_{uuid4().hex}",
+            "payment_id": payment_id,
+            "store_id": store_id,
+            "amount": preview["refund_amount"],
+            "amount_atomic": preview["amount_atomic"],
+            "proposal_digest": proposal_digest,
+            "idempotency_key": idempotency_key,
+            "operator": operator,
+            "state": "submitting",
+            "transaction_hash": None,
+            "last_error": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        assert self.refund_ledger is not None
+        refund, created = await asyncio.to_thread(self.refund_ledger.claim, values)
+        if not created:
+            if refund["state"] == "failed":
+                raise PaymentConflict(refund["last_error"] or "stablecoin refund failed")
+            return refund
+        request = {
+            "version": "stablecoin-refund-v1",
+            "refundId": refund["refund_id"],
+            "paymentId": payment_id,
+            "originalTransaction": payment["transaction_hash"],
+            "network": payment["network"],
+            "asset": payment["asset_address"],
+            "from": payment["pay_to"],
+            "to": payment["payer_address"],
+            "amount": refund["amount_atomic"],
+        }
+        assert self.refund_provider is not None
+        try:
+            result = await self.refund_provider.refund(request, idempotency_key)
+        except RefundUncertain as error:
+            uncertain = await asyncio.to_thread(
+                self.refund_ledger.transition,
+                refund["refund_id"],
+                {"submitting"},
+                "reconciliation_required",
+                last_error=str(error),
+            )
+            raise RefundUncertain(str(error), uncertain) from error
+        if (
+            not result.success
+            or not result.transaction
+            or not _TRANSACTION_HASH.fullmatch(result.transaction)
+            or (result.network is not None and result.network != payment["network"])
+        ):
+            reason = result.reason or "refund response did not match the payment"
+            await asyncio.to_thread(
+                self.refund_ledger.transition,
+                refund["refund_id"],
+                {"submitting"},
+                "failed",
+                last_error=reason,
+            )
+            raise PaymentConflict("stablecoin refund provider rejected the refund")
+        try:
+            return await asyncio.to_thread(
+                self.refund_ledger.transition,
+                refund["refund_id"],
+                {"submitting"},
+                "completed",
+                transaction_hash=result.transaction.lower(),
+                last_error=None,
+            )
+        except sqlite3.IntegrityError as error:
+            detail = "refund provider returned a transaction already recorded elsewhere"
+            uncertain = await asyncio.to_thread(
+                self.refund_ledger.transition,
+                refund["refund_id"],
+                {"submitting"},
+                "reconciliation_required",
+                last_error=detail,
+            )
+            raise RefundUncertain(detail, uncertain) from error
+
+    async def list_refunds(self, store_id: str) -> list[dict[str, Any]]:
+        if self.refund_ledger is None:
+            return []
+        return await asyncio.to_thread(self.refund_ledger.list_for_store, store_id)
+
+    async def reconcile_refund(
+        self,
+        refund_id: str,
+        store_id: str,
+        *,
+        refunded: bool,
+        transaction_hash: str | None,
+        note: str,
+    ) -> dict[str, Any]:
+        if self.refund_ledger is None:
+            raise RefundNotFound(refund_id)
+        refund = await asyncio.to_thread(self.refund_ledger.get, refund_id)
+        if refund["store_id"] != store_id:
+            raise RefundNotFound(refund_id)
+        if refund["state"] != "reconciliation_required":
+            raise PaymentConflict(f"refund is {refund['state']}")
+        if refunded:
+            if transaction_hash is None or not _TRANSACTION_HASH.fullmatch(transaction_hash):
+                raise ValueError("transaction_hash is required for a confirmed refund")
+            try:
+                return await asyncio.to_thread(
+                    self.refund_ledger.transition,
+                    refund_id,
+                    {"reconciliation_required"},
+                    "completed",
+                    transaction_hash=transaction_hash.lower(),
+                    last_error=None,
+                    event_detail=note,
+                )
+            except sqlite3.IntegrityError as error:
+                raise PaymentConflict("transaction already records another refund") from error
+        if refund["transaction_hash"] is not None:
+            raise PaymentConflict("a refund with a transaction cannot be marked not refunded")
+        return await asyncio.to_thread(
+            self.refund_ledger.transition,
+            refund_id,
+            {"reconciliation_required"},
+            "failed",
+            last_error="operator confirmed that the refund did not occur",
+            event_detail=note,
+        )
+
 
 def public_payment(payment: dict[str, Any]) -> dict[str, Any]:
     """Return status and evidence without leaking addresses or facilitator payloads."""
@@ -800,14 +1241,33 @@ def public_payment(payment: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def public_refund(refund: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "refund_id": refund["refund_id"],
+        "payment_id": refund["payment_id"],
+        "amount": refund["amount"],
+        "state": refund["state"],
+        "transaction_hash": refund["transaction_hash"],
+        "last_error": refund["last_error"],
+        "created_at": refund["created_at"],
+        "updated_at": refund["updated_at"],
+    }
+
+
 __all__ = [
     "Facilitator",
     "FacilitatorResult",
     "FacilitatorUncertain",
+    "HttpStablecoinRefundProvider",
     "HttpX402Facilitator",
     "PaymentConflict",
     "PaymentNotFound",
+    "RefundNotFound",
+    "RefundProvider",
+    "RefundResult",
+    "RefundUncertain",
     "StablecoinConfig",
     "StablecoinPayments",
     "public_payment",
+    "public_refund",
 ]

@@ -52,14 +52,15 @@ activity-log entry, with no kernel receipt at all. It does not govern merchandis
 ### Which of the five are reachable, and from where
 
 `KernelClient.execute` is called from exactly three places in this repo:
-`engine_backend/apply.py`, `host/app.py`, and `scripts/denials.py`. Taking the five
+`engine_backend/apply.py`, `host/` (`context.py`'s `commit_cart` and
+`routes/refunds.py`), and `scripts/denials.py`. Taking the five
 enabled commands one at a time:
 
 | Command | Issued from | Reachable in a running deployment? |
 |---|---|---|
 | `inventory.item.create` | `engine_backend/apply.py` (restock of a SKU with no inventory item) | **Yes** — an applied, approved staged change reaches it |
-| `checkout.commit` | `host/app.py`'s demo-only direct checkout, or its x402 route after stablecoin settlement | **Yes** — explicit shopper action; no agent tool reaches either route, and JWT mode cannot create an unpaid direct order |
-| `payments.create_refund` | `host/app.py`'s digest-bound operator refund routes; also `scripts/denials.py` and `tests/test_kernel.py` | **Yes** — an authenticated human operator, never an agent tool |
+| `checkout.commit` | `host/routes/shopping.py`'s demo-only direct checkout, or `host/routes/stablecoin.py` after settlement, both through `host/context.py`'s `commit_cart` | **Yes** — explicit shopper action; no agent tool reaches either route, and JWT mode cannot create an unpaid direct order |
+| `payments.create_refund` | `host/routes/refunds.py`'s digest-bound operator refund routes; also `scripts/denials.py` and `tests/test_kernel.py` | **Yes** — an authenticated human operator, never an agent tool |
 | `payments.create` | `tests/test_kernel.py` | No — test only |
 | `products.create` | nowhere | No — no code path issues it as a kernel command at all |
 

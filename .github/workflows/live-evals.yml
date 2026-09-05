@@ -40,8 +40,39 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: Run each behavioral evaluation three times
+        shell: bash
         run: |
-          for repetition in 1 2 3; do
-            echo "Live evaluation repetition $repetition of 3"
-            python -m evals.run
-          done
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/live-evals"
+          mkdir -p "$report_dir"
+          python -m evals.run --require-key --repetitions 3 \
+            --report "$report_dir/live-evals.json" | tee "$report_dir/live-evals.log"
+          python scripts/live_eval_check.py --report "$report_dir/live-evals.json" \
+            --commit "$(git rev-parse HEAD)"
+
+      - name: Hash available evidence, including failed runs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/live-evals"
+          if [ -d "$report_dir" ]; then
+            cd "$report_dir"
+            for artifact in live-evals.json live-evals.log; do
+              if [ -f "$artifact" ]; then
+                sha256sum "$artifact"
+              fi
+            done > live-evals.sha256
+          fi
+
+      - name: Retain release evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: live-evals-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/live-evals/live-evals.log
+            ${{ runner.temp }}/live-evals/live-evals.json
+            ${{ runner.temp }}/live-evals/live-evals.sha256
+          if-no-files-found: error
+          retention-days: 30

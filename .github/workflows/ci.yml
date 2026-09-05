@@ -98,6 +98,14 @@ jobs:
       - name: npm audit
         run: npm audit --audit-level=high
 
+      # Next 16 removed `next lint`; without these two steps nothing in CI would ever
+      # typecheck or lint the storefront, the portal, or the shared web package.
+      - name: typecheck web apps
+        run: npm run typecheck
+
+      - name: lint web apps
+        run: npm run lint
+
       - name: build storefront
         run: npm run build --workspace web/storefront
 

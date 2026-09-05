@@ -7,16 +7,26 @@ import hashlib
 import sqlite3
 import threading
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, TypeVar
 from uuid import uuid4
+from weakref import WeakValueDictionary
 
-from pydantic import BaseModel
+from pydantic import AwareDatetime, BaseModel, ConfigDict, ValidationError, field_validator
 from stateset_embedded import Commerce
 
+from engine_backend.async_utils import complete_before_cancelling
+from engine_backend.migrations import CONTROL_SCHEMA_VERSION as CONTROL_SCHEMA_VERSION
+from engine_backend.migrations import upgrade_control_schema
+from engine_backend.turn_locks import TurnLocks
+
 T = TypeVar("T")
+
+
+class MerchantOperationBusy(ValueError):
+    """A live worker still owns an apply or reconciliation operation."""
 
 
 @dataclass(frozen=True)
@@ -42,12 +52,19 @@ class ApprovalClaim:
 class PrincipalBinding(BaseModel):
     """Who a session acts for. Set by the host at session start; never a tool argument."""
 
+    model_config = ConfigDict(frozen=True)
+
     session_id: str
     subject_id: str
     kind: Literal["customer", "operator"]
     store_id: str
     authenticated_subject: str | None = None
-    expires_at: datetime | None = None
+    expires_at: AwareDatetime | None = None
+
+    @field_validator("expires_at")
+    @classmethod
+    def normalize_expiry(cls, value: datetime | None) -> datetime | None:
+        return value.astimezone(UTC) if value is not None else None
 
 
 class EngineStore:
@@ -99,23 +116,26 @@ class EngineStore:
       deliberately retains both its visible state and its leases for reconciliation.
     - Principal and session→cart bindings are durable adapter tables. File-backed
       principal reads always consult durable state so revocation is immediately visible
-      across workers; only in-memory deployments use ``self._bindings`` as authority.
+      across workers.
       Role-scoped chat transcripts and provenance state are durable too; an expiring
       database lease admits only one turn across all workers.
     """
 
     def __init__(self, db_path: str, store_id: str = "store:acme") -> None:
+        if db_path == ":memory:":
+            raise ValueError(
+                "EngineStore needs a file-backed database: the control plane, the WAL pin, "
+                "and cross-worker leases all live in that file"
+            )
         self.db_path = db_path
         self.store_id = store_id
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._bindings: dict[str, PrincipalBinding] = {}
+        # Owners and queued callers retain strong references; idle keys do not
+        # retain one lock forever for every session this worker has ever seen.
+        self._locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+        self._merchant_operations: set[str] = set()
+        self._merchant_operations_lock = threading.Lock()
         self._sql = threading.local()
-        self._memory_approvals: dict[str, dict[str, Any]] = {}
-        self._memory_target_leases: dict[str, tuple[str, str]] = {}
-        self._memory_approval_events: list[dict[str, Any]] = []
-        self._memory_chat_leases: dict[tuple[str, str], str] = {}
-        self._memory_approvals_lock = threading.Lock()
-        self._memory_chat_leases_lock = threading.Lock()
+        self._turn_locks = TurnLocks(db_path)
         # Create adapter-owned tables before opening the embedded engine. Opening and
         # closing Python's SQLite afterwards can invalidate the engine binding's WAL
         # view on some SQLite builds (the pin below exists for the same reason).
@@ -128,262 +148,18 @@ class EngineStore:
 
         This happens before the WAL pin is opened. Later control operations use
         transient connections while the pin keeps Python's SQLite from unlinking the
-        WAL index underneath the engine's embedded SQLite handle.
+        WAL index underneath the engine's embedded SQLite handle. The schema itself
+        lives in :mod:`engine_backend.migrations`.
         """
-        if self.db_path == ":memory:":
-            return
         connection = sqlite3.connect(self.db_path, timeout=30)
         try:
             connection.execute("PRAGMA busy_timeout = 30000")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS icommerce_agent_approvals (
-                    change_id TEXT PRIMARY KEY,
-                    approved_by TEXT NOT NULL,
-                    approved_at TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK (
-                        state IN (
-                            'approved', 'applying', 'applied', 'failed',
-                            'reconciliation_required', 'reconciling', 'resolved'
-                        )
-                    ),
-                    attempt_id TEXT,
-                    claimed_at TEXT,
-                    finished_at TEXT,
-                    last_error TEXT,
-                    proposal_digest TEXT,
-                    resolved_at TEXT,
-                    resolved_by TEXT,
-                    resolution TEXT
-                )
-                """
-            )
-            schema = connection.execute(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' "
-                "AND name = 'icommerce_agent_approvals'"
-            ).fetchone()[0]
-            if (
-                "reconciliation_required" not in schema
-                or "'reconciling'" not in schema
-                or "'resolved'" not in schema
-            ):
-                # Upgrade databases created by the first durable-ledger revision. A
-                # SQLite CHECK cannot be altered in place, so rebuild transactionally.
-                connection.execute(
-                    "ALTER TABLE icommerce_agent_approvals "
-                    "RENAME TO icommerce_agent_approvals_legacy"
-                )
-                connection.execute(
-                    """
-                    CREATE TABLE icommerce_agent_approvals (
-                        change_id TEXT PRIMARY KEY,
-                        approved_by TEXT NOT NULL,
-                        approved_at TEXT NOT NULL,
-                        state TEXT NOT NULL CHECK (
-                            state IN (
-                                'approved', 'applying', 'applied', 'failed',
-                                'reconciliation_required', 'reconciling', 'resolved'
-                            )
-                        ),
-                        attempt_id TEXT,
-                        claimed_at TEXT,
-                        finished_at TEXT,
-                        last_error TEXT,
-                        proposal_digest TEXT,
-                        resolved_at TEXT,
-                        resolved_by TEXT,
-                        resolution TEXT
-                    )
-                    """
-                )
-                legacy_columns = {
-                    row[1]
-                    for row in connection.execute(
-                        "PRAGMA table_info(icommerce_agent_approvals_legacy)"
-                    )
-                }
-                current_columns = [
-                    "change_id",
-                    "approved_by",
-                    "approved_at",
-                    "state",
-                    "attempt_id",
-                    "claimed_at",
-                    "finished_at",
-                    "last_error",
-                    "proposal_digest",
-                    "resolved_at",
-                    "resolved_by",
-                    "resolution",
-                ]
-                copied_columns = [column for column in current_columns if column in legacy_columns]
-                names = ", ".join(copied_columns)
-                connection.execute(
-                    f"INSERT INTO icommerce_agent_approvals ({names}) "
-                    f"SELECT {names} FROM icommerce_agent_approvals_legacy"
-                )
-                connection.execute("DROP TABLE icommerce_agent_approvals_legacy")
-            approval_columns = {
-                row[1] for row in connection.execute("PRAGMA table_info(icommerce_agent_approvals)")
-            }
-            if "proposal_digest" not in approval_columns:
-                connection.execute(
-                    "ALTER TABLE icommerce_agent_approvals ADD COLUMN proposal_digest TEXT"
-                )
-            for column in ("resolved_at", "resolved_by", "resolution"):
-                if column not in approval_columns:
-                    connection.execute(
-                        f"ALTER TABLE icommerce_agent_approvals ADD COLUMN {column} TEXT"
-                    )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS icommerce_agent_target_leases (
-                    target TEXT PRIMARY KEY,
-                    change_id TEXT NOT NULL,
-                    attempt_id TEXT NOT NULL,
-                    claimed_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS icommerce_agent_approval_events (
-                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    change_id TEXT NOT NULL,
-                    event TEXT NOT NULL,
-                    operator TEXT NOT NULL,
-                    occurred_at TEXT NOT NULL,
-                    proposal_digest TEXT,
-                    attempt_id TEXT,
-                    detail TEXT
-                )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_agent_approval_events_change "
-                "ON icommerce_agent_approval_events(change_id, event_id)"
-            )
-            # x402 settles outside the embedded engine, so its hand-off state must be
-            # durable beside the engine before the engine connection is opened.  The
-            # row is both a replay barrier and the recovery record for the dangerous
-            # interval between an on-chain settlement and ``checkout.commit``.
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS icommerce_stablecoin_payments (
-                    payment_id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    customer_id TEXT NOT NULL,
-                    store_id TEXT NOT NULL,
-                    cart_id TEXT NOT NULL,
-                    cart_digest TEXT NOT NULL,
-                    quote_digest TEXT NOT NULL UNIQUE,
-                    amount TEXT NOT NULL,
-                    amount_atomic TEXT NOT NULL,
-                    currency TEXT NOT NULL,
-                    asset_symbol TEXT NOT NULL,
-                    asset_address TEXT NOT NULL,
-                    asset_decimals INTEGER NOT NULL,
-                    network TEXT NOT NULL,
-                    pay_to TEXT NOT NULL,
-                    payer_address TEXT NOT NULL,
-                    shipping_address_json TEXT NOT NULL,
-                    payment_requirements_json TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK (
-                        state IN (
-                            'quoted', 'verifying', 'verified', 'settling',
-                            'settled', 'checkout_committing', 'completed',
-                            'failed', 'expired', 'reconciliation_required'
-                        )
-                    ),
-                    expires_at TEXT NOT NULL,
-                    payment_payload_hash TEXT UNIQUE,
-                    transaction_hash TEXT UNIQUE,
-                    order_number TEXT,
-                    checkout_receipt_json TEXT,
-                    last_error TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_stablecoin_payments_session "
-                "ON icommerce_stablecoin_payments(session_id, created_at)"
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS icommerce_stablecoin_payment_events (
-                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    payment_id TEXT NOT NULL,
-                    event TEXT NOT NULL,
-                    occurred_at TEXT NOT NULL,
-                    detail TEXT
-                )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_stablecoin_payment_events_payment "
-                "ON icommerce_stablecoin_payment_events(payment_id, event_id)"
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS icommerce_agent_sessions (
-                    session_id TEXT PRIMARY KEY,
-                    subject_id TEXT NOT NULL,
-                    kind TEXT NOT NULL CHECK (kind IN ('customer', 'operator')),
-                    store_id TEXT NOT NULL,
-                    authenticated_subject TEXT,
-                    expires_at TEXT
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS icommerce_agent_session_carts (
-                    session_id TEXT PRIMARY KEY,
-                    cart_id TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(session_id) REFERENCES icommerce_agent_sessions(session_id)
-                        ON DELETE CASCADE
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS icommerce_agent_chat_sessions (
-                    session_id TEXT NOT NULL,
-                    role TEXT NOT NULL CHECK (role IN ('shopping', 'merchant')),
-                    state_json TEXT NOT NULL,
-                    messages_json TEXT NOT NULL,
-                    revision INTEGER NOT NULL DEFAULT 0,
-                    lease_owner TEXT,
-                    lease_expires_at TEXT,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY(session_id, role),
-                    FOREIGN KEY(session_id) REFERENCES icommerce_agent_sessions(session_id)
-                        ON DELETE CASCADE
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS icommerce_agent_rate_limits (
-                    key_hash TEXT NOT NULL,
-                    window_start INTEGER NOT NULL,
-                    request_count INTEGER NOT NULL,
-                    PRIMARY KEY(key_hash, window_start)
-                )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_icommerce_agent_sessions_expires_at "
-                "ON icommerce_agent_sessions(expires_at)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_icommerce_agent_rate_limits_window_start "
-                "ON icommerce_agent_rate_limits(window_start)"
-            )
+            connection.execute("BEGIN IMMEDIATE")
+            upgrade_control_schema(connection, self._now())
             connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -430,44 +206,6 @@ class EngineStore:
     def record_approval(self, change_id: str, approved_by: str, proposal_digest: str) -> None:
         """Durably record or renew approval unless an apply is in flight or complete."""
         now = self._now()
-        if self.db_path == ":memory:":
-            with self._memory_approvals_lock:
-                current = self._memory_approvals.get(change_id)
-                if current and current["state"] in (
-                    "applying",
-                    "applied",
-                    "reconciliation_required",
-                    "reconciling",
-                    "resolved",
-                ):
-                    raise ValueError(f"change {change_id} is already {current['state']}")
-                self._memory_approvals[change_id] = {
-                    "change_id": change_id,
-                    "approved_by": approved_by,
-                    "approved_at": now,
-                    "state": "approved",
-                    "attempt_id": None,
-                    "claimed_at": None,
-                    "finished_at": None,
-                    "last_error": None,
-                    "proposal_digest": proposal_digest,
-                    "resolved_at": None,
-                    "resolved_by": None,
-                    "resolution": None,
-                }
-                self._memory_approval_events.append(
-                    {
-                        "change_id": change_id,
-                        "event": "approved",
-                        "operator": approved_by,
-                        "occurred_at": now,
-                        "proposal_digest": proposal_digest,
-                        "attempt_id": None,
-                        "detail": None,
-                    }
-                )
-            return
-
         connection = self._control_connection()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -534,31 +272,6 @@ class EngineStore:
         attempt_id = f"attempt-{uuid4().hex}"
         now = self._now()
         unique_targets = sorted(set(targets or []))
-        if self.db_path == ":memory:":
-            with self._memory_approvals_lock:
-                row = self._memory_approvals.get(change_id)
-                refusal = self._approval_refusal(row, operator, proposal_digest)
-                if refusal is not None:
-                    return ApprovalClaim(refusal=refusal)
-                for target in unique_targets:
-                    if target in self._memory_target_leases:
-                        return ApprovalClaim(refusal="target_claimed", blocked_target=target)
-                row.update(state="applying", attempt_id=attempt_id, claimed_at=now)
-                for target in unique_targets:
-                    self._memory_target_leases[target] = (change_id, attempt_id)
-                self._memory_approval_events.append(
-                    {
-                        "change_id": change_id,
-                        "event": "claimed",
-                        "operator": operator,
-                        "occurred_at": now,
-                        "proposal_digest": proposal_digest,
-                        "attempt_id": attempt_id,
-                        "detail": None,
-                    }
-                )
-                return ApprovalClaim(attempt_id=attempt_id)
-
         connection = self._control_connection()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -657,29 +370,6 @@ class EngineStore:
         """Finish only the attempt that owns the durable ``applying`` lease."""
         finished_at = self._now()
         safe_error = None if error is None else error[:1000]
-        if self.db_path == ":memory:":
-            with self._memory_approvals_lock:
-                row = self._memory_approvals.get(change_id)
-                if row is None or row.get("attempt_id") != attempt_id:
-                    raise RuntimeError(f"approval attempt {attempt_id} no longer owns {change_id}")
-                row.update(state=outcome, finished_at=finished_at, last_error=safe_error)
-                self._memory_approval_events.append(
-                    {
-                        "change_id": change_id,
-                        "event": outcome,
-                        "operator": row["approved_by"],
-                        "occurred_at": finished_at,
-                        "proposal_digest": row.get("proposal_digest"),
-                        "attempt_id": attempt_id,
-                        "detail": safe_error,
-                    }
-                )
-                if outcome != "reconciliation_required":
-                    for target, owner in list(self._memory_target_leases.items()):
-                        if owner == (change_id, attempt_id):
-                            del self._memory_target_leases[target]
-            return
-
         connection = self._control_connection()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -734,12 +424,6 @@ class EngineStore:
         if not change_ids:
             return {}
         grouped = {change_id: [] for change_id in change_ids}
-        if self.db_path == ":memory:":
-            with self._memory_approvals_lock:
-                for event in self._memory_approval_events:
-                    if event["change_id"] in grouped:
-                        grouped[event["change_id"]].append(dict(event))
-                return grouped
         connection = self._control_connection()
         try:
             placeholders = ",".join("?" for _ in change_ids)
@@ -762,51 +446,28 @@ class EngineStore:
         *,
         stale_before: datetime,
     ) -> None:
+        with self.merchant_operation(change_id):
+            self._recover_stale_approval(
+                change_id, operator, proposal_digest, stale_before=stale_before
+            )
+
+    def _recover_stale_approval(
+        self,
+        change_id: str,
+        operator: str,
+        proposal_digest: str,
+        *,
+        stale_before: datetime,
+    ) -> None:
         """Move an abandoned ``applying`` claim into explicit reconciliation.
 
         This never retries the write and never releases its target leases. The age gate
-        prevents an operator from racing a healthy worker; after the transition, the
+        and OS-held operation lock prevent racing a live worker; after the transition, the
         observed-state workflow decides what actually happened.
         """
         now = self._now()
         stale_before_utc = stale_before.astimezone(UTC)
         detail = "operator opened reconciliation for a stale control-plane attempt"
-        if self.db_path == ":memory:":
-            with self._memory_approvals_lock:
-                row = self._memory_approvals.get(change_id)
-                if row is None or row["state"] not in ("applying", "reconciling"):
-                    raise ValueError(f"change {change_id} has no active attempt to recover")
-                if row.get("proposal_digest") != proposal_digest:
-                    raise ValueError(f"change {change_id} proposal digest changed")
-                timestamp = (
-                    row.get("claimed_at") if row["state"] == "applying" else row.get("resolved_at")
-                )
-                if not timestamp:
-                    raise ValueError(f"change {change_id} attempt has no recovery timestamp")
-                claimed_at = datetime.fromisoformat(timestamp)
-                if claimed_at > stale_before_utc:
-                    raise ValueError(f"change {change_id} attempt is still within its lease")
-                row.update(
-                    state="reconciliation_required",
-                    finished_at=now,
-                    last_error=detail,
-                    resolved_at=None,
-                    resolved_by=None,
-                    resolution=None,
-                )
-                self._memory_approval_events.append(
-                    {
-                        "change_id": change_id,
-                        "event": "reconciliation_required",
-                        "operator": operator,
-                        "occurred_at": now,
-                        "proposal_digest": proposal_digest,
-                        "attempt_id": row.get("attempt_id"),
-                        "detail": detail,
-                    }
-                )
-            return
-
         connection = self._control_connection()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -861,32 +522,6 @@ class EngineStore:
     ) -> None:
         """Atomically grant one operator ownership of a reconciliation decision."""
         now = self._now()
-        if self.db_path == ":memory:":
-            with self._memory_approvals_lock:
-                row = self._memory_approvals.get(change_id)
-                if row is None or row["state"] != "reconciliation_required":
-                    raise ValueError(f"change {change_id} does not require reconciliation")
-                if row.get("proposal_digest") != proposal_digest:
-                    raise ValueError(f"change {change_id} proposal digest changed")
-                row.update(
-                    state="reconciling",
-                    resolved_at=now,
-                    resolved_by=operator,
-                    resolution=resolution,
-                )
-                self._memory_approval_events.append(
-                    {
-                        "change_id": change_id,
-                        "event": f"reconciliation_claimed:{resolution}",
-                        "operator": operator,
-                        "occurred_at": now,
-                        "proposal_digest": proposal_digest,
-                        "attempt_id": row.get("attempt_id"),
-                        "detail": None,
-                    }
-                )
-            return
-
         connection = self._control_connection()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -933,37 +568,6 @@ class EngineStore:
         """Return a normally failed metadata update to reconciliation-required."""
         now = self._now()
         detail = error[:1000]
-        if self.db_path == ":memory:":
-            with self._memory_approvals_lock:
-                row = self._memory_approvals.get(change_id)
-                if (
-                    row is None
-                    or row["state"] != "reconciling"
-                    or row.get("resolved_by") != operator
-                    or row.get("resolution") != resolution
-                    or row.get("proposal_digest") != proposal_digest
-                ):
-                    raise ValueError(f"change {change_id} reconciliation claim is not owned")
-                row.update(
-                    state="reconciliation_required",
-                    resolved_at=None,
-                    resolved_by=None,
-                    resolution=None,
-                    last_error=detail,
-                )
-                self._memory_approval_events.append(
-                    {
-                        "change_id": change_id,
-                        "event": "reconciliation_failed",
-                        "operator": operator,
-                        "occurred_at": now,
-                        "proposal_digest": proposal_digest,
-                        "attempt_id": row.get("attempt_id"),
-                        "detail": detail,
-                    }
-                )
-            return
-
         connection = self._control_connection()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -1014,35 +618,6 @@ class EngineStore:
     ) -> None:
         """Finish the reconciliation claim owned by ``operator`` and release leases."""
         now = self._now()
-        if self.db_path == ":memory:":
-            with self._memory_approvals_lock:
-                row = self._memory_approvals.get(change_id)
-                if (
-                    row is None
-                    or row["state"] != "reconciling"
-                    or row.get("resolved_by") != operator
-                    or row.get("resolution") != resolution
-                    or row.get("proposal_digest") != proposal_digest
-                ):
-                    raise ValueError(f"change {change_id} reconciliation claim is not owned")
-                row.update(state="resolved", resolved_at=now)
-                attempt_id = row.get("attempt_id")
-                for target, owner in list(self._memory_target_leases.items()):
-                    if owner == (change_id, attempt_id):
-                        del self._memory_target_leases[target]
-                self._memory_approval_events.append(
-                    {
-                        "change_id": change_id,
-                        "event": f"reconciled:{resolution}",
-                        "operator": operator,
-                        "occurred_at": now,
-                        "proposal_digest": proposal_digest,
-                        "attempt_id": attempt_id,
-                        "detail": None,
-                    }
-                )
-            return
-
         connection = self._control_connection()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -1089,13 +664,6 @@ class EngineStore:
         """Batch-read control state without an operator-UI N+1 query."""
         if not change_ids:
             return {}
-        if self.db_path == ":memory:":
-            with self._memory_approvals_lock:
-                return {
-                    change_id: dict(self._memory_approvals[change_id])
-                    for change_id in change_ids
-                    if change_id in self._memory_approvals
-                }
         connection = self._control_connection()
         try:
             placeholders = ",".join("?" for _ in change_ids)
@@ -1108,13 +676,6 @@ class EngineStore:
             connection.close()
 
     def approved_change_ids(self) -> set[str]:
-        if self.db_path == ":memory:":
-            with self._memory_approvals_lock:
-                return {
-                    change_id
-                    for change_id, row in self._memory_approvals.items()
-                    if row["state"] == "approved"
-                }
         connection = self._control_connection()
         try:
             return {
@@ -1126,12 +687,43 @@ class EngineStore:
         finally:
             connection.close()
 
+    @contextmanager
+    def merchant_operation(self, change_id: str):
+        """Exclude apply, resolution, and stale recovery for one proposal.
+
+        Durable state still arbitrates approvals and target ownership. This guard
+        additionally prevents a paused live operation being declared abandoned.
+        Callers retain it until engine work and final bookkeeping have drained.
+        """
+        owner = uuid4().hex
+        with self._merchant_operations_lock:
+            if change_id in self._merchant_operations:
+                raise MerchantOperationBusy(
+                    "merchant operation is still active; retry after it finishes"
+                )
+            self._merchant_operations.add(change_id)
+        try:
+            if self._turn_locks is not None and not self._turn_locks.acquire(
+                change_id, "merchant-operation", owner
+            ):
+                raise MerchantOperationBusy(
+                    "merchant operation is still active; retry after it finishes"
+                )
+            try:
+                yield
+            finally:
+                if self._turn_locks is not None:
+                    self._turn_locks.release(owner)
+        finally:
+            with self._merchant_operations_lock:
+                self._merchant_operations.remove(change_id)
+
     async def call(self, fn: Callable[[Commerce], T]) -> T:
-        return await asyncio.to_thread(fn, self.commerce)
+        return await complete_before_cancelling(asyncio.to_thread(fn, self.commerce))
 
     async def write(self, session_key: str, fn: Callable[[Commerce], T]) -> T:
         async with self.serialized(session_key):
-            return await asyncio.to_thread(fn, self.commerce)
+            return await complete_before_cancelling(asyncio.to_thread(fn, self.commerce))
 
     @asynccontextmanager
     async def serialized(self, operation_key: str):
@@ -1172,7 +764,7 @@ class EngineStore:
 
         lock = self._locks.setdefault("direct_sql", asyncio.Lock())
         async with lock:
-            await asyncio.to_thread(body)
+            await complete_before_cancelling(asyncio.to_thread(body))
 
     def _pin_connection(self) -> sqlite3.Connection | None:
         """One read-only connection that joins the WAL index and then holds a share of it.
@@ -1226,12 +818,8 @@ class EngineStore:
         one, so the bug shipped and only CI ever saw it. With the ``sqlite_schema`` read
         below, all four versions track every write.
 
-        The connection is never read from again: its only job is to hold that share. An
-        in-memory store has no file to pin and no ``readonly_sql`` either, so it gets
-        ``None``.
+        The connection is never read from again: its only job is to hold that share.
         """
-        if self.db_path == ":memory:":
-            return None
         connection = sqlite3.connect(
             f"file:{self.db_path}?mode=ro", uri=True, check_same_thread=False
         )
@@ -1256,8 +844,6 @@ class EngineStore:
         each thread its own removes the sharing instead, which is why
         ``check_same_thread`` is left at its default here.
         """
-        if self.db_path == ":memory:":
-            raise RuntimeError("a read-only connection needs a file-backed store, not :memory:")
         connection: sqlite3.Connection | None = getattr(self._sql, "connection", None)
         if connection is None:
             connection = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
@@ -1282,105 +868,113 @@ class EngineStore:
             authenticated_subject=authenticated_subject,
             expires_at=expires_at,
         )
-        self._bindings[session_id] = binding
-        if self.db_path != ":memory:":
-            connection = self._control_connection()
-            try:
-                connection.execute(
-                    """
-                    INSERT INTO icommerce_agent_sessions (
-                        session_id, subject_id, kind, store_id,
-                        authenticated_subject, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(session_id) DO UPDATE SET
-                        subject_id = excluded.subject_id,
-                        kind = excluded.kind,
-                        store_id = excluded.store_id,
-                        authenticated_subject = excluded.authenticated_subject,
-                        expires_at = excluded.expires_at
-                    """,
-                    (
-                        session_id,
-                        subject_id,
-                        kind,
-                        self.store_id,
-                        authenticated_subject,
-                        expires_at.isoformat() if expires_at is not None else None,
-                    ),
-                )
-                connection.commit()
-            finally:
-                connection.close()
+        connection = self._control_connection()
+        try:
+            cursor = connection.execute(
+                """
+                INSERT INTO icommerce_agent_sessions (
+                    session_id, subject_id, kind, store_id,
+                    authenticated_subject, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    expires_at = excluded.expires_at
+                WHERE subject_id = excluded.subject_id
+                  AND kind = excluded.kind
+                  AND store_id = excluded.store_id
+                  AND authenticated_subject IS excluded.authenticated_subject
+                """,
+                (
+                    session_id,
+                    subject_id,
+                    kind,
+                    self.store_id,
+                    authenticated_subject,
+                    binding.expires_at.isoformat(timespec="microseconds")
+                    if binding.expires_at is not None
+                    else None,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("session identity cannot be rebound; start a new session")
+            connection.commit()
+        finally:
+            connection.close()
         return binding
 
     def binding(self, session_id: str) -> PrincipalBinding:
-        if self.db_path != ":memory:":
-            connection = self._control_connection()
-            try:
-                row = connection.execute(
-                    "SELECT * FROM icommerce_agent_sessions WHERE session_id = ?",
-                    (session_id,),
-                ).fetchone()
-            finally:
-                connection.close()
+        connection = self._control_connection()
+        try:
+            row = connection.execute(
+                "SELECT * FROM icommerce_agent_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
             if row is None:
-                self._bindings.pop(session_id, None)
                 raise KeyError(session_id)
-            binding = PrincipalBinding.model_validate(dict(row))
-            self._bindings[session_id] = binding
-        else:
-            binding = self._bindings[session_id]
-        if binding.expires_at is not None and binding.expires_at <= datetime.now(UTC):
-            self.unbind(session_id)
-            raise KeyError(session_id)
-        return binding
+            try:
+                binding = PrincipalBinding.model_validate(dict(row))
+            except ValidationError as error:
+                # Corrupt/legacy naive expiries have no unambiguous instant.
+                # Deny access rather than guess a timezone or produce an HTTP 500.
+                raise KeyError(session_id) from error
+            if binding.expires_at is not None and binding.expires_at <= datetime.now(UTC):
+                # A renewal can race this read. Remove only the expired
+                # snapshot we observed, never its newly renewed replacement.
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute(
+                    "DELETE FROM icommerce_agent_sessions WHERE session_id = ? AND expires_at = ?",
+                    (session_id, row["expires_at"]),
+                )
+                connection.commit()
+                raise KeyError(session_id)
+            return binding
+        finally:
+            connection.close()
 
     def unbind(self, session_id: str) -> None:
         """Revoke a durable session binding; missing ids are already revoked."""
-        self._bindings.pop(session_id, None)
-        if self.db_path != ":memory:":
-            connection = self._control_connection()
-            try:
-                connection.execute("PRAGMA foreign_keys = ON")
-                connection.execute(
-                    "DELETE FROM icommerce_agent_sessions WHERE session_id = ?", (session_id,)
-                )
-                connection.commit()
-            finally:
-                connection.close()
+        connection = self._control_connection()
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(
+                "DELETE FROM icommerce_agent_sessions WHERE session_id = ?", (session_id,)
+            )
+            connection.commit()
+        finally:
+            connection.close()
 
     def cleanup_expired_sessions(self) -> int:
         """Delete expired identity/workflow state and its chat/cart children."""
-        if self.db_path == ":memory:":
-            now = datetime.now(UTC)
-            expired = [
-                session_id
-                for session_id, binding in self._bindings.items()
-                if binding.expires_at is not None and binding.expires_at <= now
-            ]
-            for session_id in expired:
-                self.unbind(session_id)
-            return len(expired)
         connection = self._control_connection()
         try:
             now = datetime.now(UTC)
             connection.execute("PRAGMA foreign_keys = ON")
-            cursor = connection.execute(
-                "DELETE FROM icommerce_agent_sessions "
-                "WHERE expires_at IS NOT NULL AND expires_at <= ?",
+            rows = connection.execute(
+                "SELECT * FROM icommerce_agent_sessions "
+                "WHERE expires_at IS NOT NULL AND julianday(expires_at) <= julianday(?)",
                 (now.isoformat(),),
+            ).fetchall()
+            expired = []
+            for row in rows:
+                try:
+                    binding = PrincipalBinding.model_validate(dict(row))
+                except ValidationError:
+                    # Preserve ambiguous records for operator repair. binding()
+                    # rejects them; cleanup must not invent an expiry instant.
+                    continue
+                # SQLite's date conversion handles legacy offsets but rounds to
+                # milliseconds. Confirm in Python before deleting a future row.
+                if binding.expires_at is not None and binding.expires_at <= now:
+                    expired.append((row["session_id"], row["expires_at"]))
+            cursor = connection.executemany(
+                "DELETE FROM icommerce_agent_sessions WHERE session_id = ? AND expires_at = ?",
+                expired,
             )
             connection.commit()
-            for session_id, binding in list(self._bindings.items()):
-                if binding.expires_at is not None and binding.expires_at <= now:
-                    self._bindings.pop(session_id, None)
             return cursor.rowcount
         finally:
             connection.close()
 
     def session_cart_id(self, session_id: str) -> str | None:
-        if self.db_path == ":memory:":
-            return None
         connection = self._control_connection()
         try:
             row = connection.execute(
@@ -1397,8 +991,6 @@ class EngineStore:
         Two workers may both create an empty candidate, but the unique session key means
         every subsequent read/write converges on one winner before either adds a line.
         """
-        if self.db_path == ":memory:":
-            return cart_id
         connection = self._control_connection()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -1424,8 +1016,6 @@ class EngineStore:
     def initialize_chat_session(
         self, session_id: str, role: str, state_json: str, messages_json: str
     ) -> None:
-        if self.db_path == ":memory:":
-            return
         connection = self._control_connection()
         try:
             connection.execute(
@@ -1443,13 +1033,22 @@ class EngineStore:
     ) -> tuple[str, dict[str, Any]] | None:
         """Atomically own a chat turn and return the latest durable snapshot."""
         owner = uuid4().hex
-        if self.db_path == ":memory:":
-            key = (session_id, role)
-            with self._memory_chat_leases_lock:
-                if key in self._memory_chat_leases:
-                    return None
-                self._memory_chat_leases[key] = owner
-            return owner, {}
+        if self._turn_locks is not None:
+            if not self._turn_locks.acquire(session_id, role, owner):
+                return None
+        try:
+            claimed = self._claim_chat_turn(session_id, role, lease_seconds, owner)
+            if claimed is None and self._turn_locks is not None:
+                self._turn_locks.release(owner)
+            return claimed
+        except BaseException:
+            if self._turn_locks is not None:
+                self._turn_locks.release(owner)
+            raise
+
+    def _claim_chat_turn(
+        self, session_id: str, role: str, lease_seconds: int, owner: str
+    ) -> tuple[str, dict[str, Any]] | None:
         now = datetime.now(UTC)
         expires = now + timedelta(seconds=lease_seconds)
         connection = self._control_connection()
@@ -1481,11 +1080,6 @@ class EngineStore:
             connection.close()
 
     def renew_chat_turn(self, session_id: str, role: str, owner: str, lease_seconds: int) -> None:
-        if self.db_path == ":memory:":
-            with self._memory_chat_leases_lock:
-                if self._memory_chat_leases.get((session_id, role)) != owner:
-                    raise RuntimeError("chat turn lease was lost")
-            return
         connection = self._control_connection()
         try:
             cursor = connection.execute(
@@ -1513,12 +1107,15 @@ class EngineStore:
         state_json: str,
         messages_json: str,
     ) -> None:
-        if self.db_path == ":memory:":
-            with self._memory_chat_leases_lock:
-                if self._memory_chat_leases.get((session_id, role)) != owner:
-                    raise RuntimeError("chat turn lease was lost before persistence")
-                self._memory_chat_leases.pop((session_id, role), None)
-            return
+        try:
+            self._finish_chat_turn(session_id, role, owner, state_json, messages_json)
+        finally:
+            if self._turn_locks is not None:
+                self._turn_locks.release(owner)
+
+    def _finish_chat_turn(
+        self, session_id: str, role: str, owner: str, state_json: str, messages_json: str
+    ) -> None:
         connection = self._control_connection()
         try:
             cursor = connection.execute(
@@ -1536,11 +1133,13 @@ class EngineStore:
             connection.close()
 
     def release_chat_turn(self, session_id: str, role: str, owner: str) -> None:
-        if self.db_path == ":memory:":
-            with self._memory_chat_leases_lock:
-                if self._memory_chat_leases.get((session_id, role)) == owner:
-                    self._memory_chat_leases.pop((session_id, role), None)
-            return
+        try:
+            self._release_chat_turn(session_id, role, owner)
+        finally:
+            if self._turn_locks is not None:
+                self._turn_locks.release(owner)
+
+    def _release_chat_turn(self, session_id: str, role: str, owner: str) -> None:
         connection = self._control_connection()
         try:
             connection.execute(
@@ -1555,7 +1154,7 @@ class EngineStore:
 
     def consume_rate_limit(self, principal: str, limit: int, window_start: int) -> bool:
         """Consume one fixed-minute allowance without storing a principal identifier."""
-        if limit <= 0 or self.db_path == ":memory:":
+        if limit <= 0:
             return True
         key_hash = hashlib.sha256(principal.encode()).hexdigest()
         connection = self._control_connection()

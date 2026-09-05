@@ -9,7 +9,7 @@ model configured in a later deployment. Read this page before trusting one green
 mean more than that.
 
 The deterministic pull-request workflow still makes no paid model calls. A separate
-`Live Claude evals` workflow runs the six cases three times each on a weekly schedule
+`Live Claude evals` workflow runs the twelve cases three times each on a weekly schedule
 and on manual dispatch when the protected `live-evals` environment has an
 `ANTHROPIC_API_KEY`. A missing credential fails its preflight rather than producing a
 misleading green skip. This workflow measures raw agent behavior; the HTTP host's
@@ -17,6 +17,28 @@ last-mile response policy is tested separately and must not be used to grade awa
 underlying model regression.
 
 ## The pytest suite: what it covers
+
+Pytest checks that nonblocking local socket pairs work before starting the suite.
+Asyncio uses these for cross-thread completion notifications; a sandbox that denies
+`send` can leave completed engine work apparently hung, including during cancellation.
+Check a restricted environment without importing the engine with
+`python scripts/runtime_check.py`. A failure requires an environment permitting local
+socket pairs, not a bypass of engine serialization or cancellation protection. The
+check opens no network listener. Use an outer process deadline for diagnosis because
+cooperative timeouts deliberately drain already-started engine writes.
+
+The current concurrency regressions include a real subprocess stopped with
+`SIGSTOP` past its lease deadline: takeover must remain blocked until that process
+exits. Cancellation tests cover repeated cancellation, AnyIO disconnect scopes,
+late lease acquisition, and persistence cleanup. Session-identity tests cover
+cross-worker attempts to reassign customer, role, store, and authenticated subject.
+
+Every store or app fixture opens a copy of one seeded engine file built once per
+session (`tests/conftest.py`'s `engine_template`, copied by `engine_db`). Opening the
+engine on a *new* file runs its own migrations and costs about 2.5 seconds; reopening
+an existing file costs a quarter of that, which is the difference between a seven-minute
+suite and a three-minute one. Tests that need a fresh, unseeded, or deliberately legacy
+database (`tests/test_store.py`, `tests/test_backup_store.py`) still build their own.
 
 One file per module in `engine_backend/`, `host/`, and `mcp_servers/`, plus the suites
 listed below. All of it runs against `EngineMerchant`/`EngineStorefront` over a real,
@@ -30,9 +52,11 @@ engine, and never a model.
 - The engine-layer kernel check on the five commands this deployment governs
   (`config/kernel-policy.json`), including the over-refund rejection inside the
   transaction.
-- The human-only refund workflow: exact-decimal preview, store/payment/amount proposal
-  digest, tamper rejection, authenticated merchant-session boundary, successful sealed
-  receipt, and the engine's sealed over-refund refusal (`tests/test_refunds.py`).
+- The human-only refund workflows: dedicated JWT refund authority, exact-decimal and
+  digest-bound review, tamper rejection, the engine's sealed over-refund refusal, plus
+  stablecoin balance reservation, one-call idempotency, treasury wire contract,
+  transaction evidence, and ambiguous-outcome reconciliation (`tests/test_refunds.py`,
+  `tests/test_stablecoin_checkout.py`).
 - The `stage_*` / `apply_change` pipeline end to end: staging, guardrail re-check at
   apply time, the HTTP route's two-layer approval handoff, single-use operator-bound
   approval, restart persistence, cross-process single-claim and target-lease behavior,
@@ -64,6 +88,9 @@ engine, and never a model.
   client that never calls the expected tool — confirming the check actually fails when
   it should, rather than passing vacuously.
 - The Next.js builds for `web/storefront` and `web/portal` (`tests/test_web_build.py`).
+  Type checking (`tsc --noEmit`) and ESLint run in the CI `web` job through
+  `npm run typecheck` and `npm run lint`; Next 16 removed `next lint`, so those scripts
+  are the only lint and type gates the web workspace has.
 - The opt-in production JWT boundary: issuer, audience, expiry, roles/scopes, store
   tenancy, customer provisioning, and token-subject/session binding (`tests/test_auth.py`).
 - The last-mile host response boundary: affirmative claims that a merely staged change
@@ -88,6 +115,10 @@ engine, and never a model.
   (`tests/test_auth.py`, `tests/test_sessions.py`).
 - Online WAL-safe backup publication, integrity verification, and overwrite refusal
   (`tests/test_backup_store.py`).
+- Forward-only control-schema recording, legacy-ledger adoption, and refusal to open a
+  database created by newer code (`tests/test_store.py`).
+- Fail-closed, commit-bound production evidence validation and SPDX inventory generation
+  (`tests/test_release_check.py`, `tests/test_generate_sbom.py`).
 
 ## `scripts/tour.py`: a keyless end-to-end check, not a substitute for a live eval
 
@@ -134,8 +165,9 @@ restricted proxy reaches the host without exposing a bearer token to client code
   instruction instead of obeying it, describes checkout as staging rather than
   completion, gives a medical referral alongside a product, confirms a write only after
   success, or states the campaign limitation instead of fabricating a number —
-  `evals/`'s six cases exist to check exactly these six rules. They have now run once,
-  live, against `claude-sonnet-5`; see "Live run, 2026-09-03" below.
+  `evals/` tests these six rules with twelve cases, including six user-pressure
+  variants. Only the original six have a documented live result against
+  `claude-sonnet-5`; see "Live run, 2026-09-03" below.
 - Whether the model's own `apply_change` tool call is refused by the host when no
   approval exists — only the host's refusal logic is exercised here (by
   `tests/test_merchant_writes.py` and friends), not whether a live model attempts the
@@ -168,7 +200,7 @@ That message is accurate about this machine and CI, which carry no key by defaul
 `scripts/smoke_chat.py` drives one scripted conversation per role (shopping: search,
 compare, add to cart, check order status; merchant: a snapshot question, a listing
 search, a staged price change, then an apply attempt with no host approval that the
-script fails on if it succeeds). `evals/` runs six graded cases, one per rule in
+script fails on if it succeeds). `evals/` runs twelve graded cases, two per rule in
 `vendor/commerce-agents/docs/safety.md`'s "still asked of the model" list. Both exist
 so that setting `ANTHROPIC_API_KEY` and running them is the way to close this gap — not
 so that their presence closes it on its own. See `evals/README.md` for the case list and
@@ -322,12 +354,18 @@ python scripts/run_demo.py --web --tour   # runs it against the live host and bo
 python scripts/smoke_chat.py
 python -m evals.run
 
+# Release evidence: all twelve cases, three runs, structured results; no missing-key skip
+python -m evals.run --require-key --repetitions 3 --report live-evals.json
+
 # Web builds -- need Node >= 20.9 (Next 16 requirement)
 nvm use 22   # or any Node >= 20.9
 npm install
 npm audit --audit-level=high
 npm run build --workspace web/storefront
 npm run build --workspace web/portal
+
+# Start an isolated host and both built apps, run Chromium checks, then clean up
+python scripts/browser_check.py
 
 # Headless render check -- needs a running host with a tour already run against it,
 # and both web apps started; see the CI `web` job for the exact sequence. No API key.

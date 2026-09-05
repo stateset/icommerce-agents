@@ -36,3 +36,18 @@ def test_check_fails_on_an_undocumented_engine_backend_module(tmp_path, monkeypa
     problems = check.check_modules_documented()
     assert len(problems) == 1
     assert "undocumented.py" in problems[0]
+
+
+def test_release_workflow_check_fails_when_evidence_gate_is_removed(tmp_path, monkeypatch):
+    sys.path.insert(0, str(ROOT))
+    from scripts import check
+
+    workflow = tmp_path / "release.yml"
+    workflow.write_text("environment: production-release\ngh release create --verify-tag\n")
+    monkeypatch.setattr(check, "RELEASE_WORKFLOW", workflow)
+
+    problems = check.check_release_workflow()
+
+    assert any("evidence" in problem for problem in problems)
+    assert any("SBOM" in problem for problem in problems)
+    assert any("provenance" in problem for problem in problems)
