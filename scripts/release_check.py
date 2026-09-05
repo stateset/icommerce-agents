@@ -95,8 +95,8 @@ def validate_evidence(
                 and bool(parsed_url.hostname)
                 and parsed_url.username is None
                 and parsed_url.password is None
-                and not any(character.isspace() for character in url)
-                and not parsed_url.hostname.endswith(".invalid")
+                and not any(character.isspace() for character in str(url))
+                and not (parsed_url.hostname or "").endswith(".invalid")
             )
             if parsed_url is not None:
                 _ = parsed_url.port  # Validate malformed ports as well as host syntax.

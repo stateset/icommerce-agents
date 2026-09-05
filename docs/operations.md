@@ -102,3 +102,12 @@ against the source runbook. Never rehearse a restore over the live store.
 The stablecoin runbook is in [`stablecoin-checkout.md`](stablecoin-checkout.md). Payment
 reconciliation is a privileged, audited break-glass action and requires independent
 facilitator plus chain/RPC evidence.
+
+## Logs
+
+The host writes JSON lines to stderr: one object per record with `ts`, `level`,
+`logger`, `message`, and, for anything emitted while serving a request, the
+`request_id` the client saw in `X-Request-Id`. `scripts/run_demo.py` starts uvicorn
+with `--log-config config/uvicorn-logging.json`, which routes uvicorn's own startup and
+access records through the same formatter, so a deployment that starts uvicorn itself
+should pass the same flag. `ICOMMERCE_LOG_LEVEL` sets the level (default `INFO`).

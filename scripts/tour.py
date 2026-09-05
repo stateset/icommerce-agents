@@ -112,6 +112,14 @@ def run_tour(
         return _drive_tour(http, db_path, session_ids, result)
 
 
+def _proposal_digest(store: EngineStore, change_id: str) -> str:
+    """The digest the operator must echo back; a staged change always has one."""
+    record = asyncio.run(load_record(store, change_id))
+    if record is None:
+        raise RuntimeError(f"staged change {change_id} vanished before approval")
+    return str(record["proposal_digest"])
+
+
 def _drive_tour(
     http: Any, db_path: str, session_ids: dict[str, str], result: TourResult
 ) -> TourResult:
@@ -229,11 +237,7 @@ def _drive_tour(
     approve_response = http.post(
         f"/merchant/changes/{price_change.change_id}/approve",
         headers=merchant_headers,
-        json={
-            "proposal_digest": asyncio.run(load_record(store, price_change.change_id))[
-                "proposal_digest"
-            ]
-        },
+        json={"proposal_digest": _proposal_digest(store, price_change.change_id)},
     )
     if approve_response.status_code != 200:
         result.fail(f"approve did not succeed: {approve_response.text}")
@@ -276,11 +280,7 @@ def _drive_tour(
     approve_restock = http.post(
         f"/merchant/changes/{restock_change.change_id}/approve",
         headers=merchant_headers,
-        json={
-            "proposal_digest": asyncio.run(load_record(store, restock_change.change_id))[
-                "proposal_digest"
-            ]
-        },
+        json={"proposal_digest": _proposal_digest(store, restock_change.change_id)},
     )
     if approve_restock.status_code != 200:
         result.fail(f"approve did not succeed: {approve_restock.text}")

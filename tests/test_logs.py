@@ -41,10 +41,26 @@ def test_configure_logging_installs_one_handler_only():
         root.handlers[:] = before
 
 
-def test_request_records_carry_the_correlation_id(engine_db, caplog):
+def test_request_records_carry_the_correlation_id(engine_db):
+    """The completion record is written while the request id is still bound, so the
+    JSON line carries it as a field, not only inside the message text."""
     client = TestClient(create_app(engine_db()))
-    with caplog.at_level(logging.INFO, logger="host.app"):
+    lines: list[str] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            lines.append(JsonFormatter().format(record))
+
+    handler = Capture()
+    host_logger = logging.getLogger("host.app")
+    host_logger.addHandler(handler)
+    previous = host_logger.level
+    host_logger.setLevel(logging.INFO)
+    try:
         response = client.get("/healthz", headers={"X-Request-Id": "trace-abc"})
+    finally:
+        host_logger.removeHandler(handler)
+        host_logger.setLevel(previous)
     assert response.headers["X-Request-Id"] == "trace-abc"
-    completed = [r for r in caplog.records if "request completed" in r.getMessage()]
-    assert completed and "request_id=trace-abc" in completed[-1].getMessage()
+    completed = [json.loads(line) for line in lines if "request completed" in line]
+    assert completed and completed[-1]["request_id"] == "trace-abc"

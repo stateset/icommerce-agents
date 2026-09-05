@@ -109,7 +109,7 @@ jobs:
       - name: lint web apps
         run: npm run lint
 
-      - name: test the shared web package (BFF origin and cross-site rules)
+      - name: test the shared web package (BFF rules) and portal components
         run: npm test
 
       - name: build storefront
@@ -138,7 +138,8 @@ jobs:
       - name: start the host (no ANTHROPIC_API_KEY -- capabilities reports unconfigured)
         run: |
           DEMO_DB_PATH=/tmp/ci-web-tour.db nohup python -m uvicorn scripts.run_demo:build_app \
-            --factory --host 0.0.0.0 --port 8000 > /tmp/host.log 2>&1 &
+            --factory --host 0.0.0.0 --port 8000 --log-config config/uvicorn-logging.json \
+            > /tmp/host.log 2>&1 &
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:8000/readyz && exit 0
             sleep 1

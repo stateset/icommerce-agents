@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.release_check import REQUIRED_GATES, validate_evidence  # noqa: E402
@@ -29,7 +30,7 @@ def command(*args: str) -> str:
 
 def github_checks(repo: str, commit: str) -> list[dict]:
     """Inspect exact-commit checks, release reviewers, and scanner settings."""
-    checks = []
+    checks: list[dict[str, Any]] = []
 
     def inspect(name, endpoint, predicate):
         try:
@@ -100,7 +101,7 @@ def github_checks(repo: str, commit: str) -> list[dict]:
 
 
 def assess(target_version: str, evidence_path: Path | None, repo: str | None) -> dict:
-    checks = []
+    checks: list[dict[str, Any]] = []
     commit = command("git", "rev-parse", "HEAD")
     dirty = bool(command("git", "status", "--porcelain"))
     version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
